@@ -63,7 +63,14 @@ PRESET_CATEGORIES_FI: tuple[PresetCategory, ...] = (
 PRESET_CATEGORIES = PRESET_CATEGORIES_FI + PRESET_CATEGORIES_CH
 PRESET_BY_KEY = {c.key: c for c in PRESET_CATEGORIES}
 
-MAX_CATEGORIES_PER_USER = 7
+
+@dataclass(frozen=True)
+class ParseCategory:
+    """Категория для парсинга (из пресетов страны, без выбора в UI)."""
+
+    key: str
+    label: str
+    url_path: str
 
 
 def presets_for_country(country: str | None) -> tuple[PresetCategory, ...]:
@@ -76,6 +83,14 @@ def presets_for_country(country: str | None) -> tuple[PresetCategory, ...]:
 
 def preset_keys_for_country(country: str | None) -> frozenset[str]:
     return frozenset(c.key for c in presets_for_country(country))
+
+
+def parse_categories_for_country(country: str) -> tuple[ParseCategory, ...]:
+    """Все search-категории страны — парсинг без ручного выбора."""
+    return tuple(
+        ParseCategory(key=c.key, label=c.label, url_path=c.url_path)
+        for c in presets_for_country(country)
+    )
 
 
 COUNTRY_LOCATIONS: dict[str, dict] = {

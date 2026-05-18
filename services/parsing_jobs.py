@@ -34,7 +34,7 @@ from parser.marketplace import (
     listings_to_json,
 )
 from parser.marketplace_region import apply_marketplace_region
-from services.categories import list_user_categories
+from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
 from services.seller_blacklist import (
     load_blocked_seller_keys,
@@ -244,18 +244,16 @@ async def _parse_impl(
 
     async with Session() as session:
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
-        categories = await list_user_categories(session, user_id)
         json_limit = max(1, min(int(user.json_limit or 50), 500))
         country = user.country
         user.last_account_token = token_raw
         await session.commit()
 
-        if not categories:
-            raise RuntimeError("Выбери категории в ⚙️ Настройки")
-        if not country:
+        if not country or country not in ("ch", "fi"):
             raise RuntimeError(
                 "Выбери страну в ⚙️ Настройки → 🇨🇭 Швейцария или 🇫🇮 Финляндия"
             )
+        categories = list(parse_categories_for_country(country))
 
         run = ParseRun(user_id=user_id, status="running")
         session.add(run)

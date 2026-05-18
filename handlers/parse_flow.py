@@ -49,19 +49,10 @@ async def open_start_flow(message: Message, state: FSMContext | None = None) -> 
         user = await get_or_create_user(session, tg_id)
         has_last = bool(user.last_account_token)
 
-    from services.categories import list_user_categories
-
-    async with Session() as session:
-        cats = await list_user_categories(session, user.id)
-
-    if not cats:
-        await message.answer("Сначала выбери категории в ⚙️ Настройки → 📂 Категории.")
-        return
-
-    if not user.country:
+    if not user.country or user.country not in ("ch", "fi"):
         await message.answer(
             "Сначала выбери страну в ⚙️ Настройки:\n"
-            "🇨🇭 Швейцария или 🇫🇮 Финляндия (тумблер в меню настроек)."
+            "🇨🇭 Швейцария или 🇫🇮 Финляндия — категории подставятся автоматически."
         )
         return
 
@@ -132,13 +123,12 @@ async def _launch_parse(message: Message, telegram_id: int, db_user: User, token
 
         u = (await session.execute(select(U).where(U.id == db_user.id))).scalar_one()
         lim = int(u.json_limit or 50)
-        from services.categories import list_user_categories
-
-        n_cat = len(await list_user_categories(session, db_user.id))
+        country = u.country or "fi"
+        n_cat = len(parse_categories_for_country(country))
 
     status_msg = await message.answer(
         f"🔎 <b>В JSON: 0/{lim}</b>\n"
-        f"<i>Парсинг запущен ({n_cat} кат.). Статистика обновляется по ходу.</i>\n"
+        f"<i>Парсинг: {n_cat} категорий Marketplace. Статистика обновляется по ходу.</i>\n"
         f"<i>⏹ Стоп поиск — отменить.</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,

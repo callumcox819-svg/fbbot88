@@ -5,64 +5,22 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select
 
 from database import Session
-from data.preset_categories import MAX_CATEGORIES_PER_USER
+from data.preset_categories import presets_for_country
 from keyboards.settings_kb import (
     json_limit_menu_kb,
     json_limit_menu_text,
-    preset_categories_kb,
     settings_menu_kb_with_country,
 )
 from models import User
-from services import categories as cat_svc
 from services import proxies as proxy_svc
 from utils.telegram_edit import edit_text_keep_markup
 
 router = Router()
 
 
-def _preset_categories_text(active_count: int, country: str | None) -> str:
-    if country == "ch":
-        hint = "🇨🇭 Категории Marketplace Switzerland (ваши search-ссылки)."
-    elif country == "fi":
-        hint = "🇫🇮 Категории Marketplace Finland (search-ссылки)."
-    else:
-        hint = "Сначала выбери 🇨🇭 или 🇫🇮 в настройках."
-    return (
-        "✨ <b>Готовые категории Marketplace</b>\n\n"
-        f"{hint}\n\n"
-        f"Выбрано: <b>{active_count}/{MAX_CATEGORIES_PER_USER}</b>\n"
-        "Нажимай категории — окно <b>не закроется</b>.\n"
-        "Когда закончишь — <b>◀️ Назад</b>.\n\n"
-        "<i>🟢 — в парсинг · 🔴 — выкл.</i>"
-    )
-
-
 class SettingsStates(StatesGroup):
     waiting_proxies = State()
     waiting_json_limit = State()
-    waiting_custom_url = State()
-
-
-async def open_settings(message: Message, db_user: User | None = None) -> None:
-    if db_user is None:
-        async with Session() as session:
-            res = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
-            db_user = res.scalar_one()
-    async with Session() as session:
-        n_cats = await cat_svc.count_active_categories(session, db_user.id)
-    country = db_user.country
-    text = (
-        "⚙️ <b>Настройки</b>\n\n"
-        f"📦 Лимит JSON: <b>{db_user.json_limit or 50}</b>\n"
-        f"📂 Активных категорий: <b>{n_cats}/{MAX_CATEGORIES_PER_USER}</b>\n"
-        f"🌍 Страна: <b>{_country_label(country)}</b>\n\n"
-        "<i>🟢 CH/FI — парсинг по всей стране (все регионы), 🔴 — выкл.</i>"
-    )
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=settings_menu_kb_with_country(country, active_cats=n_cats),
-    )
 
 
 def _country_label(code: str | None) -> str:
@@ -71,6 +29,39 @@ def _country_label(code: str | None) -> str:
     if code == "fi":
         return "Финляндия"
     return "не выбрана"
+
+
+def _settings_text(db_user: User) -> str:
+    country = db_user.country
+    lines = [
+        "⚙️ <b>Настройки</b>\n",
+        f"📦 Лимит JSON: <b>{db_user.json_limit or 50}</b>",
+        f"🌍 Страна: <b>{_country_label(country)}</b>\n",
+    ]
+    if country in ("ch", "fi"):
+        cats = presets_for_country(country)
+        names = ", ".join(c.label for c in cats)
+        lines.append(
+            f"<i>Парсинг автоматически по <b>{len(cats)}</b> категориям Marketplace:</i>\n"
+            f"{names}"
+        )
+    else:
+        lines.append(
+            "<i>Выбери 🇨🇭 или 🇫🇮 — все категории страны подставятся сами.</i>"
+        )
+    return "\n".join(lines)
+
+
+async def open_settings(message: Message, db_user: User | None = None) -> None:
+    if db_user is None:
+        async with Session() as session:
+            res = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+            db_user = res.scalar_one()
+    await message.answer(
+        _settings_text(db_user),
+        parse_mode="HTML",
+        reply_markup=settings_menu_kb_with_country(db_user.country),
+    )
 
 
 @router.callback_query(F.data == "set:close")
@@ -82,14 +73,10 @@ async def set_close(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "set:back")
 async def set_back(callback: CallbackQuery, db_user: User) -> None:
     await callback.answer()
-    async with Session() as session:
-        n_cats = await cat_svc.count_active_categories(session, db_user.id)
     await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n\n"
-        f"📂 Активных категорий: <b>{n_cats}/{MAX_CATEGORIES_PER_USER}</b>\n"
-        "<i>🟢 — включено</i>",
+        _settings_text(db_user),
         parse_mode="HTML",
-        reply_markup=settings_menu_kb_with_country(db_user.country, active_cats=n_cats),
+        reply_markup=settings_menu_kb_with_country(db_user.country),
     )
 
 
@@ -101,14 +88,16 @@ async def toggle_country(callback: CallbackQuery, db_user: User) -> None:
         if user.country == code:
             user.country = None
         else:
-            if user.country and user.country != code:
-                await cat_svc.clear_preset_categories(session, user.id)
             user.country = code
         await session.commit()
         country = user.country
 
     await callback.answer("Обновлено")
-    await callback.message.edit_reply_markup(reply_markup=settings_menu_kb_with_country(country))
+    await callback.message.edit_text(
+        _settings_text(user),
+        parse_mode="HTML",
+        reply_markup=settings_menu_kb_with_country(country),
+    )
 
 
 @router.callback_query(F.data == "set:json_limit")
@@ -174,7 +163,12 @@ async def proxies_menu(callback: CallbackQuery, state: FSMContext, db_user: User
     await callback.answer()
     async with Session() as session:
         rows = await proxy_svc.list_proxies(session, db_user.id)
-    lines = [f"🌐 <b>Прокси</b> ({len(rows)})", "", "Пришли список (по одному на строку):", "<code>host:port:user:pass</code>"]
+    lines = [
+        f"🌐 <b>Прокси</b> ({len(rows)})",
+        "",
+        "Пришли список (по одному на строку):",
+        "<code>host:port:user:pass</code>",
+    ]
     for p in rows[:15]:
         lines.append(f"• <code>{p.host}:{p.port}</code> (id={p.id})")
     kb = InlineKeyboardMarkup(
@@ -204,88 +198,3 @@ async def proxy_save(message: Message, state: FSMContext, db_user: User) -> None
         added, failed = await proxy_svc.add_proxies(session, db_user.id, lines)
     await state.clear()
     await message.answer(f"✅ Добавлено: {added}, ошибок: {failed}")
-
-
-@router.callback_query(F.data == "set:cat:noop")
-async def cat_noop(callback: CallbackQuery) -> None:
-    await callback.answer(f"Можно выбрать до {MAX_CATEGORIES_PER_USER} категорий", show_alert=True)
-
-
-@router.callback_query(F.data == "set:cat:preset")
-async def cat_preset(callback: CallbackQuery, db_user: User) -> None:
-    await callback.answer()
-    async with Session() as session:
-        active = await cat_svc.get_active_preset_keys(session, db_user.id)
-    await edit_text_keep_markup(
-        callback.message,
-        _preset_categories_text(len(active), db_user.country),
-        reply_markup=preset_categories_kb(active, country=db_user.country),
-    )
-
-
-@router.callback_query(F.data.startswith("set:cat:toggle:"))
-async def cat_toggle(callback: CallbackQuery, db_user: User) -> None:
-    key = callback.data.split(":")[-1]
-    async with Session() as session:
-        active, err = await cat_svc.toggle_preset_category(
-            session, db_user.id, key, country=db_user.country
-        )
-
-    if err:
-        await callback.answer(err, show_alert=True)
-        return
-
-    from data.preset_categories import PRESET_BY_KEY
-
-    preset = PRESET_BY_KEY.get(key)
-    name = (preset.label if preset else key).replace("🟢 ", "").replace("🔴 ", "")
-    on = key in active
-    await callback.answer(f"{'🟢' if on else '🔴'} {name}")
-
-    await edit_text_keep_markup(
-        callback.message,
-        _preset_categories_text(len(active), db_user.country),
-        reply_markup=preset_categories_kb(active, country=db_user.country),
-    )
-
-
-@router.callback_query(F.data == "set:cat:custom")
-async def cat_custom(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await state.set_state(SettingsStates.waiting_custom_url)
-    await callback.message.answer(
-        "Ссылка на категорию Marketplace (лучше со страной/городом):\n"
-        "🇫🇮 <code>https://www.facebook.com/marketplace/104042359631581/search/?category_id=…</code>\n"
-        "🇨🇭 <code>https://www.facebook.com/marketplace/switzerland/category/electronics/</code>\n"
-        "🇨🇭 <code>https://www.facebook.com/marketplace/103767472995143/search/?category_id=…</code>\n"
-        "Или без страны: <code>…/marketplace/category/electronics</code> — бот сам подставит FI/CH.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(SettingsStates.waiting_custom_url)
-async def cat_custom_save(message: Message, state: FSMContext, db_user: User) -> None:
-    async with Session() as session:
-        err = await cat_svc.add_custom_category(session, db_user.id, message.text or "")
-    await state.clear()
-    if err:
-        await message.answer(f"❌ {err}")
-    else:
-        await message.answer("✅ Категория добавлена")
-
-
-@router.callback_query(F.data == "set:cat:list")
-async def cat_list(callback: CallbackQuery, db_user: User) -> None:
-    await callback.answer()
-    async with Session() as session:
-        cats = await cat_svc.list_user_categories(session, db_user.id)
-    if not cats:
-        await callback.message.answer(
-            "Нет активных категорий.\nОткрой ⚙️ Настройки → ✨ Готовые категории."
-        )
-        return
-    lines = [f"<b>🟢 Активные категории ({len(cats)}):</b>"]
-    for c in cats:
-        mark = "🟢" if c.is_preset else "🔗"
-        lines.append(f"{mark} {c.label}")
-    await callback.message.answer("\n".join(lines), parse_mode="HTML")

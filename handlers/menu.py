@@ -27,7 +27,7 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 <b>FB Marketplace Parser</b>\n\n"
         "▶️ <b>Старт поиска</b> — токен аккаунта FB → сбор JSON\n"
-        "⚙️ <b>Настройки</b> — прокси, категории, страна, лимит JSON\n"
+        "⚙️ <b>Настройки</b> — прокси, страна (CH/FI), лимит JSON\n"
         "⏹ <b>Стоп поиск</b> — остановить парсинг",
         parse_mode="HTML",
         reply_markup=main_menu_kb(is_admin=user.is_admin),
