@@ -349,26 +349,27 @@ def _location_suggests_fi(location: str) -> bool:
 
 def _location_matches_country(location: str, country: str) -> bool:
     """
-    Непустая локация должна соответствовать CH/FI.
-    Пустая — ок (регион задаётся URL helsinki/finland).
+    Режем только явно чужую страну (UA/CH при FI и наоборот).
+    Неизвестный пригород без «Helsinki» в тексте — ок (URL finland/helsinki).
     """
     loc = (location or "").strip()
     if not loc:
         return True
+    blob = f" {loc.lower()} "
     if country == "fi":
         if _text_has_ua_markers(loc):
             return False
-        if any(r in f" {loc.lower()} " for r in _FI_REJECT):
+        if any(r in blob for r in _FI_REJECT):
             return False
         if _location_suggests_ch(loc):
             return False
-        return _location_suggests_fi(loc)
+        return True
     if country == "ch":
-        if any(r in f" {loc.lower()} " for r in _CH_REJECT):
+        if any(r in blob for r in _CH_REJECT):
             return False
         if _location_suggests_fi(loc):
             return False
-        return _location_suggests_ch(loc)
+        return True
     return True
 
 
@@ -444,12 +445,17 @@ def _parse_relative_time_hours(text: str) -> float | None:
     m = re.search(
         r"(?:il y a|vor)\s*(\d+)\s*(?:heures?|h|std\.?|stunden?)|"
         r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?|tuntia)|"
-        r"(\d+)\s*t\s+sitten",
+        r"(\d+)\s*t\s+sitten|"
+        r"(\d+)\s*tuntia\s+sitten",
         t,
     )
     if m:
-        return float(m.group(1) or m.group(2))
-    m = re.search(r"(\d+)\s*(?:d|days?|tage?|jours?)", t)
+        return float(next(g for g in m.groups() if g))
+    m = re.search(
+        r"(\d+)\s*(?:d|days?|tage?|jours?|päivää?|paivaa?)|"
+        r"(\d+)\s*päivää?\s+sitten",
+        t,
+    )
     if m:
         return float(m.group(1)) * 24.0
     return None
@@ -465,17 +471,17 @@ def listing_age_hours(item: MarketplaceListing) -> float | None:
 
 def listing_is_too_old(item: MarketplaceListing, max_age_hours: float) -> bool:
     """
-    Лимит 24 ч: режем вчера/дни/недели и timestamp > 24ч.
-    «5 hours ago» / «12 tuntia» — пропускаем (как при стабильных 40+ в ленте).
+    Лимит по тексту «5 tuntia sitten» / «2 days ago».
+    Без даты или только unix из ленты категории — не режем (там часто мусор).
     """
     if max_age_hours <= 0:
         return False
-    age_h = listing_age_hours(item)
-    if age_h is not None:
-        return age_h > max_age_hours
     cd = (item.created_date or "").lower().strip()
     if not cd:
         return False
+    hours = _parse_relative_time_hours(cd)
+    if hours is not None:
+        return hours > max_age_hours
     if any(x in cd for x in ("yesterday", "gestern", "hier", "eilen")):
         return True
     if re.search(r"\d+\s*(?:d|days?|tage?|jours?|päiv)", cd):
@@ -541,10 +547,6 @@ def export_reject_reason(
 
     photo = (item.photo or "").strip()
     seller = (item.seller_name or "").strip()
-    desc = (item.item_desc or "").strip()
-
-    if not seller and not desc:
-        return "нет_данных"
 
     if price and photo:
         return None

@@ -367,6 +367,13 @@ async def _parse_impl(
                         _record_reject(stats, "повторный_продавец")
                         seen_ids.add(item.listing_id)
                         continue
+                    reason = export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
+                    if reason in ("чужая_страна", "старше_24ч", "нет_заголовка"):
+                        _record_reject(stats, reason)
+                        seen_ids.add(item.listing_id)
+                        continue
                     if not stop.is_set():
                         try:
                             await enrich_listing(
@@ -374,7 +381,7 @@ async def _parse_impl(
                                 item,
                                 user_agent=config.fb_user_agent,
                                 proxy_url=proxy_used,
-                                timeout_sec=20.0,
+                                timeout_sec=16.0,
                                 country=country,
                             )
                         except AccountTokenDeadError:
