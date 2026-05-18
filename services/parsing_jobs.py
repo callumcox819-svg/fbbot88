@@ -18,7 +18,7 @@ from config import config
 from database import Session
 from models import ParseRun, User
 from parser.account_token import parse_account_token
-from parser.marketplace import fetch_category_listings, listings_to_json
+from parser.marketplace import fetch_category_listings, is_connection_error, listings_to_json
 from services.categories import list_user_categories
 from services.proxies import pick_random_proxy_url
 
@@ -122,12 +122,16 @@ async def _parse_impl(
     cat_idx = 0
     empty_rounds = 0
     max_empty_rounds = cat_count * 5
+    connect_fails = 0
 
-    async def status_progress() -> None:
+    async def status_progress(extra: str = "") -> None:
         if on_status:
-            await on_status(_progress_text(len(collected), json_limit))
+            text = _progress_text(len(collected), json_limit)
+            if extra:
+                text += f"\n<i>{extra}</i>"
+            await on_status(text)
 
-    await status_progress()
+    await status_progress("Подключение к Facebook…")
 
     while len(collected) < json_limit and not stop.is_set():
         cat = categories[cat_idx % cat_count]
@@ -137,18 +141,46 @@ async def _parse_impl(
         async with Session() as session:
             proxy_url = await pick_random_proxy_url(session, user_id)
 
-        try:
-            batch = await fetch_category_listings(
-                token,
-                url_path=cat.url_path,
-                category_label=cat.label,
-                user_agent=config.fb_user_agent,
-                country=country,
-                proxy_url=proxy_url,
-                limit=min(max(need * 2, 30), 120),
-            )
-        except Exception as e:
-            logger.warning("category %s failed: %s", cat.label, e)
+        batch = None
+        last_err: Exception | None = None
+        for proxy_try in (proxy_url, None):
+            if proxy_try is None and proxy_url is None:
+                break
+            try:
+                batch = await fetch_category_listings(
+                    token,
+                    url_path=cat.url_path,
+                    category_label=cat.label,
+                    user_agent=config.fb_user_agent,
+                    country=country,
+                    proxy_url=proxy_try,
+                    limit=min(max(need * 2, 30), 120),
+                    timeout_sec=35.0,
+                )
+                connect_fails = 0
+                break
+            except Exception as e:
+                last_err = e
+                if proxy_try and is_connection_error(e):
+                    logger.warning("proxy failed for %s, retry direct: %s", cat.label, e)
+                    continue
+                break
+
+        if batch is None:
+            err = last_err or RuntimeError("unknown")
+            logger.warning("category %s failed: %s", cat.label, err)
+            if is_connection_error(err):
+                connect_fails += 1
+                if connect_fails >= 3 and len(collected) == 0:
+                    hint = (
+                        "❌ <b>Нет связи с Facebook</b>\n\n"
+                        "С сервера Railway без рабочего прокси FB часто недоступен.\n"
+                        "⚙️ Настройки → 🌐 Прокси — добавь SOCKS5 (CH/FI).\n"
+                        "Проверь host:port:user:pass."
+                    )
+                    if on_status:
+                        await on_status(hint)
+                    raise RuntimeError("Нет связи с Facebook") from err
             empty_rounds += 1
             if empty_rounds >= max_empty_rounds:
                 break

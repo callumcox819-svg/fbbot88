@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+from aiohttp_socks import ProxyConnector
 
 from data.preset_categories import COUNTRY_LOCATIONS
 from parser.account_token import AccountToken, cookies_header
@@ -129,6 +130,31 @@ def _build_category_url(url_path: str, hub: str | None) -> str:
     return urljoin(_FB_BASE, path)
 
 
+def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
+    """SOCKS5/HTTP прокси — через aiohttp-socks (иначе Cannot connect to host)."""
+    if not proxy_url:
+        return aiohttp.ClientSession()
+    connector = ProxyConnector.from_url(proxy_url)
+    return aiohttp.ClientSession(connector=connector)
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return any(
+        x in s
+        for x in (
+            "cannot connect",
+            "connection refused",
+            "connection reset",
+            "timed out",
+            "timeout",
+            "ssl",
+            "proxy",
+            "network is unreachable",
+        )
+    )
+
+
 async def _fetch_page(
     token: AccountToken,
     *,
@@ -144,13 +170,9 @@ async def _fetch_page(
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            url,
-            headers=headers,
-            proxy=proxy_url,
-            timeout=aiohttp.ClientTimeout(total=timeout_sec),
-        ) as resp:
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    async with _session_for_proxy(proxy_url) as session:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
             html = await resp.text(errors="ignore")
             if resp.status >= 400:
                 raise RuntimeError(f"Facebook HTTP {resp.status}")

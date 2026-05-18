@@ -1,4 +1,7 @@
+import logging
+
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -11,6 +14,7 @@ from services.parsing_jobs import is_parsing, start_parsing
 from services.users import get_or_create_user
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 class ParseStates(StatesGroup):
@@ -96,17 +100,26 @@ async def on_token_input(message: Message, state: FSMContext, db_user: User) -> 
 
 
 async def _launch_parse(message: Message, telegram_id: int, db_user: User, token_raw: str) -> None:
+    # Статус без reply-клавиатуры — иначе edit_text часто не работает
     status_msg = await message.answer(
-        "⏳ Запуск…",
-        reply_markup=main_menu_kb(is_admin=db_user.is_admin),
+        "🔎 <b>0/?</b> — запуск…",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
     async def on_status(text: str) -> None:
         try:
             await status_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return
+            logger.warning("status edit failed: %s", e)
+            try:
+                await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                pass
         except Exception:
-            pass
+            logger.exception("status update failed")
 
     try:
         await start_parsing(
@@ -117,4 +130,4 @@ async def _launch_parse(message: Message, telegram_id: int, db_user: User, token
             on_status=on_status,
         )
     except RuntimeError as e:
-        await status_msg.edit_text(str(e))
+        await status_msg.edit_text(str(e), parse_mode="HTML")
