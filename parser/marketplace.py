@@ -457,7 +457,9 @@ def _parse_relative_time_hours(text: str) -> float | None:
         t,
     )
     if m:
-        return float(m.group(1)) * 24.0
+        g = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else None)
+        if g:
+            return float(g) * 24.0
     return None
 
 
