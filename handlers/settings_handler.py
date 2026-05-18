@@ -24,7 +24,7 @@ def _preset_categories_text(active_count: int, country: str | None) -> str:
     if country == "ch":
         hint = "🇨🇭 Категории Marketplace Switzerland (ваши search-ссылки)."
     elif country == "fi":
-        hint = "🇫🇮 Категории finland/helsinki + фильтр страны."
+        hint = "🇫🇮 Категории Marketplace Finland (search-ссылки)."
     else:
         hint = "Сначала выбери 🇨🇭 или 🇫🇮 в настройках."
     return (
@@ -255,8 +255,7 @@ async def cat_custom(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsStates.waiting_custom_url)
     await callback.message.answer(
         "Ссылка на категорию Marketplace (лучше со страной/городом):\n"
-        "🇫🇮 <code>https://www.facebook.com/marketplace/finland/category/baby/</code>\n"
-        "🇫🇮 <code>https://www.facebook.com/marketplace/helsinki/category/baby/</code>\n"
+        "🇫🇮 <code>https://www.facebook.com/marketplace/104042359631581/search/?category_id=…</code>\n"
         "🇨🇭 <code>https://www.facebook.com/marketplace/switzerland/category/electronics/</code>\n"
         "🇨🇭 <code>https://www.facebook.com/marketplace/103767472995143/search/?category_id=…</code>\n"
         "Или без страны: <code>…/marketplace/category/electronics</code> — бот сам подставит FI/CH.",

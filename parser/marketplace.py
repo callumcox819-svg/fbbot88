@@ -13,7 +13,11 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
-from data.preset_categories import CH_MARKETPLACE_LOCATION_ID, COUNTRY_LOCATIONS
+from data.preset_categories import (
+    CH_MARKETPLACE_LOCATION_ID,
+    COUNTRY_LOCATIONS,
+    FI_MARKETPLACE_LOCATION_ID,
+)
 from parser.marketplace_region import append_geo_to_marketplace_url
 from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
 
@@ -593,7 +597,7 @@ def normalize_listing_for_export(item: MarketplaceListing, country: str | None) 
 
 
 def _all_marketplace_roots() -> frozenset[str]:
-    roots: set[str] = {CH_MARKETPLACE_LOCATION_ID}
+    roots: set[str] = {CH_MARKETPLACE_LOCATION_ID, FI_MARKETPLACE_LOCATION_ID}
     for cfg in COUNTRY_LOCATIONS.values():
         roots.update(str(x) for x in (cfg.get("marketplace_slugs") or []))
         roots.update(cfg.get("region_hubs") or [])
@@ -630,7 +634,7 @@ def _normalize_search_path(path: str) -> str:
             tail, qs = path, {}
 
     parts = tail.strip("/").split("/")
-    loc_id = parts[0] if parts else CH_MARKETPLACE_LOCATION_ID
+    loc_id = parts[0] if parts else FI_MARKETPLACE_LOCATION_ID
     cat_id = (qs.get("category_id") or [""])[0]
     query = (qs.get("query") or [""])[0]
     if not cat_id:

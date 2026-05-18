@@ -1,12 +1,13 @@
-"""Готовые категории Facebook Marketplace — пути от /marketplace/."""
+"""Готовые категории Facebook Marketplace — search URLs CH/FI от пользователя."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from urllib.parse import quote_plus
 
-# Marketplace CH из ссылок пользователя (search + filter_location_id)
+# ID Marketplace из ссылок браузера (search + GraphQL filter_location_id)
 CH_MARKETPLACE_LOCATION_ID = "103767472995143"
+FI_MARKETPLACE_LOCATION_ID = "104042359631581"
 
 
 @dataclass(frozen=True)
@@ -17,91 +18,46 @@ class PresetCategory:
     countries: tuple[str, ...] = ("fi",)
 
 
-def _ch_search(category_id: str, query: str) -> str:
+def _marketplace_search(location_id: str, category_id: str, query: str) -> str:
     q = quote_plus(query)
     return (
-        f"{CH_MARKETPLACE_LOCATION_ID}/search"
+        f"{location_id}/search"
         f"?category_id={category_id}&query={q}&referral_ui_component=category_menu_item"
     )
 
 
-# 🇨🇭 — категории из меню Marketplace Switzerland (search URLs)
+def _ch_search(category_id: str, query: str) -> str:
+    return _marketplace_search(CH_MARKETPLACE_LOCATION_ID, category_id, query)
+
+
+def _fi_search(category_id: str, query: str) -> str:
+    return _marketplace_search(FI_MARKETPLACE_LOCATION_ID, category_id, query)
+
+
+# 🇨🇭 — Marketplace Switzerland
 PRESET_CATEGORIES_CH: tuple[PresetCategory, ...] = (
+    PresetCategory("ch_toys", "🧸 Игрушки", _ch_search("199404184572737", "Toys and games"), ("ch",)),
+    PresetCategory("ch_sports", "⚽ Спорт", _ch_search("391335928190702", "Sporting goods"), ("ch",)),
+    PresetCategory("ch_home", "🛋 Дом", _ch_search("753380185098614", "Home goods"), ("ch",)),
+    PresetCategory("ch_hobbies", "🎨 Хобби", _ch_search("459026188375950", "Hobbies"), ("ch",)),
+    PresetCategory("ch_family", "👶 Семья", _ch_search("891748581240437", "Family"), ("ch",)),
     PresetCategory(
-        "ch_toys",
-        "🧸 Игрушки",
-        _ch_search("199404184572737", "Toys and games"),
-        ("ch",),
+        "ch_electronics", "📱 Электроника", _ch_search("479353692612078", "Electronics"), ("ch",)
     ),
-    PresetCategory(
-        "ch_sports",
-        "⚽ Спорт",
-        _ch_search("391335928190702", "Sporting goods"),
-        ("ch",),
-    ),
-    PresetCategory(
-        "ch_home",
-        "🛋 Дом",
-        _ch_search("753380185098614", "Home goods"),
-        ("ch",),
-    ),
-    PresetCategory(
-        "ch_hobbies",
-        "🎨 Хобби",
-        _ch_search("459026188375950", "Hobbies"),
-        ("ch",),
-    ),
-    PresetCategory(
-        "ch_family",
-        "👶 Семья",
-        _ch_search("891748581240437", "Family"),
-        ("ch",),
-    ),
-    PresetCategory(
-        "ch_electronics",
-        "📱 Электроника",
-        _ch_search("479353692612078", "Electronics"),
-        ("ch",),
-    ),
-    PresetCategory(
-        "ch_clothing",
-        "👕 Одежда",
-        _ch_search("677457442746983", "Clothing"),
-        ("ch",),
-    ),
+    PresetCategory("ch_clothing", "👕 Одежда", _ch_search("677457442746983", "Clothing"), ("ch",)),
 )
 
-# 🇫🇮 — классические category/… + finland/helsinki в парсере
+# 🇫🇮 — Marketplace Finland (те же category_id, другой location_id)
 PRESET_CATEGORIES_FI: tuple[PresetCategory, ...] = (
-    PresetCategory("vehicles", "🚗 Транспорт", "category/vehicles", ("fi",)),
-    PresetCategory("electronics", "📱 Электроника", "category/electronics", ("fi",)),
-    PresetCategory("property_rent", "🏠 Аренда жилья", "category/propertyrentals", ("fi",)),
-    PresetCategory("property_sale", "🏢 Продажа жилья", "category/propertyforsale", ("fi",)),
-    PresetCategory("apparel", "👕 Одежда", "category/apparel", ("fi",)),
-    PresetCategory("baby", "👶 Дети", "category/baby", ("fi",)),
-    PresetCategory("toys", "🧸 Игрушки", "category/toys", ("fi",)),
-    PresetCategory("home", "🛋 Дом", "category/home", ("fi",)),
-    PresetCategory("furniture", "🪑 Мебель", "category/furniture", ("fi",)),
-    PresetCategory("appliances", "🔌 Бытовая техника", "category/appliances", ("fi",)),
-    PresetCategory("garden", "🌿 Сад", "category/garden", ("fi",)),
-    PresetCategory("tools", "🔧 Инструменты", "category/tools", ("fi",)),
-    PresetCategory("sports", "⚽ Спорт", "category/sports", ("fi",)),
-    PresetCategory("hobbies", "🎨 Хобби", "category/hobbies", ("fi",)),
-    PresetCategory("entertainment", "🎮 Развлечения", "category/entertainment", ("fi",)),
-    PresetCategory("instruments", "🎸 Музыка", "category/instruments", ("fi",)),
-    PresetCategory("books", "📚 Книги", "category/books", ("fi",)),
-    PresetCategory("games", "🕹 Видеоигры", "category/games", ("fi",)),
-    PresetCategory("pets", "🐾 Животные", "category/pets", ("fi",)),
-    PresetCategory("health", "💊 Здоровье", "category/health", ("fi",)),
-    PresetCategory("beauty", "💄 Красота", "category/beauty", ("fi",)),
-    PresetCategory("jewelry", "💍 Украшения", "category/jewelry", ("fi",)),
-    PresetCategory("bags", "👜 Сумки", "category/bags", ("fi",)),
-    PresetCategory("autoparts", "⚙️ Автозапчасти", "category/autoparts", ("fi",)),
-    PresetCategory("office", "📎 Офис", "category/office", ("fi",)),
-    PresetCategory("garage", "🏷 Гаражная распродажа", "category/garagesale", ("fi",)),
-    PresetCategory("antiques", "🏺 Антиквариат", "category/antiques", ("fi",)),
-    PresetCategory("classifieds", "📦 Разное", "category/classifieds", ("fi",)),
-    PresetCategory("free", "🎁 Бесплатно", "category/free", ("fi",)),
+    PresetCategory("fi_toys", "🧸 Игрушки", _fi_search("199404184572737", "Toys and games"), ("fi",)),
+    PresetCategory("fi_sports", "⚽ Спорт", _fi_search("391335928190702", "Sporting goods"), ("fi",)),
+    PresetCategory("fi_home", "🛋 Дом", _fi_search("753380185098614", "Home goods"), ("fi",)),
+    PresetCategory("fi_hobbies", "🎨 Хобби", _fi_search("459026188375950", "Hobbies"), ("fi",)),
+    PresetCategory("fi_family", "👶 Семья", _fi_search("891748581240437", "Family"), ("fi",)),
+    PresetCategory(
+        "fi_electronics", "📱 Электроника", _fi_search("479353692612078", "Electronics"), ("fi",)
+    ),
+    PresetCategory("fi_clothing", "👕 Одежда", _fi_search("677457442746983", "Clothing"), ("fi",)),
 )
 
 PRESET_CATEGORIES = PRESET_CATEGORIES_FI + PRESET_CATEGORIES_CH
@@ -147,8 +103,8 @@ COUNTRY_LOCATIONS: dict[str, dict] = {
         "latitude": 60.1699,
         "longitude": 24.9384,
         "radius_km": 80,
-        "filter_location_id": "106410786056698",
-        "marketplace_slugs": ["finland"],
+        "filter_location_id": FI_MARKETPLACE_LOCATION_ID,
+        "marketplace_slugs": [FI_MARKETPLACE_LOCATION_ID, "finland"],
         "region_hubs": [
             "helsinki",
             "tampere",
