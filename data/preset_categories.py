@@ -52,7 +52,11 @@ MAX_CATEGORIES_PER_USER = 7
 COUNTRY_LOCATIONS: dict[str, dict] = {
     "ch": {
         "label": "🇨🇭 Швейцария",
-        # marketplace/{slug}/category/…
+        "latitude": 46.8182,
+        "longitude": 8.2275,
+        "radius_km": 80,
+        # ID города в FB (можно переопределить FB_MARKETPLACE_LOCATION_ID_CH)
+        "filter_location_id": "107863829082992",
         "marketplace_slugs": ["switzerland"],
         "region_hubs": [
             "zurich",
@@ -68,6 +72,10 @@ COUNTRY_LOCATIONS: dict[str, dict] = {
     },
     "fi": {
         "label": "🇫🇮 Финляндия",
+        "latitude": 60.1699,
+        "longitude": 24.9384,
+        "radius_km": 80,
+        "filter_location_id": "106410786056698",
         "marketplace_slugs": ["finland"],
         "region_hubs": [
             "helsinki",

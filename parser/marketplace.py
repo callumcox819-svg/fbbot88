@@ -13,6 +13,7 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from data.preset_categories import COUNTRY_LOCATIONS
+from parser.marketplace_region import append_geo_to_marketplace_url
 from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
 
 logger = logging.getLogger(__name__)
@@ -197,10 +198,23 @@ _FI_REJECT = (
     "switzerland",
     "schweiz",
     "russia",
-    "ukraine",
+)
+_UA_SPAM_HINTS = (
     "україн",
+    "украин",
     "київ",
+    "киев",
     "kyiv",
+    "kiev",
+    "львів",
+    "lviv",
+    "одес",
+    "харків",
+    "kharkiv",
+    "dnipro",
+    "запоріж",
+    "poltava",
+    "ukraine",
 )
 _MIN_LISTING_ID_LEN = 12
 
@@ -316,6 +330,12 @@ def build_category_url(url_path: str, *, marketplace_root: str | None = None) ->
     return urljoin(_FB_BASE, f"{cat_path}/")
 
 
+def with_country_geo(url: str, country: str | None) -> str:
+    if country:
+        return append_geo_to_marketplace_url(url, country)
+    return url
+
+
 def urls_for_country_category(country: str, url_path: str) -> list[str]:
     """Только регионы выбранной страны (без глобального marketplace/category/…)."""
     cfg = COUNTRY_LOCATIONS.get(country) or {}
@@ -370,11 +390,12 @@ async def fetch_category_listings(
         if on_url_progress:
             short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
             await on_url_progress(i, total_urls, short)
-        logger.info("GET %s", url)
+        fetch_url = with_country_geo(url, country)
+        logger.info("GET %s", fetch_url)
         try:
             batch, meta = await _fetch_page(
                 token,
-                url=url,
+                url=fetch_url,
                 user_agent=user_agent,
                 proxy_url=proxy_url,
                 timeout_sec=timeout_sec,

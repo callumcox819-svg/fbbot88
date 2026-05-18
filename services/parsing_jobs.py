@@ -33,6 +33,7 @@ from parser.marketplace import (
     listing_is_valid,
     listings_to_json,
 )
+from parser.marketplace_region import apply_marketplace_region
 from services.categories import list_user_categories
 from services.proxies import pick_random_proxy_url
 
@@ -249,6 +250,22 @@ async def _parse_impl(
     current_step["text"] = f"Категорий: {cat_count}{country_label}"
     await status_progress()
     logger.info("parse start tg=%s limit=%s cats=%s country=%s", telegram_id, json_limit, cat_count, country)
+
+    async with Session() as session:
+        proxy_url_boot = await pick_random_proxy_url(session, user_id)
+    try:
+        current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
+        await status_progress()
+        await apply_marketplace_region(
+            token,
+            country,
+            user_agent=config.fb_user_agent,
+            proxy_url=proxy_url_boot,
+        )
+    except AccountTokenDeadError:
+        token_dead_flag["value"] = True
+        await _notify_token_dead(bot, telegram_id, on_status)
+        return
 
     try:
         while len(collected) < json_limit and not stop.is_set():
