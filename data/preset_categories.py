@@ -12,7 +12,6 @@ class PresetCategory:
     url_path: str
 
 
-# Основные разделы Marketplace (facebook.com/marketplace/category/…)
 PRESET_CATEGORIES: tuple[PresetCategory, ...] = (
     PresetCategory("vehicles", "🚗 Транспорт", "category/vehicles"),
     PresetCategory("electronics", "📱 Электроника", "category/electronics"),
@@ -49,8 +48,35 @@ PRESET_BY_KEY = {c.key: c for c in PRESET_CATEGORIES}
 
 MAX_CATEGORIES_PER_USER = 7
 
-# Фильтр страны — по полю location в объявлении (URL всегда /marketplace/category/…)
-COUNTRY_LOCATIONS: dict[str, dict[str, str]] = {
-    "ch": {"label": "🇨🇭 Швейцария"},
-    "fi": {"label": "🇫🇮 Финляндия"},
+# Сбор по всей стране: несколько регионов FB + фильтр «это CH/FI, не другая страна»
+COUNTRY_LOCATIONS: dict[str, dict] = {
+    "ch": {
+        "label": "🇨🇭 Швейцария",
+        # marketplace/{slug}/category/…
+        "marketplace_slugs": ["switzerland"],
+        "region_hubs": [
+            "zurich",
+            "geneva",
+            "bern",
+            "basel",
+            "lausanne",
+            "lugano",
+            "winterthur",
+            "lucerne",
+            "stgallen",
+        ],
+    },
+    "fi": {
+        "label": "🇫🇮 Финляндия",
+        "marketplace_slugs": ["finland"],
+        "region_hubs": [
+            "helsinki",
+            "tampere",
+            "turku",
+            "oulu",
+            "espoo",
+            "vantaa",
+            "jyvaskyla",
+        ],
+    },
 }

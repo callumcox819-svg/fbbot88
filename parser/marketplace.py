@@ -57,24 +57,85 @@ def _unescape(s: str) -> str:
         return s.replace("\\u0027", "'").replace('\\"', '"')
 
 
+_CH_OK = (
+    "switzerland",
+    "schweiz",
+    "suisse",
+    "svizzera",
+    "switzerland",
+    "ch-",
+    " zürich",
+    " zurich",
+    " geneva",
+    " genève",
+    " bern",
+    " basel",
+    " lausanne",
+    " lugano",
+    " winterthur",
+    " luzern",
+    " lucerne",
+    " st. gallen",
+    " st gallen",
+)
+_CH_REJECT = (
+    "germany",
+    "deutschland",
+    "france",
+    "italy",
+    "italia",
+    "austria",
+    "österreich",
+    "united kingdom",
+    " uk",
+    "finland",
+    "suomi",
+)
+_FI_OK = (
+    "finland",
+    "suomi",
+    "helsinki",
+    "tampere",
+    "turku",
+    "oulu",
+    "espoo",
+    "vantaa",
+    "jyväskylä",
+    "jyvaskyla",
+    "lahti",
+)
+_FI_REJECT = (
+    "sweden",
+    "sverige",
+    "norway",
+    "norge",
+    "estonia",
+    "germany",
+    "deutschland",
+    "switzerland",
+    "schweiz",
+    "russia",
+)
+
+
 def _country_location_ok(location: str, country: str | None) -> bool:
+    """Страна целиком: не режем по одному городу; отсекаем явно чужие страны."""
     if not country:
         return True
-    loc = (location or "").lower()
+    loc = f" {(location or '').lower()} "
     if country == "ch":
-        hints = (
-            "switzerland", "schweiz", "suisse", "zürich", "zurich", "geneva", "genève",
-            "bern", "basel", "lausanne", "lugano", "winterthur",
-        )
-    elif country == "fi":
-        hints = (
-            "finland", "suomi", "helsinki", "tampere", "turku", "oulu", "espoo", "vantaa",
-        )
-    else:
-        return True
-    if not loc:
-        return True
-    return any(h in loc for h in hints)
+        if any(r in loc for r in _CH_REJECT):
+            return False
+        if not loc.strip():
+            return True
+        return any(h in loc for h in _CH_OK)
+    if country == "fi":
+        if any(r in loc for r in _FI_REJECT):
+            return False
+        if not loc.strip():
+            return True
+        return any(h in loc for h in _FI_OK)
+    return True
 
 
 def normalize_category_path(url_or_path: str) -> str:
@@ -96,10 +157,41 @@ def normalize_category_path(url_or_path: str) -> str:
     return path
 
 
-def build_category_url(url_path: str) -> str:
-    """Как в браузере: https://www.facebook.com/marketplace/category/sports"""
+def _category_slug(url_path: str) -> str:
     path = normalize_category_path(url_path)
-    return urljoin(_FB_BASE, f"{path}/")
+    return path.split("/", 1)[1] if "/" in path else path
+
+
+def build_category_url(url_path: str, *, marketplace_root: str | None = None) -> str:
+    """
+    Без страны: marketplace/category/sports/
+    По стране: marketplace/switzerland/category/sports/ или marketplace/zurich/category/sports/
+    """
+    cat_path = normalize_category_path(url_path)
+    slug = _category_slug(url_path)
+    if marketplace_root:
+        root = marketplace_root.strip("/")
+        return urljoin(_FB_BASE, f"{root}/category/{slug}/")
+    return urljoin(_FB_BASE, f"{cat_path}/")
+
+
+def urls_for_country_category(country: str, url_path: str) -> list[str]:
+    """URL по всей стране: общий slug + крупные города (регионы FB)."""
+    cfg = COUNTRY_LOCATIONS.get(country) or {}
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(u: str) -> None:
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    add(build_category_url(url_path))
+    for slug in cfg.get("marketplace_slugs") or []:
+        add(build_category_url(url_path, marketplace_root=slug))
+    for hub in cfg.get("region_hubs") or []:
+        add(build_category_url(url_path, marketplace_root=hub))
+    return urls
 
 
 async def fetch_category_listings(
@@ -113,27 +205,53 @@ async def fetch_category_listings(
     limit: int,
     timeout_sec: float = 45.0,
 ) -> list[MarketplaceListing]:
-    """Собрать объявления из категории. Страна — фильтр по городу в объявлении."""
-    url = build_category_url(url_path)
-    logger.info("fetch category url=%s country=%s", url, country or "all")
+    """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
+    if country and country in COUNTRY_LOCATIONS:
+        urls = urls_for_country_category(country, url_path)
+    else:
+        urls = [build_category_url(url_path)]
 
-    batch = await _fetch_page(
-        token,
-        url=url,
-        user_agent=user_agent,
-        proxy_url=proxy_url,
-        timeout_sec=timeout_sec,
-        category_label=category_label,
-    )
-
+    seen_ids: set[str] = set()
     out: list[MarketplaceListing] = []
-    for item in batch:
-        if country and not _country_location_ok(item.location, country):
-            continue
-        out.append(item)
+
+    for url in urls:
         if len(out) >= limit:
             break
+        try:
+            batch = await _fetch_page(
+                token,
+                url=url,
+                user_agent=user_agent,
+                proxy_url=proxy_url,
+                timeout_sec=timeout_sec,
+                category_label=category_label,
+            )
+        except RuntimeError as e:
+            if "HTTP 400" in str(e) or "HTTP 404" in str(e):
+                logger.info("skip url %s: %s", url, e)
+                continue
+            raise
+        except Exception as e:
+            logger.warning("skip url %s: %s", url, e)
+            continue
 
+        for item in batch:
+            if item.listing_id in seen_ids:
+                continue
+            if country and not _country_location_ok(item.location, country):
+                continue
+            seen_ids.add(item.listing_id)
+            out.append(item)
+            if len(out) >= limit:
+                break
+
+    logger.info(
+        "category %s country=%s urls=%s collected=%s",
+        category_label,
+        country or "all",
+        len(urls),
+        len(out),
+    )
     return out[:limit]
 
 

@@ -49,7 +49,7 @@ async def open_settings(message: Message, db_user: User | None = None) -> None:
         f"📦 Лимит JSON: <b>{db_user.json_limit or 50}</b>\n"
         f"📂 Активных категорий: <b>{n_cats}/{MAX_CATEGORIES_PER_USER}</b>\n"
         f"🌍 Страна: <b>{_country_label(country)}</b>\n\n"
-        "<i>🟢 — включено (парсится), 🔴 — выключено</i>"
+        "<i>🟢 CH/FI — парсинг по всей стране (все регионы), 🔴 — выкл.</i>"
     )
     await message.answer(
         text,
