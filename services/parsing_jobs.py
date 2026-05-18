@@ -190,6 +190,7 @@ async def _parse_impl(
                         limit=min(max(need * 2, 30), 120),
                         timeout_sec=22.0,
                         on_url_progress=on_url,
+                        graphql_doc_id=config.fb_marketplace_doc_id,
                     )
                     connect_fails = 0
                     break

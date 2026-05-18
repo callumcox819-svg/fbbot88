@@ -29,30 +29,63 @@ _PRICE_RE = re.compile(
 _SELLER_RE = re.compile(r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"')
 _PHOTO_RE = re.compile(r'"uri"\s*:\s*"(https://[^"]*scontent[^"]*)"')
 _LOCATION_RE = re.compile(r'"city"\s*:\s*"([^"]+)"|"location_text"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"')
+_DESC_RE = re.compile(
+    r'"marketplace_listing_description"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"redacted_description"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
+_SELLER_ID_RE = re.compile(r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"')
+_PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d+)")
+_REL_TIME_RE = re.compile(
+    r'"(?:creation_time|listing_created_time|time_created)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
+)
+_JOIN_TIME_RE = re.compile(
+    r'"(?:join_time|seller_join_time|marketplace_seller_join_time)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
+)
+_ADS_COUNT_RE = re.compile(
+    r'"(?:active_listing_count|marketplace_listing_count|listing_count)"\s*:\s*(\d+)'
+)
+_GENDER_RE = re.compile(r'"gender"\s*:\s*"([^"]+)"')
+_RATING_RE = re.compile(r'"(?:marketplace_rating|rating)"\s*:\s*(\d+(?:\.\d+)?)')
+_SCRIPT_JSON_RE = re.compile(
+    r'<script[^>]+type="application/json"[^>]*>([^<]+)</script>',
+    re.IGNORECASE,
+)
+_WINDOW_BEFORE = 900
+_WINDOW_AFTER = 6500
+
+_GENDER_RU = {
+    "MALE": "Мужской",
+    "FEMALE": "Женский",
+    "male": "Мужской",
+    "female": "Женский",
+    "OTHER": "Другое",
+}
 
 
 @dataclass
 class MarketplaceListing:
     listing_id: str
-    title: str
-    price: str
-    link: str
-    seller_name: str
-    photo: str
-    location: str
-    category: str
-
-    def to_export_dict(self) -> dict[str, Any]:
-        return {
-            "item_title": self.title,
-            "item_price": self.price,
-            "item_link": self.link,
-            "item_person_name": self.seller_name,
-            "item_photo": self.photo,
-            "location": self.location,
-            "listing_id": self.listing_id,
-            "category": self.category,
-        }
+    title: str = ""
+    price: str = ""
+    link: str = ""
+    seller_name: str = ""
+    photo: str = ""
+    location: str = ""
+    category: str = ""
+    item_desc: str = ""
+    person_link: str = ""
+    created_date: str = ""
+    created_real_date: str = ""
+    person_reg_date: str = ""
+    ads_number: int | None = None
+    ads_number_bought: int | None = None
+    ads_number_sold: int | None = None
+    gender: str = ""
+    email: str = ""
+    phone: str = ""
+    views: int | None = None
+    parser_views: int = 0
+    rating: float | int = 0
 
 
 def _unescape(s: str) -> str:
@@ -210,6 +243,7 @@ async def fetch_category_listings(
     limit: int,
     timeout_sec: float = 22.0,
     on_url_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    graphql_doc_id: str | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
     if country and country in COUNTRY_LOCATIONS:
@@ -236,6 +270,7 @@ async def fetch_category_listings(
                 proxy_url=proxy_url,
                 timeout_sec=timeout_sec,
                 category_label=category_label,
+                graphql_doc_id=graphql_doc_id,
             )
             logger.info(
                 "parsed %s items from %s (html=%s, links=%s)",
@@ -298,6 +333,41 @@ def is_connection_error(exc: BaseException) -> bool:
     )
 
 
+def _gender_ru(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    return _GENDER_RU.get(s, s)
+
+
+def _first_match(pattern: re.Pattern[str], text: str) -> str:
+    m = pattern.search(text)
+    if not m:
+        return ""
+    g = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else "")
+    return _unescape(g) if g else ""
+
+
+def _int_or_none(s: str) -> int | None:
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_listing(base: MarketplaceListing, patch: dict[str, Any]) -> MarketplaceListing:
+    for key, val in patch.items():
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        if hasattr(base, key):
+            setattr(base, key, val)
+    if base.listing_id and not base.link:
+        base.link = f"https://www.facebook.com/marketplace/item/{base.listing_id}/"
+    return base
+
+
 def _looks_like_login_wall(html: str) -> bool:
     h = html.lower()
     if "id=\"loginform\"" in h or 'id="loginform"' in h:
@@ -307,6 +377,153 @@ def _looks_like_login_wall(html: str) -> bool:
     if "marketplace/item/" not in h and ("login" in h[:8000] or "log in" in h[:8000]):
         return True
     return False
+
+
+def _parse_chunk(chunk: str, lid: str) -> dict[str, Any]:
+    seller_id = _first_match(_SELLER_ID_RE, chunk)
+    profile_m = _PROFILE_LINK_RE.search(chunk)
+    person_link = ""
+    if profile_m:
+        person_link = f"https://www.facebook.com/marketplace/profile/{profile_m.group(1)}/"
+    elif seller_id:
+        person_link = f"https://www.facebook.com/marketplace/profile/{seller_id}/"
+
+    ads_raw = _first_match(_ADS_COUNT_RE, chunk)
+    rating_raw = _first_match(_RATING_RE, chunk)
+
+    return {
+        "title": _first_match(_TITLE_RE, chunk),
+        "price": _first_match(_PRICE_RE, chunk),
+        "seller_name": _first_match(_SELLER_RE, chunk),
+        "photo": _first_match(_PHOTO_RE, chunk),
+        "location": _first_match(_LOCATION_RE, chunk),
+        "item_desc": _first_match(_DESC_RE, chunk),
+        "person_link": person_link,
+        "created_date": _first_match(_REL_TIME_RE, chunk),
+        "person_reg_date": _first_match(_JOIN_TIME_RE, chunk),
+        "gender": _gender_ru(_first_match(_GENDER_RE, chunk)),
+        "ads_number": _int_or_none(ads_raw) if ads_raw else None,
+        "rating": float(rating_raw) if rating_raw else None,
+    }
+
+
+def _dig_str(obj: Any, *keys: str) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    for key in keys:
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            t = val.get("text")
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    return ""
+
+
+def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(node.get("product_item"), dict):
+        pi = node["product_item"]
+        if isinstance(pi.get("for_sale_item"), dict):
+            return _listing_from_graph_node(pi["for_sale_item"])
+
+    fs = node.get("for_sale_item") or node.get("listing") or node
+    if not isinstance(fs, dict):
+        fs = node
+
+    lid = str(fs.get("id") or node.get("id") or "").strip()
+    title = _dig_str(fs, "marketplace_listing_title", "group_commerce_item_title", "title")
+    if not lid and not title:
+        return None
+    if lid and not lid.isdigit():
+        return None
+
+    price = _dig_str(fs, "formatted_price", "formatted_amount")
+    if not price:
+        price_obj = fs.get("formatted_price") or fs.get("price")
+        if isinstance(price_obj, dict):
+            price = _dig_str(price_obj, "text")
+
+    location = _dig_str(fs, "marketplace_listing_location", "location")
+    seller = fs.get("marketplace_listing_seller") or fs.get("seller")
+    seller_name = ""
+    seller_id = ""
+    if isinstance(seller, dict):
+        seller_name = _dig_str(seller, "name", "marketplace_listing_seller_name")
+        seller_id = str(seller.get("id") or "").strip()
+
+    photo = ""
+    photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
+    if isinstance(photo_obj, dict):
+        img = photo_obj.get("image") or photo_obj
+        if isinstance(img, dict):
+            photo = str(img.get("uri") or "").strip()
+
+    person_link = ""
+    if seller_id:
+        person_link = f"https://www.facebook.com/marketplace/profile/{seller_id}/"
+
+    created = ""
+    ct = fs.get("creation_time") or fs.get("listing_created_time")
+    if isinstance(ct, dict):
+        created = _dig_str(ct, "text")
+
+    reg = ""
+    jt = fs.get("join_time") or fs.get("seller_join_time")
+    if isinstance(jt, dict):
+        reg = _dig_str(jt, "text")
+
+    ads = fs.get("active_listing_count") or fs.get("marketplace_listing_count")
+    ads_n = int(ads) if isinstance(ads, (int, float)) else None
+
+    rating = fs.get("marketplace_rating") or fs.get("rating")
+    rating_v: float | int = 0
+    if isinstance(rating, (int, float)):
+        rating_v = rating
+
+    gender = _gender_ru(_dig_str(fs, "gender"))
+
+    return {
+        "listing_id": lid,
+        "title": title,
+        "price": price,
+        "seller_name": seller_name,
+        "photo": photo,
+        "location": location,
+        "item_desc": _dig_str(fs, "marketplace_listing_description", "description"),
+        "person_link": person_link,
+        "created_date": created,
+        "person_reg_date": reg,
+        "ads_number": ads_n,
+        "gender": gender,
+        "rating": rating_v,
+    }
+
+
+def _walk_marketplace_json(obj: Any, out: dict[str, MarketplaceListing]) -> None:
+    if isinstance(obj, dict):
+        patch = _listing_from_graph_node(obj)
+        if patch and patch.get("listing_id"):
+            lid = str(patch["listing_id"])
+            if lid not in out:
+                out[lid] = MarketplaceListing(listing_id=lid, category="")
+            _merge_listing(out[lid], patch)
+        for val in obj.values():
+            _walk_marketplace_json(val, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_marketplace_json(item, out)
+
+
+def _parse_embedded_scripts(html: str) -> dict[str, MarketplaceListing]:
+    by_id: dict[str, MarketplaceListing] = {}
+    for raw in _SCRIPT_JSON_RE.findall(html):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        _walk_marketplace_json(data, by_id)
+    return by_id
 
 
 def _first_group(matches: list) -> list[str]:
@@ -328,6 +545,72 @@ def _collect_listing_ids(html: str) -> list[str]:
     return seen
 
 
+def _seo_path_from_url(url: str) -> str:
+    return url.replace("https://www.facebook.com/marketplace/", "").strip("/")
+
+
+async def _fetch_graphql_category(
+    token: AccountToken,
+    *,
+    seo_path: str,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    category_label: str,
+    doc_id: str,
+    limit: int,
+) -> list[MarketplaceListing] | None:
+    if not token.access_token:
+        return None
+
+    variables: dict[str, Any] = {
+        "count": min(limit, 48),
+        "cursor": None,
+        "scale": 2,
+        "seoURL": seo_path,
+    }
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Origin": "https://www.facebook.com",
+        "Referer": f"https://www.facebook.com/marketplace/{seo_path}/",
+    }
+    body = {
+        "doc_id": doc_id,
+        "variables": json.dumps(variables),
+        "access_token": token.access_token,
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with _session_for_proxy(proxy_url) as session:
+            async with session.post(
+                "https://www.facebook.com/api/graphql/",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            ) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400:
+                    return None
+                data = json.loads(raw)
+    except Exception as e:
+        logger.debug("graphql category failed %s: %s", seo_path, e)
+        return None
+
+    by_id: dict[str, MarketplaceListing] = {}
+    _walk_marketplace_json(data, by_id)
+    for lid, item in by_id.items():
+        item.category = category_label
+        if not item.link:
+            item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
+    items = list(by_id.values())
+    if items:
+        logger.info("graphql %s: %s items (doc_id=%s)", seo_path, len(items), doc_id[:8])
+    return items or None
+
+
 async def _fetch_page(
     token: AccountToken,
     *,
@@ -336,7 +619,28 @@ async def _fetch_page(
     proxy_url: str | None,
     timeout_sec: float,
     category_label: str,
+    graphql_doc_id: str | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, int]]:
+    seo = _seo_path_from_url(url)
+    if graphql_doc_id:
+        gql_items = await _fetch_graphql_category(
+            token,
+            seo_path=seo,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            category_label=category_label,
+            doc_id=graphql_doc_id,
+            limit=80,
+        )
+        if gql_items:
+            return gql_items, {
+                "html_len": 0,
+                "link_count": len(gql_items),
+                "parsed": len(gql_items),
+                "source": "graphql",
+            }
+
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
@@ -365,39 +669,65 @@ async def _fetch_page(
             "Facebook отдал страницу входа — обнови токен аккаунта (cookies истекли)"
         )
 
-    return _parse_html(html, category_label), meta
+    items = _parse_html(html, category_label)
+    meta["parsed"] = len(items)
+    return items, meta
 
 
 def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
-    by_id: dict[str, MarketplaceListing] = {}
-    titles = _first_group(list(_TITLE_RE.finditer(html)))
-    prices = _first_group(list(_PRICE_RE.finditer(html)))
-    sellers = _first_group(list(_SELLER_RE.finditer(html)))
-    photos = _first_group(list(_PHOTO_RE.finditer(html)))
-    locs: list[str] = []
-    for m in _LOCATION_RE.finditer(html):
-        locs.append(_unescape(m.group(1) or m.group(2) or ""))
+    by_id: dict[str, MarketplaceListing] = _parse_embedded_scripts(html)
 
     ids_in_order = _collect_listing_ids(html)
+    for lid in ids_in_order:
+        pos = html.find(f"/marketplace/item/{lid}")
+        if pos < 0:
+            pos = html.find(f'"{lid}"')
+        chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER] if pos >= 0 else html
+        patch = _parse_chunk(chunk, lid)
+        if lid not in by_id:
+            by_id[lid] = MarketplaceListing(
+                listing_id=lid,
+                link=f"https://www.facebook.com/marketplace/item/{lid}/",
+                category=category_label,
+            )
+        patch["listing_id"] = lid
+        if not patch.get("title"):
+            patch.pop("title", None)
+        _merge_listing(by_id[lid], patch)
+        by_id[lid].category = category_label
 
-    for i, lid in enumerate(ids_in_order):
-        title = titles[i] if i < len(titles) else ""
-        if not title and titles:
-            title = titles[0]
-        if not title:
-            title = f"Listing {lid}"
-        by_id[lid] = MarketplaceListing(
-            listing_id=lid,
-            title=title,
-            price=prices[i] if i < len(prices) else "",
-            link=f"https://www.facebook.com/marketplace/item/{lid}/",
-            seller_name=sellers[i] if i < len(sellers) else "",
-            photo=photos[i] if i < len(photos) else "",
-            location=locs[i] if i < len(locs) else "",
-            category=category_label,
-        )
+    # fallback: плоские массивы по порядку id
+    if len(by_id) < len(ids_in_order):
+        titles = _first_group(list(_TITLE_RE.finditer(html)))
+        prices = _first_group(list(_PRICE_RE.finditer(html)))
+        sellers = _first_group(list(_SELLER_RE.finditer(html)))
+        photos = _first_group(list(_PHOTO_RE.finditer(html)))
+        locs = [_unescape(m.group(1) or m.group(2) or "") for m in _LOCATION_RE.finditer(html)]
+        for i, lid in enumerate(ids_in_order):
+            if lid in by_id and by_id[lid].title:
+                continue
+            title = titles[i] if i < len(titles) else (titles[0] if titles else f"Listing {lid}")
+            by_id[lid] = MarketplaceListing(
+                listing_id=lid,
+                title=title,
+                price=prices[i] if i < len(prices) else "",
+                link=f"https://www.facebook.com/marketplace/item/{lid}/",
+                seller_name=sellers[i] if i < len(sellers) else "",
+                photo=photos[i] if i < len(photos) else "",
+                location=locs[i] if i < len(locs) else "",
+                category=category_label,
+            )
+
+    for item in by_id.values():
+        if not item.title:
+            item.title = f"Listing {item.listing_id}"
+        if not item.link:
+            item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
+
     return list(by_id.values())
 
 
 def listings_to_json(items: list[MarketplaceListing]) -> str:
-    return json.dumps([x.to_export_dict() for x in items], ensure_ascii=False, indent=2)
+    from parser.void_format import listings_to_void_json
+
+    return listings_to_void_json(items)
