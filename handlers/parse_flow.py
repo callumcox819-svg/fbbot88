@@ -96,11 +96,15 @@ async def on_token_input(message: Message, state: FSMContext, db_user: User) -> 
 
 
 async def _launch_parse(message: Message, telegram_id: int, db_user: User, token_raw: str) -> None:
-    status_msg = await message.answer("⏳ Запускаю парсинг…", reply_markup=main_menu_kb(is_admin=db_user.is_admin))
+    status_msg = await message.answer(
+        "⏳ Запуск…",
+        reply_markup=main_menu_kb(is_admin=db_user.is_admin),
+        disable_web_page_preview=True,
+    )
 
     async def on_status(text: str) -> None:
         try:
-            await status_msg.edit_text(text, parse_mode="HTML")
+            await status_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             pass
 

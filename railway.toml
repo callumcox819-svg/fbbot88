@@ -4,3 +4,6 @@ builder = "nixpacks"
 [deploy]
 startCommand = "python bot.py"
 restartPolicyType = "on_failure"
+
+# В Railway: Volume mount path /data, Variable DATABASE_PATH=/data/fb_bot.db
+# (прокси и категории каждого пользователя сохраняются в SQLite)
