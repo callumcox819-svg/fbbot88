@@ -24,6 +24,8 @@ class Config:
     admin_ids: frozenset[int]
     fb_user_agent: str
     fb_marketplace_doc_id: str | None
+    fb_marketplace_browse_doc_id: str | None
+    listing_max_age_hours: float
 
 
 def load_config() -> Config:
@@ -40,6 +42,10 @@ def load_config() -> Config:
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         ).strip(),
         fb_marketplace_doc_id=(os.getenv("FB_MARKETPLACE_DOC_ID") or "").strip() or None,
+        fb_marketplace_browse_doc_id=(
+            (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip() or None
+        ),
+        listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "3"),
     )
 
 

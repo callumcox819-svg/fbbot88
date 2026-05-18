@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin
@@ -42,6 +43,11 @@ _PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d+)")
 _REL_TIME_RE = re.compile(
     r'"(?:creation_time|listing_created_time|time_created)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
+_CREATION_UNIX_RE = re.compile(
+    r'"(?:creation_time|listing_created_time|time_created)"\s*:\s*\{[^}]{0,200}?"timestamp"\s*:\s*(\d{9,11})'
+)
+_MAX_CATEGORY_FEED_PAGES = 25
+_FEED_PAGE_SIZE = 24
 _JOIN_TIME_RE = re.compile(
     r'"(?:join_time|seller_join_time|marketplace_seller_join_time)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
@@ -80,6 +86,7 @@ class MarketplaceListing:
     item_desc: str = ""
     person_link: str = ""
     created_date: str = ""
+    created_timestamp: int | None = None
     created_real_date: str = ""
     person_reg_date: str = ""
     ads_number: int | None = None
@@ -234,9 +241,73 @@ def listing_is_valid(item: MarketplaceListing) -> bool:
     return True
 
 
-def listing_is_export_ready(item: MarketplaceListing, country: str | None = None) -> bool:
+def listing_is_export_ready(
+    item: MarketplaceListing,
+    country: str | None = None,
+    *,
+    max_age_hours: float | None = None,
+) -> bool:
     """Карточка как в ленте VOID: название + цена и/или фото (не пустышка)."""
-    return export_reject_reason(item, country) is None
+    return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
+
+
+def _dig_timestamp(ct: Any) -> int | None:
+    if isinstance(ct, (int, float)) and ct > 1_000_000_000:
+        return int(ct)
+    if not isinstance(ct, dict):
+        return None
+    for key in ("timestamp", "unix", "time"):
+        val = ct.get(key)
+        if isinstance(val, (int, float)) and val > 1_000_000_000:
+            return int(val)
+    rel = _dig_str(ct, "text")
+    if rel:
+        hours = _parse_relative_time_hours(rel)
+        if hours is not None:
+            return int(time.time() - hours * 3600)
+    return None
+
+
+def _parse_relative_time_hours(text: str) -> float | None:
+    t = (text or "").lower().strip()
+    if not t:
+        return None
+    if any(x in t for x in ("just now", "gerade", "à l'instant", "maintenant", "aujourd")):
+        return 0.0
+    if any(x in t for x in ("yesterday", "gestern", "hier")):
+        return 24.0
+    m = re.search(r"(\d+)\s*(?:min(?:ute)?s?|min\.?|мин)", t)
+    if m:
+        return int(m.group(1)) / 60.0
+    m = re.search(r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?)", t)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"(\d+)\s*(?:d|days?|tage?|jours?)", t)
+    if m:
+        return float(m.group(1)) * 24.0
+    return None
+
+
+def listing_age_hours(item: MarketplaceListing) -> float | None:
+    if item.created_timestamp:
+        return max(0.0, (time.time() - item.created_timestamp) / 3600.0)
+    if item.created_date:
+        return _parse_relative_time_hours(item.created_date)
+    return None
+
+
+def _feed_page_all_too_old(batch: list[MarketplaceListing], max_age_hours: float) -> bool:
+    """Лента обычно от новых к старым — если страница целиком старше лимита, дальше не листаем."""
+    checked = 0
+    old = 0
+    for item in batch:
+        age = listing_age_hours(item)
+        if age is None:
+            continue
+        checked += 1
+        if age > max_age_hours:
+            old += 1
+    return checked >= 3 and old == checked
 
 
 def _price_hints_country(price: str, country: str) -> bool:
@@ -261,9 +332,20 @@ def _location_explicitly_foreign(location: str, country: str) -> bool:
     return False
 
 
-def export_reject_reason(item: MarketplaceListing, country: str | None = None) -> str | None:
+def export_reject_reason(
+    item: MarketplaceListing,
+    country: str | None = None,
+    *,
+    max_age_hours: float | None = None,
+) -> str | None:
     if not listing_is_valid(item):
         return "нет_заголовка"
+    if max_age_hours is not None:
+        age_h = listing_age_hours(item)
+        if age_h is None:
+            return "время_неизвестно"
+        if age_h > max_age_hours:
+            return "старше_3ч"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
     if country and _location_explicitly_foreign(loc, country):
@@ -404,6 +486,7 @@ async def fetch_category_listings(
     should_stop: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
+    max_listing_age_hours: float | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
     if country and country in COUNTRY_LOCATIONS:
@@ -424,48 +507,87 @@ async def fetch_category_listings(
             short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
             await on_url_progress(i, total_urls, short)
         fetch_url = with_country_geo(url, country)
-        logger.info("GET %s", fetch_url)
+        short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
+        cursor: str | None = None
+        has_next = True
         try:
-            batch, meta = await _fetch_page(
-                token,
-                url=fetch_url,
-                user_agent=user_agent,
-                proxy_url=proxy_url,
-                timeout_sec=timeout_sec,
-                category_label=category_label,
-                graphql_doc_id=graphql_doc_id,
-            )
-            logger.info(
-                "parsed %s items from %s (html=%s, links=%s)",
-                len(batch),
-                short if on_url_progress else url,
-                meta.get("html_len"),
-                meta.get("link_count"),
-            )
-            page_new: list[MarketplaceListing] = []
-            for item in batch:
-                if not listing_is_valid(item):
-                    continue
-                if item.listing_id in seen_ids:
-                    continue
-                seen_ids.add(item.listing_id)
-                page_new.append(item)
-                out.append(item)
+            for page_no in range(1, _MAX_CATEGORY_FEED_PAGES + 1):
+                if should_stop and should_stop():
+                    break
                 if len(out) >= limit:
                     break
+                if not has_next and page_no > 1:
+                    break
+                if on_url_progress:
+                    page_hint = f" стр.{page_no}" if page_no > 1 else ""
+                    await on_url_progress(i, total_urls, f"{short[:40]}{page_hint}")
+                logger.info("GET %s page=%s cursor=%s", fetch_url, page_no, bool(cursor))
+                try:
+                    batch, meta, cursor, has_next = await _fetch_page(
+                        token,
+                        url=fetch_url,
+                        user_agent=user_agent,
+                        proxy_url=proxy_url,
+                        timeout_sec=timeout_sec,
+                        category_label=category_label,
+                        graphql_doc_id=graphql_doc_id,
+                        cursor=cursor,
+                    )
+                except RuntimeError as e:
+                    if page_no == 1:
+                        raise
+                    logger.info("stop pagination at page %s: %s", page_no, e)
+                    break
+                except Exception as e:
+                    if page_no == 1:
+                        raise
+                    logger.warning("pagination page %s failed: %s", page_no, e)
+                    break
 
-            if batch and not page_new:
-                logger.debug(
-                    "url %s: parsed %s, 0 new (duplicates or invalid)",
-                    short if on_url_progress else url,
+                logger.info(
+                    "parsed %s items from %s p%s (html=%s, links=%s, next=%s)",
                     len(batch),
+                    short,
+                    page_no,
+                    meta.get("html_len"),
+                    meta.get("link_count"),
+                    has_next,
                 )
-            if on_page_found and page_new:
-                await on_page_found(len(page_new))
-            if on_page_items and page_new:
-                await on_page_items(page_new)
-            if len(out) >= limit:
-                break
+                page_new: list[MarketplaceListing] = []
+                for item in batch:
+                    if not listing_is_valid(item):
+                        continue
+                    if item.listing_id in seen_ids:
+                        continue
+                    seen_ids.add(item.listing_id)
+                    page_new.append(item)
+                    out.append(item)
+                    if len(out) >= limit:
+                        break
+
+                if batch and not page_new:
+                    logger.debug(
+                        "url %s p%s: parsed %s, 0 new (duplicates or invalid)",
+                        short,
+                        page_no,
+                        len(batch),
+                    )
+                if on_page_found and page_new:
+                    await on_page_found(len(page_new))
+                if on_page_items and page_new:
+                    await on_page_items(page_new)
+                if len(out) >= limit:
+                    break
+                if max_listing_age_hours and _feed_page_all_too_old(batch, max_listing_age_hours):
+                    logger.info(
+                        "stop pagination %s: page %s all older than %sh",
+                        short,
+                        page_no,
+                        max_listing_age_hours,
+                    )
+                    break
+                if not has_next or not cursor:
+                    break
         except RuntimeError as e:
             if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                 logger.info("skip url %s: %s", url, e)
@@ -567,6 +689,13 @@ def _parse_chunk(chunk: str, lid: str) -> dict[str, Any]:
 
     ads_raw = _first_match(_ADS_COUNT_RE, chunk)
     rating_raw = _first_match(_RATING_RE, chunk)
+    created_date = _first_match(_REL_TIME_RE, chunk)
+    created_ts_raw = _first_match(_CREATION_UNIX_RE, chunk)
+    created_ts = int(created_ts_raw) if created_ts_raw else None
+    if not created_ts and created_date:
+        hours = _parse_relative_time_hours(created_date)
+        if hours is not None:
+            created_ts = int(time.time() - hours * 3600)
 
     return {
         "title": _first_match(_TITLE_RE, chunk),
@@ -577,7 +706,8 @@ def _parse_chunk(chunk: str, lid: str) -> dict[str, Any]:
         "location": _first_match(_LOCATION_RE, chunk),
         "item_desc": _first_match(_DESC_RE, chunk),
         "person_link": person_link,
-        "created_date": _first_match(_REL_TIME_RE, chunk),
+        "created_date": created_date,
+        "created_timestamp": created_ts,
         "person_reg_date": _first_match(_JOIN_TIME_RE, chunk),
         "gender": _gender_ru(_first_match(_GENDER_RE, chunk)),
         "ads_number": _int_or_none(ads_raw) if ads_raw else None,
@@ -645,9 +775,13 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
         person_link = f"https://www.facebook.com/marketplace/profile/{seller_id}/"
 
     created = ""
+    created_ts: int | None = None
     ct = fs.get("creation_time") or fs.get("listing_created_time")
     if isinstance(ct, dict):
         created = _dig_str(ct, "text")
+        created_ts = _dig_timestamp(ct)
+    elif isinstance(ct, (int, float)):
+        created_ts = int(ct)
 
     reg = ""
     jt = fs.get("join_time") or fs.get("seller_join_time")
@@ -675,11 +809,46 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
         "item_desc": _dig_str(fs, "marketplace_listing_description", "description"),
         "person_link": person_link,
         "created_date": created,
+        "created_timestamp": created_ts,
         "person_reg_date": reg,
         "ads_number": ads_n,
         "gender": gender,
         "rating": rating_v,
     }
+
+
+def _extract_feed_cursor(obj: Any) -> tuple[str | None, bool]:
+    found: dict[str, Any] = {"cursor": None, "has_next": False}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            pi = node.get("page_info")
+            if isinstance(pi, dict):
+                ec = pi.get("end_cursor")
+                if isinstance(ec, str) and ec:
+                    found["cursor"] = ec
+                if pi.get("has_next_page"):
+                    found["has_next"] = True
+            for val in node.values():
+                walk(val)
+        elif isinstance(node, list):
+            for val in node:
+                walk(val)
+
+    walk(obj)
+    return found["cursor"], bool(found["has_next"])
+
+
+def _extract_cursor_from_html(html: str) -> tuple[str | None, bool]:
+    for raw in _SCRIPT_JSON_RE.findall(html):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        cursor, has_next = _extract_feed_cursor(data)
+        if cursor:
+            return cursor, has_next
+    return None, False
 
 
 def _walk_marketplace_json(obj: Any, out: dict[str, MarketplaceListing]) -> None:
@@ -779,6 +948,7 @@ async def enrich_listing(
             "item_desc": best.item_desc,
             "person_link": best.person_link,
             "created_date": best.created_date,
+            "created_timestamp": best.created_timestamp,
             "person_reg_date": best.person_reg_date,
             "gender": best.gender,
             "ads_number": best.ads_number,
@@ -801,13 +971,14 @@ async def _fetch_graphql_category(
     category_label: str,
     doc_id: str,
     limit: int,
-) -> list[MarketplaceListing] | None:
+    cursor: str | None = None,
+) -> tuple[list[MarketplaceListing], str | None, bool] | None:
     if not token.access_token:
         return None
 
     variables: dict[str, Any] = {
-        "count": min(limit, 48),
-        "cursor": None,
+        "count": min(limit, _FEED_PAGE_SIZE),
+        "cursor": cursor,
         "scale": 2,
         "seoURL": seo_path,
     }
@@ -848,9 +1019,16 @@ async def _fetch_graphql_category(
         if not item.link:
             item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
     items = [x for x in by_id.values() if listing_is_valid(x)]
+    next_cursor, has_next = _extract_feed_cursor(data)
     if items:
-        logger.info("graphql %s: %s items (doc_id=%s)", seo_path, len(items), doc_id[:8])
-    return items or None
+        logger.info(
+            "graphql %s: %s items page cursor=%s next=%s",
+            seo_path,
+            len(items),
+            bool(cursor),
+            has_next,
+        )
+    return items, next_cursor, has_next
 
 
 async def _fetch_page(
@@ -862,10 +1040,11 @@ async def _fetch_page(
     timeout_sec: float,
     category_label: str,
     graphql_doc_id: str | None = None,
-) -> tuple[list[MarketplaceListing], dict[str, int]]:
+    cursor: str | None = None,
+) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
     if graphql_doc_id:
-        gql_items = await _fetch_graphql_category(
+        gql = await _fetch_graphql_category(
             token,
             seo_path=seo,
             user_agent=user_agent,
@@ -873,15 +1052,20 @@ async def _fetch_page(
             timeout_sec=timeout_sec,
             category_label=category_label,
             doc_id=graphql_doc_id,
-            limit=80,
+            limit=_FEED_PAGE_SIZE,
+            cursor=cursor,
         )
-        if gql_items:
-            return gql_items, {
-                "html_len": 0,
-                "link_count": len(gql_items),
-                "parsed": len(gql_items),
-                "source": "graphql",
-            }
+        if gql:
+            items, next_cursor, has_next = gql
+            if items or cursor:
+                return items, {
+                    "html_len": 0,
+                    "link_count": len(items),
+                    "parsed": len(items),
+                    "source": "graphql",
+                }, next_cursor, has_next
+        if cursor:
+            return [], {"html_len": 0, "link_count": 0, "parsed": 0, "source": "graphql"}, None, False
 
     headers = {
         "User-Agent": user_agent,
@@ -911,7 +1095,12 @@ async def _fetch_page(
 
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)
-    return items, meta
+    next_cursor, has_next = _extract_cursor_from_html(html)
+    if not graphql_doc_id:
+        next_cursor, has_next = None, False
+    elif not next_cursor and items:
+        has_next = len(items) >= 12
+    return items, meta, next_cursor, has_next
 
 
 def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:

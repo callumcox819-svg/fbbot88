@@ -50,6 +50,8 @@ _REJECT_LABELS: dict[str, str] = {
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
+    "старше_3ч": "Старше 3 ч",
+    "время_неизвестно": "Время неизвестно",
 }
 
 
@@ -169,7 +171,8 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>«В JSON» — карточки CH/FI. Полный лимит — JSON в конце; ⏹ Стоп — частичный JSON.</i>",
+        "<i>«В JSON» — свежие объявления (до 3 ч), листаем ленту дальше 1-й страницы. "
+        "⏹ Стоп — частичный JSON.</i>",
     ]
     if stats:
         lines.append(
@@ -202,8 +205,13 @@ async def _send_json_file(
     json_limit: int,
     *,
     caption: str,
+    max_age_hours: float | None = None,
 ) -> int:
-    export_items = [x for x in collected if listing_is_export_ready(x, country)][:json_limit]
+    export_items = [
+        x
+        for x in collected
+        if listing_is_export_ready(x, country, max_age_hours=max_age_hours)
+    ][:json_limit]
     if not export_items:
         return 0
     payload = listings_to_json(export_items)
@@ -231,6 +239,8 @@ async def _parse_impl(
     on_status: Callable[[str], Awaitable[None]] | None,
 ) -> None:
     token = parse_account_token(token_raw)
+    max_age_hours = config.listing_max_age_hours
+    gql_doc = config.fb_marketplace_doc_id or config.fb_marketplace_browse_doc_id
 
     async with Session() as session:
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
@@ -364,7 +374,9 @@ async def _parse_impl(
                         _record_reject(stats, "повторный_продавец")
                         await status_progress()
                         continue
-                    reason = export_reject_reason(item, country)
+                    reason = export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
                     if reason and not stop.is_set():
                         try:
                             await enrich_listing(
@@ -382,7 +394,9 @@ async def _parse_impl(
                             _record_reject(stats, "повторный_продавец")
                             await status_progress()
                             continue
-                        reason = export_reject_reason(item, country)
+                        reason = export_reject_reason(
+                            item, country, max_age_hours=max_age_hours
+                        )
                     if reason:
                         _record_reject(stats, reason)
                         await status_progress()
@@ -426,7 +440,8 @@ async def _parse_impl(
                         on_page_items=on_page_items,
                         should_stop=should_stop,
                         hub_round=cat_idx,
-                        graphql_doc_id=config.fb_marketplace_doc_id,
+                        graphql_doc_id=gql_doc,
+                        max_listing_age_hours=max_age_hours,
                     )
                     connect_fails = 0
                     break
@@ -523,6 +538,7 @@ async def _parse_impl(
                 country,
                 json_limit,
                 caption=f"⏹ Остановлено — JSON: {got} объявлений",
+                max_age_hours=max_age_hours,
             )
             if on_status:
                 if sent:
@@ -557,7 +573,11 @@ async def _parse_impl(
             )
         return
 
-    export_items = [x for x in collected if listing_is_export_ready(x, country)][:json_limit]
+    export_items = [
+        x
+        for x in collected
+        if listing_is_export_ready(x, country, max_age_hours=max_age_hours)
+    ][:json_limit]
     if len(export_items) < json_limit:
         if on_status:
             await on_status(
