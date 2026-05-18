@@ -80,13 +80,16 @@ class UserCategory(Base):
 
 
 class BlockedSeller(Base):
-    """Личный ЧС: один продавец — одно объявление в JSON (как VOID «повторные продавцы»)."""
+    """Личный ЧС по стране: CH и FI — разные списки (разные ленты)."""
 
     __tablename__ = "blocked_sellers"
-    __table_args__ = (UniqueConstraint("user_id", "seller_key", name="uq_user_seller"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "seller_key", "country", name="uq_user_seller_country"),
+    )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    country = Column(String, nullable=False, index=True)  # ch | fi
     seller_key = Column(String, nullable=False, index=True)
     seller_name = Column(String, nullable=True)
 

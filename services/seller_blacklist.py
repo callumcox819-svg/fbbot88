@@ -26,30 +26,41 @@ def seller_key_from_item(item) -> str:
     return ""
 
 
-async def clear_blocked_sellers(session: AsyncSession, user_id: int) -> int:
+async def clear_blocked_sellers(
+    session: AsyncSession, user_id: int, *, country: str | None = None
+) -> int:
     from sqlalchemy import delete
 
-    res = await session.execute(
-        delete(BlockedSeller).where(BlockedSeller.user_id == user_id)
-    )
+    q = delete(BlockedSeller).where(BlockedSeller.user_id == user_id)
+    if country:
+        q = q.where(BlockedSeller.country == country)
+    res = await session.execute(q)
     await session.commit()
     return res.rowcount or 0
 
 
-async def load_blocked_seller_keys(session: AsyncSession, user_id: int) -> set[str]:
+async def load_blocked_seller_keys(
+    session: AsyncSession, user_id: int, country: str
+) -> set[str]:
     res = await session.execute(
-        select(BlockedSeller.seller_key).where(BlockedSeller.user_id == user_id)
+        select(BlockedSeller.seller_key).where(
+            BlockedSeller.user_id == user_id,
+            BlockedSeller.country == country,
+        )
     )
     return {row[0] for row in res.fetchall() if row[0]}
 
 
-async def remember_seller(session: AsyncSession, user_id: int, item) -> None:
+async def remember_seller(
+    session: AsyncSession, user_id: int, country: str, item
+) -> None:
     key = seller_key_from_item(item)
-    if not key:
+    if not key or not country:
         return
     exists = await session.execute(
         select(BlockedSeller.id).where(
             BlockedSeller.user_id == user_id,
+            BlockedSeller.country == country,
             BlockedSeller.seller_key == key,
         )
     )
@@ -58,6 +69,7 @@ async def remember_seller(session: AsyncSession, user_id: int, item) -> None:
     session.add(
         BlockedSeller(
             user_id=user_id,
+            country=country,
             seller_key=key,
             seller_name=(item.seller_name or "").strip() or None,
         )

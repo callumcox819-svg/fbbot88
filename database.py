@@ -55,3 +55,6 @@ async def init_db() -> None:
         await _sqlite_add_column_if_missing(
             conn, "users", "last_account_token", "last_account_token TEXT"
         )
+        await _sqlite_add_column_if_missing(
+            conn, "blocked_sellers", "country", "country TEXT DEFAULT 'ch'"
+        )

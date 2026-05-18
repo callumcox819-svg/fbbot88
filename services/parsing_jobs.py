@@ -249,7 +249,7 @@ async def _parse_impl(
         await session.commit()
         await session.refresh(run)
         run_id = run.id
-        blocked_sellers = await load_blocked_seller_keys(session, user_id)
+        blocked_sellers = await load_blocked_seller_keys(session, user_id, country)
 
     collected: list = []
     seen_ids: set[str] = set()
@@ -387,7 +387,7 @@ async def _parse_impl(
                         session_sellers.add(sk)
                         blocked_sellers.add(sk)
                         async with Session() as session:
-                            await remember_seller(session, user_id, item)
+                            await remember_seller(session, user_id, country, item)
                     collected.append(item)
                     cat_added += 1
                     empty_rounds = 0
