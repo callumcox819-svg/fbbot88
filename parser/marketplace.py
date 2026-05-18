@@ -24,7 +24,10 @@ _TITLE_RE = re.compile(
     r'"marketplace_listing_title"\s*:\s*"((?:\\.|[^"\\])*)"|"title"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
 _PRICE_RE = re.compile(
-    r'"formatted_amount"\s*:\s*"((?:\\.|[^"\\])*)"|"amount"\s*:\s*"((?:\\.|[^"\\])*)"'
+    r'"formatted_amount"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"amount"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"formatted_price"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"listing_price"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
 _SELLER_RE = re.compile(r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"')
 _PHOTO_RE = re.compile(r'"uri"\s*:\s*"(https://[^"]*scontent[^"]*)"')
@@ -189,36 +192,55 @@ def listing_is_valid(item: MarketplaceListing) -> bool:
 
 
 def listing_is_export_ready(item: MarketplaceListing, country: str | None = None) -> bool:
-    """Достаточно данных как у VOID (не пустышка)."""
+    """Карточка как в ленте VOID: название + цена и/или фото (не пустышка)."""
+    return export_reject_reason(item, country) is None
+
+
+def export_reject_reason(item: MarketplaceListing, country: str | None = None) -> str | None:
     if not listing_is_valid(item):
-        return False
-    if country == "ch" and _looks_ua_spam(item):
-        return False
+        return "нет_заголовка"
     if country and item.location and not _country_location_ok(item.location, country):
-        return False
-    score = 0
-    if item.price:
-        score += 2
-    if item.seller_name:
-        score += 1
-    if item.photo:
-        score += 1
-    if item.location:
-        score += 1
-    if item.person_link:
-        score += 1
-    if item.item_desc:
-        score += 1
-    if item.price and (item.photo or item.seller_name):
-        return True
-    if item.seller_name and item.photo:
-        return True
-    return score >= 3
+        return "чужая_страна"
+    if country == "ch" and _looks_ua_spam(item):
+        return "не_ch"
+
+    price = (item.price or "").strip()
+    photo = (item.photo or "").strip()
+    seller = (item.seller_name or "").strip()
+
+    if price and photo:
+        return None
+    if price and seller:
+        return None
+    if photo and seller:
+        return None
+    if price:
+        return None
+    if photo:
+        return None
+    return "мало_полей"
 
 
 def _looks_ua_spam(item: MarketplaceListing) -> bool:
-    blob = f"{(item.title or '').lower()} {(item.location or '').lower()} {(item.item_desc or '').lower()}"
-    return any(h in blob for h in _UA_SPAM_HINTS)
+    """Только явная UA-география, не любой кириллический заголовок."""
+    loc = f" {(item.location or '').lower()} "
+    if loc.strip() and any(h in loc for h in _UA_SPAM_HINTS):
+        return True
+    title = (item.title or "").lower()
+    strong = (
+        "київ",
+        "киев",
+        "kyiv",
+        "україн",
+        "ukraine",
+        "харків",
+        "kharkiv",
+        "львів",
+        "lviv",
+        "одеса",
+        "odessa",
+    )
+    return any(s in title for s in strong)
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
@@ -522,11 +544,14 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
     if not lid or not lid.isdigit() or len(lid) < _MIN_LISTING_ID_LEN:
         return None
 
-    price = _dig_str(fs, "formatted_price", "formatted_amount")
+    price = _dig_str(fs, "formatted_price", "formatted_amount", "listing_price")
     if not price:
-        price_obj = fs.get("formatted_price") or fs.get("price")
-        if isinstance(price_obj, dict):
-            price = _dig_str(price_obj, "text")
+        for key in ("formatted_price", "listing_price", "price"):
+            price_obj = fs.get(key)
+            if isinstance(price_obj, dict):
+                price = _dig_str(price_obj, "text", "amount")
+            if price:
+                break
 
     location = _dig_str(fs, "marketplace_listing_location", "location")
     seller = fs.get("marketplace_listing_seller") or fs.get("seller")

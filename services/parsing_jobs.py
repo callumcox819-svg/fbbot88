@@ -26,6 +26,7 @@ from parser.account_token import (
 )
 from parser.marketplace import (
     enrich_listing,
+    export_reject_reason,
     fetch_category_listings,
     is_connection_error,
     listing_is_export_ready,
@@ -160,6 +161,9 @@ def _progress_text(
             f"проверено: <b>{stats.get('checked', 0)}</b> · "
             f"отклонено: <b>{stats.get('rejected', 0)}</b>"
         )
+        last_reject = stats.get("last_reject")
+        if last_reject and stats.get("rejected", 0) > 0:
+            lines.append(f"<i>Последний отсев: {last_reject}</i>")
     if step:
         lines.append(f"📍 {step}")
     return "\n".join(lines)
@@ -276,20 +280,24 @@ async def _parse_impl(
                         return
                     if item.listing_id in seen_ids:
                         continue
-                    try:
-                        await enrich_listing(
-                            token,
-                            item,
-                            user_agent=config.fb_user_agent,
-                            proxy_url=proxy_used,
-                            timeout_sec=14.0,
-                        )
-                    except AccountTokenDeadError:
-                        token_dead_flag["value"] = True
-                        raise
                     stats["checked"] = stats.get("checked", 0) + 1
-                    if not listing_is_export_ready(item, country):
+                    reason = export_reject_reason(item, country)
+                    if reason:
+                        try:
+                            await enrich_listing(
+                                token,
+                                item,
+                                user_agent=config.fb_user_agent,
+                                proxy_url=proxy_used,
+                                timeout_sec=14.0,
+                            )
+                        except AccountTokenDeadError:
+                            token_dead_flag["value"] = True
+                            raise
+                        reason = export_reject_reason(item, country)
+                    if reason:
                         stats["rejected"] = stats.get("rejected", 0) + 1
+                        stats["last_reject"] = reason
                         await status_progress()
                         continue
                     seen_ids.add(item.listing_id)
