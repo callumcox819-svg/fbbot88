@@ -45,7 +45,7 @@ def load_config() -> Config:
         fb_marketplace_browse_doc_id=(
             (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip() or None
         ),
-        listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "3"),
+        listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "0"),
     )
 
 

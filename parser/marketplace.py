@@ -276,12 +276,13 @@ def _parse_relative_time_hours(text: str) -> float | None:
         return 0.0
     if any(x in t for x in ("yesterday", "gestern", "hier")):
         return 24.0
-    m = re.search(r"(\d+)\s*(?:min(?:ute)?s?|min\.?|мин)", t)
+    m = re.search(r"(\d+)\s*(?:min(?:ute)?s?|min\.?|мин|minuuttia)", t)
     if m:
         return int(m.group(1)) / 60.0
     m = re.search(
         r"(?:il y a|vor)\s*(\d+)\s*(?:heures?|h|std\.?|stunden?)|"
-        r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?)",
+        r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?|tuntia)|"
+        r"(\d+)\s*t\s+sitten",
         t,
     )
     if m:
@@ -298,6 +299,50 @@ def listing_age_hours(item: MarketplaceListing) -> float | None:
     if item.created_date:
         return _parse_relative_time_hours(item.created_date)
     return None
+
+
+def listing_is_too_old(item: MarketplaceListing, max_age_hours: float) -> bool:
+    """
+    Мягкий фильтр «свежести».
+    Жёстко по unix-timestamp; по тексту — только явно старые (вчера, дни, недели).
+    «5 hours ago» на ленте не режем при лимите 3ч — иначе 7/100 вместо 40+.
+    """
+    if max_age_hours <= 0:
+        return False
+    if item.created_timestamp:
+        return (time.time() - item.created_timestamp) / 3600.0 > max_age_hours
+    cd = (item.created_date or "").lower().strip()
+    if not cd:
+        return False
+    if any(
+        x in cd
+        for x in (
+            "week",
+            "woche",
+            "semaine",
+            "month",
+            "monat",
+            "mois",
+            "kuukaus",
+            "viikko",
+            "päivää",
+            "päivä",
+        )
+    ):
+        if re.search(r"\d+\s*(?:d|days?|tage?|jours?|päiv)", cd):
+            return True
+        if "week" in cd or "woche" in cd or "month" in cd or "viikko" in cd or "kuukaus" in cd:
+            return True
+    if re.search(r"\d+\s*tuntia\s+sitten", cd):
+        m = re.search(r"(\d+)\s*tuntia", cd)
+        if m and int(m.group(1)) > 3:
+            return True
+    if any(x in cd for x in ("yesterday", "gestern", "hier", "eilen")):
+        return True
+    hours = _parse_relative_time_hours(cd)
+    if hours is not None and hours >= 24:
+        return True
+    return False
 
 
 def _feed_page_all_too_old(batch: list[MarketplaceListing], max_age_hours: float) -> bool:
@@ -344,10 +389,8 @@ def export_reject_reason(
 ) -> str | None:
     if not listing_is_valid(item):
         return "нет_заголовка"
-    if max_age_hours is not None:
-        age_h = listing_age_hours(item)
-        if age_h is not None and age_h > max_age_hours:
-            return "старше_3ч"
+    if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
+        return "старше_3ч"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
     if country and _location_explicitly_foreign(loc, country):

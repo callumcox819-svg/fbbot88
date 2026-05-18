@@ -165,11 +165,14 @@ def _progress_text(
     *,
     step: str = "",
     stats: dict | None = None,
+    max_age_hours: float = 0,
 ) -> str:
+    age_hint = ""
+    if max_age_hours > 0:
+        age_hint = f" · явно старше {int(max_age_hours)}ч отсев"
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>Свежие до 3 ч (если FB показал время) · 1 продавец = 1 карточка. "
-        "⏹ Стоп — JSON.</i>",
+        f"<i>1 продавец = 1 карточка{age_hint}. ⏹ Стоп — JSON.</i>",
     ]
     if stats:
         lines.append(
@@ -275,6 +278,7 @@ async def _parse_impl(
                     json_limit,
                     step=current_step["text"],
                     stats=stats,
+                    max_age_hours=max_age_hours,
                 )
             )
 
