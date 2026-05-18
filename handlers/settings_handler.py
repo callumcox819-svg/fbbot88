@@ -243,8 +243,12 @@ async def cat_custom(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(SettingsStates.waiting_custom_url)
     await callback.message.answer(
-        "Ссылка на категорию Marketplace, например:\n"
-        "<code>https://www.facebook.com/marketplace/category/electronics</code>",
+        "Ссылка на категорию Marketplace (лучше со страной/городом):\n"
+        "🇫🇮 <code>https://www.facebook.com/marketplace/finland/category/baby/</code>\n"
+        "🇫🇮 <code>https://www.facebook.com/marketplace/helsinki/category/baby/</code>\n"
+        "🇨🇭 <code>https://www.facebook.com/marketplace/switzerland/category/electronics/</code>\n"
+        "🇨🇭 <code>https://www.facebook.com/marketplace/zurich/category/electronics/</code>\n"
+        "Или без страны: <code>…/marketplace/category/electronics</code> — бот сам подставит FI/CH.",
         parse_mode="HTML",
     )
 

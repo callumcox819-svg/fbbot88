@@ -592,10 +592,38 @@ def normalize_listing_for_export(item: MarketplaceListing, country: str | None) 
         item.price = format_price_for_country(item.price, country)
 
 
+def _all_marketplace_roots() -> frozenset[str]:
+    roots: set[str] = set()
+    for cfg in COUNTRY_LOCATIONS.values():
+        roots.update(cfg.get("marketplace_slugs") or [])
+        roots.update(cfg.get("region_hubs") or [])
+    return frozenset(roots)
+
+
+def _split_marketplace_path(path: str) -> tuple[str | None, str | None]:
+    """
+    finland/category/baby → (finland, baby)
+    category/baby → (None, baby)
+    baby → (None, baby)
+    """
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts:
+        return None, None
+    roots = _all_marketplace_roots()
+    if len(parts) >= 3 and parts[0] in roots and parts[1] == "category":
+        return parts[0], parts[2]
+    if len(parts) >= 2 and parts[0] == "category":
+        return None, parts[1]
+    if parts[0] not in roots:
+        return None, parts[-1]
+    return None, None
+
+
 def normalize_category_path(url_or_path: str) -> str:
     """
-    https://www.facebook.com/marketplace/category/sports → category/sports
-    sports → category/sports
+    Сохраняет страну/город в пути, если есть в ссылке:
+    …/marketplace/finland/category/baby → finland/category/baby
+    …/marketplace/category/sports → category/sports
     """
     path = (url_or_path or "").strip()
     if "facebook.com/marketplace/" in path:
@@ -603,30 +631,35 @@ def normalize_category_path(url_or_path: str) -> str:
     path = path.strip("/").split("?")[0]
     if not path:
         raise ValueError("Пустой путь категории")
-    if not path.startswith("category/"):
-        if path.startswith("category"):
-            path = path.replace("category", "category/", 1)
-        else:
-            path = f"category/{path}"
-    return path
+    root, slug = _split_marketplace_path(path)
+    if not slug:
+        raise ValueError("Не удалось определить категорию")
+    if root:
+        return f"{root}/category/{slug}"
+    return f"category/{slug}"
 
 
 def _category_slug(url_path: str) -> str:
-    path = normalize_category_path(url_path)
-    return path.split("/", 1)[1] if "/" in path else path
+    _, slug = _split_marketplace_path(url_path.strip("/"))
+    if slug:
+        return slug
+    parts = url_path.strip("/").split("/")
+    return parts[-1] if parts else ""
 
 
 def build_category_url(url_path: str, *, marketplace_root: str | None = None) -> str:
     """
-    Без страны: marketplace/category/sports/
-    По стране: marketplace/switzerland/category/sports/ или marketplace/zurich/category/sports/
+    marketplace/category/sports/
+    marketplace/finland/category/baby/  (если путь уже с finland/)
+    marketplace/zurich/category/sports/ (marketplace_root)
     """
-    cat_path = normalize_category_path(url_path)
-    slug = _category_slug(url_path)
-    if marketplace_root:
-        root = marketplace_root.strip("/")
+    norm = normalize_category_path(url_path)
+    root, slug = _split_marketplace_path(norm)
+    if root and slug:
         return urljoin(_FB_BASE, f"{root}/category/{slug}/")
-    return urljoin(_FB_BASE, f"{cat_path}/")
+    if marketplace_root and slug:
+        return urljoin(_FB_BASE, f"{marketplace_root.strip('/')}/category/{slug}/")
+    return urljoin(_FB_BASE, f"{norm}/")
 
 
 def with_country_geo(url: str, country: str | None) -> str:
@@ -650,6 +683,14 @@ def urls_for_country_category(
         if u not in seen:
             seen.add(u)
             urls.append(u)
+
+    norm = normalize_category_path(url_path)
+    embed_root, _ = _split_marketplace_path(norm)
+    country_slugs = set(cfg.get("marketplace_slugs") or [])
+    country_hubs = set(cfg.get("region_hubs") or [])
+    if embed_root and (embed_root in country_slugs or embed_root in country_hubs):
+        add(build_category_url(norm))
+        return urls
 
     slugs = cfg.get("marketplace_slugs") or []
     hubs = cfg.get("region_hubs") or []
