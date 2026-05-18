@@ -19,7 +19,14 @@ from config import config
 from database import Session
 from models import ParseRun, User
 from parser.account_token import parse_account_token
-from parser.marketplace import fetch_category_listings, is_connection_error, listings_to_json
+from parser.marketplace import (
+    enrich_listing,
+    fetch_category_listings,
+    is_connection_error,
+    listing_is_export_ready,
+    listing_is_valid,
+    listings_to_json,
+)
 from services.categories import list_user_categories
 from services.proxies import pick_random_proxy_url
 
@@ -221,11 +228,33 @@ async def _parse_impl(
                     break
                 continue
 
+            need_now = json_limit - len(collected)
+            candidates = [
+                it
+                for it in batch
+                if listing_is_valid(it)
+                and it.listing_id not in seen_ids
+            ][: max(need_now * 3, 15)]
+
+            if candidates:
+                await asyncio.gather(
+                    *[
+                        enrich_listing(
+                            token,
+                            it,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_try,
+                            timeout_sec=14.0,
+                        )
+                        for it in candidates
+                    ]
+                )
+
             added = 0
-            for item in batch:
+            for item in candidates:
                 if stop.is_set() or len(collected) >= json_limit:
                     break
-                if item.listing_id in seen_ids:
+                if not listing_is_export_ready(item, country):
                     continue
                 seen_ids.add(item.listing_id)
                 collected.append(item)
@@ -282,11 +311,22 @@ async def _parse_impl(
                 "Чаще всего:\n"
                 "• токен аккаунта протух — вставь новый\n"
                 "• Facebook отдаёт пустую страницу — проверь прокси CH/FI\n"
-                "• в логах Railway: <code>parsed 0 items</code> и <code>links=0</code>"
+                "• в логах Railway: <code>parsed 0 items</code> и <code>links=0</code>\n"
+                "• мало полных карточек — обнови токен / прокси CH"
             )
         return
 
-    payload = listings_to_json(collected[:json_limit])
+    export_items = [x for x in collected if listing_is_export_ready(x, country)][:json_limit]
+    if len(export_items) < json_limit:
+        if on_status:
+            await on_status(
+                f"⚠️ Полных объявлений только <b>{len(export_items)}/{json_limit}</b>.\n"
+                "JSON не отправлен — нужны цена/продавец/фото как в VOID.\n"
+                "Проверь токен, прокси 🇨🇭 и категории."
+            )
+        return
+
+    payload = listings_to_json(export_items)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
         f.write(payload)
         path = f.name

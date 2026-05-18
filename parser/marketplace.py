@@ -154,6 +154,67 @@ _FI_REJECT = (
     "schweiz",
     "russia",
 )
+_UA_SPAM_HINTS = (
+    "україн",
+    "украин",
+    "київ",
+    "киев",
+    "kyiv",
+    "kiev",
+    "львів",
+    "lviv",
+    "одес",
+    "харків",
+    "kharkiv",
+    "dnipro",
+    "запоріж",
+    "poltava",
+    "ukraine",
+)
+_MIN_LISTING_ID_LEN = 12
+
+
+def listing_is_valid(item: MarketplaceListing) -> bool:
+    """Реальное объявление: не плейсхолдер и id из /marketplace/item/."""
+    title = (item.title or "").strip()
+    if not title or title.startswith("Listing "):
+        return False
+    lid = (item.listing_id or "").strip()
+    if not lid.isdigit() or len(lid) < _MIN_LISTING_ID_LEN:
+        return False
+    link = item.link or ""
+    if f"/marketplace/item/{lid}" not in link:
+        return False
+    return True
+
+
+def listing_is_export_ready(item: MarketplaceListing, country: str | None = None) -> bool:
+    """Достаточно данных как у VOID (не пустышка)."""
+    if not listing_is_valid(item):
+        return False
+    if country == "ch" and _looks_ua_spam(item):
+        return False
+    if country and item.location and not _country_location_ok(item.location, country):
+        return False
+    score = 0
+    if item.price:
+        score += 2
+    if item.seller_name:
+        score += 1
+    if item.photo:
+        score += 1
+    if item.location:
+        score += 1
+    if item.person_link:
+        score += 1
+    if item.item_desc:
+        score += 1
+    return score >= 3
+
+
+def _looks_ua_spam(item: MarketplaceListing) -> bool:
+    blob = f"{(item.title or '').lower()} {(item.location or '').lower()} {(item.item_desc or '').lower()}"
+    return any(h in blob for h in _UA_SPAM_HINTS)
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
@@ -289,9 +350,13 @@ async def fetch_category_listings(
             continue
 
         for item in batch:
+            if not listing_is_valid(item):
+                continue
             if item.listing_id in seen_ids:
                 continue
-            if country and not _country_location_ok(item.location, country):
+            if country and item.location and not _country_location_ok(item.location, country):
+                continue
+            if country == "ch" and _looks_ua_spam(item):
                 continue
             seen_ids.add(item.listing_id)
             out.append(item)
@@ -433,9 +498,9 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
 
     lid = str(fs.get("id") or node.get("id") or "").strip()
     title = _dig_str(fs, "marketplace_listing_title", "group_commerce_item_title", "title")
-    if not lid and not title:
+    if not title:
         return None
-    if lid and not lid.isdigit():
+    if not lid or not lid.isdigit() or len(lid) < _MIN_LISTING_ID_LEN:
         return None
 
     price = _dig_str(fs, "formatted_price", "formatted_amount")
@@ -536,13 +601,72 @@ def _first_group(matches: list) -> list[str]:
 
 
 def _collect_listing_ids(html: str) -> list[str]:
+    """Только id из ссылок /marketplace/item/ — без мусора из JSON."""
     seen: list[str] = []
-    for pattern in (_LISTING_ID_RE, _LISTING_ID_JSON_RE):
-        for m in pattern.finditer(html):
-            lid = m.group(1)
-            if lid not in seen:
-                seen.append(lid)
+    for m in _LISTING_ID_RE.finditer(html):
+        lid = m.group(1)
+        if len(lid) < _MIN_LISTING_ID_LEN:
+            continue
+        if lid not in seen:
+            seen.append(lid)
     return seen
+
+
+async def enrich_listing(
+    token: AccountToken,
+    item: MarketplaceListing,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 18.0,
+) -> MarketplaceListing:
+    """Догружает цену, описание, даты с карточки объявления."""
+    url = item.link or f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.facebook.com/marketplace/",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with _session_for_proxy(proxy_url) as session:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    return item
+                html = await resp.text(errors="ignore")
+    except Exception as e:
+        logger.debug("enrich %s failed: %s", item.listing_id, e)
+        return item
+
+    if _looks_like_login_wall(html):
+        return item
+
+    parsed = _parse_html(html, item.category)
+    best: MarketplaceListing | None = None
+    for p in parsed:
+        if p.listing_id == item.listing_id:
+            best = p
+            break
+    if not best and parsed:
+        best = parsed[0]
+    if best:
+        _merge_listing(item, {
+            "title": best.title,
+            "price": best.price,
+            "seller_name": best.seller_name,
+            "photo": best.photo,
+            "location": best.location,
+            "item_desc": best.item_desc,
+            "person_link": best.person_link,
+            "created_date": best.created_date,
+            "person_reg_date": best.person_reg_date,
+            "gender": best.gender,
+            "ads_number": best.ads_number,
+            "rating": best.rating,
+        })
+    return item
 
 
 def _seo_path_from_url(url: str) -> str:
@@ -605,7 +729,7 @@ async def _fetch_graphql_category(
         item.category = category_label
         if not item.link:
             item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
-    items = list(by_id.values())
+    items = [x for x in by_id.values() if listing_is_valid(x)]
     if items:
         logger.info("graphql %s: %s items (doc_id=%s)", seo_path, len(items), doc_id[:8])
     return items or None
@@ -678,53 +802,46 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
     by_id: dict[str, MarketplaceListing] = _parse_embedded_scripts(html)
 
     ids_in_order = _collect_listing_ids(html)
-    for lid in ids_in_order:
+    titles = _first_group(list(_TITLE_RE.finditer(html)))
+    prices = _first_group(list(_PRICE_RE.finditer(html)))
+    sellers = _first_group(list(_SELLER_RE.finditer(html)))
+    photos = _first_group(list(_PHOTO_RE.finditer(html)))
+    locs = [_unescape(m.group(1) or m.group(2) or "") for m in _LOCATION_RE.finditer(html)]
+
+    for idx, lid in enumerate(ids_in_order):
         pos = html.find(f"/marketplace/item/{lid}")
         if pos < 0:
-            pos = html.find(f'"{lid}"')
-        chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER] if pos >= 0 else html
+            continue
+        chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
         patch = _parse_chunk(chunk, lid)
+        if not patch.get("title"):
+            patch["title"] = titles[idx] if idx < len(titles) else ""
+        if not patch.get("price"):
+            patch["price"] = prices[idx] if idx < len(prices) else ""
+        if not patch.get("seller_name"):
+            patch["seller_name"] = sellers[idx] if idx < len(sellers) else ""
+        if not patch.get("photo"):
+            patch["photo"] = photos[idx] if idx < len(photos) else ""
+        if not patch.get("location"):
+            patch["location"] = locs[idx] if idx < len(locs) else ""
+        if not (patch.get("title") or "").strip():
+            continue
         if lid not in by_id:
             by_id[lid] = MarketplaceListing(
                 listing_id=lid,
                 link=f"https://www.facebook.com/marketplace/item/{lid}/",
                 category=category_label,
             )
-        patch["listing_id"] = lid
-        if not patch.get("title"):
-            patch.pop("title", None)
         _merge_listing(by_id[lid], patch)
         by_id[lid].category = category_label
 
-    # fallback: плоские массивы по порядку id
-    if len(by_id) < len(ids_in_order):
-        titles = _first_group(list(_TITLE_RE.finditer(html)))
-        prices = _first_group(list(_PRICE_RE.finditer(html)))
-        sellers = _first_group(list(_SELLER_RE.finditer(html)))
-        photos = _first_group(list(_PHOTO_RE.finditer(html)))
-        locs = [_unescape(m.group(1) or m.group(2) or "") for m in _LOCATION_RE.finditer(html)]
-        for i, lid in enumerate(ids_in_order):
-            if lid in by_id and by_id[lid].title:
-                continue
-            title = titles[i] if i < len(titles) else (titles[0] if titles else f"Listing {lid}")
-            by_id[lid] = MarketplaceListing(
-                listing_id=lid,
-                title=title,
-                price=prices[i] if i < len(prices) else "",
-                link=f"https://www.facebook.com/marketplace/item/{lid}/",
-                seller_name=sellers[i] if i < len(sellers) else "",
-                photo=photos[i] if i < len(photos) else "",
-                location=locs[i] if i < len(locs) else "",
-                category=category_label,
-            )
-
+    out: list[MarketplaceListing] = []
     for item in by_id.values():
-        if not item.title:
-            item.title = f"Listing {item.listing_id}"
         if not item.link:
             item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
-
-    return list(by_id.values())
+        if listing_is_valid(item):
+            out.append(item)
+    return out
 
 
 def listings_to_json(items: list[MarketplaceListing]) -> str:
