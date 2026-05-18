@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from database import Session
+from data.preset_categories import parse_categories_for_country
 from keyboards.main_menu import main_menu_kb
 from models import User
 from parser.account_token import is_account_token_line, parse_account_token
@@ -123,7 +124,13 @@ async def _launch_parse(message: Message, telegram_id: int, db_user: User, token
 
         u = (await session.execute(select(U).where(U.id == db_user.id))).scalar_one()
         lim = int(u.json_limit or 50)
-        country = u.country or "fi"
+        country = u.country
+        if country not in ("ch", "fi"):
+            await message.answer(
+                "Сначала выбери 🇨🇭 или 🇫🇮 в ⚙️ Настройки.",
+                parse_mode="HTML",
+            )
+            return
         n_cat = len(parse_categories_for_country(country))
 
     status_msg = await message.answer(
