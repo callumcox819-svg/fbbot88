@@ -510,6 +510,7 @@ async def fetch_category_listings(
         short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
         cursor: str | None = None
         has_next = True
+        empty_feed_pages = 0
         try:
             for page_no in range(1, _MAX_CATEGORY_FEED_PAGES + 1):
                 if should_stop and should_stop():
@@ -576,6 +577,13 @@ async def fetch_category_listings(
                     await on_page_found(len(page_new))
                 if on_page_items and page_new:
                     await on_page_items(page_new)
+                if not batch:
+                    empty_feed_pages += 1
+                    if empty_feed_pages >= 3:
+                        logger.info("stop %s: 3 empty pages", short)
+                        break
+                else:
+                    empty_feed_pages = 0
                 if len(out) >= limit:
                     break
                 if max_listing_age_hours and _feed_page_all_too_old(batch, max_listing_age_hours):
@@ -1043,7 +1051,7 @@ async def _fetch_page(
     cursor: str | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
-    if graphql_doc_id:
+    if graphql_doc_id and cursor:
         gql = await _fetch_graphql_category(
             token,
             seo_path=seo,
@@ -1057,15 +1065,35 @@ async def _fetch_page(
         )
         if gql:
             items, next_cursor, has_next = gql
-            if items or cursor:
-                return items, {
-                    "html_len": 0,
-                    "link_count": len(items),
-                    "parsed": len(items),
-                    "source": "graphql",
-                }, next_cursor, has_next
-        if cursor:
-            return [], {"html_len": 0, "link_count": 0, "parsed": 0, "source": "graphql"}, None, False
+            return items, {
+                "html_len": 0,
+                "link_count": len(items),
+                "parsed": len(items),
+                "source": "graphql",
+            }, next_cursor, has_next
+        return [], {"html_len": 0, "link_count": 0, "parsed": 0, "source": "graphql"}, None, False
+
+    if graphql_doc_id and not cursor:
+        gql = await _fetch_graphql_category(
+            token,
+            seo_path=seo,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            category_label=category_label,
+            doc_id=graphql_doc_id,
+            limit=_FEED_PAGE_SIZE,
+            cursor=None,
+        )
+        if gql and gql[0]:
+            items, next_cursor, has_next = gql
+            return items, {
+                "html_len": 0,
+                "link_count": len(items),
+                "parsed": len(items),
+                "source": "graphql",
+            }, next_cursor, has_next
+        logger.info("graphql empty for %s — fallback HTML", seo[:48])
 
     headers = {
         "User-Agent": user_agent,

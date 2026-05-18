@@ -171,7 +171,7 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>«В JSON» — свежие объявления (до 3 ч), листаем ленту дальше 1-й страницы. "
+        "<i>«В JSON» — свежие (до 3 ч). 1-я страница — HTML; 2-я+ нужен FB_MARKETPLACE_DOC_ID. "
         "⏹ Стоп — частичный JSON.</i>",
     ]
     if stats:
@@ -240,7 +240,8 @@ async def _parse_impl(
 ) -> None:
     token = parse_account_token(token_raw)
     max_age_hours = config.listing_max_age_hours
-    gql_doc = config.fb_marketplace_doc_id or config.fb_marketplace_browse_doc_id
+    # Browse doc_id — только для смены региона, не для категорий (иначе пустая лента).
+    gql_doc = config.fb_marketplace_doc_id
 
     async with Session() as session:
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
@@ -321,12 +322,19 @@ async def _parse_impl(
         logger.info(
             "hint: не запускай VOID-парсер с тем же токеном одновременно — сессия сбивается"
         )
-        await apply_marketplace_region(
-            token,
-            country,
-            user_agent=config.fb_user_agent,
-            proxy_url=proxy_url_boot,
-        )
+        try:
+            await asyncio.wait_for(
+                apply_marketplace_region(
+                    token,
+                    country,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    timeout_sec=12.0,
+                ),
+                timeout=45.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("region switch timeout — продолжаем парсинг")
     except AccountTokenDeadError:
         token_dead_flag["value"] = True
         await _notify_token_dead(bot, telegram_id, on_status)
@@ -340,6 +348,7 @@ async def _parse_impl(
             current_step["detail"] = cat.label
             current_step["text"] = f"Категория: {cat.label}"
             await status_progress()
+            logger.info("category %s path=%s gql=%s", cat.label, cat.url_path, bool(gql_doc))
 
             async with Session() as session:
                 proxy_url = await pick_random_proxy_url(session, user_id)

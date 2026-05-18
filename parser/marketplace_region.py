@@ -160,15 +160,18 @@ async def apply_marketplace_region(
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
     urls: list[str] = []
-    for slug in cfg.get("marketplace_slugs") or []:
-        urls.append(_url_with_geo(urljoin(_FB, f"{slug}/"), country))
-    for hub in (cfg.get("region_hubs") or [])[:3]:
-        urls.append(_url_with_geo(urljoin(_FB, f"{hub}/"), country))
-    urls.append(_url_with_geo(urljoin(_FB, "browse/"), country))
+    slugs = cfg.get("marketplace_slugs") or []
+    hubs = cfg.get("region_hubs") or []
+    if slugs:
+        urls.append(_url_with_geo(urljoin(_FB, f"{slugs[0]}/"), country))
+    if hubs:
+        urls.append(_url_with_geo(urljoin(_FB, f"{hubs[0]}/"), country))
 
+    logger.info("region switch start country=%s urls=%s proxy=%s", country, len(urls), bool(proxy_url))
     async with _session_for_proxy(proxy_url) as session:
         for url in urls:
             try:
+                logger.info("region GET %s", url.replace(_FB, "")[:56])
                 async with session.get(url, headers=headers_base, timeout=timeout) as resp:
                     html = await resp.text(errors="ignore")
                     if "login" in str(resp.url).lower() or _looks_like_login_wall(html):
@@ -184,7 +187,7 @@ async def apply_marketplace_region(
         country=country,
         user_agent=user_agent,
         proxy_url=proxy_url,
-        timeout_sec=timeout_sec,
+        timeout_sec=min(timeout_sec, 12.0),
     )
     logger.info("marketplace region applied: %s", label)
 
