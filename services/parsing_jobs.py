@@ -152,7 +152,7 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>«В JSON» — прошли фильтр (цена/продавец/фото). JSON в конце.</i>",
+        "<i>«В JSON» — карточки для выбранной страны (CH/FI). JSON в конце.</i>",
     ]
     if stats:
         lines.append(
@@ -190,6 +190,10 @@ async def _parse_impl(
 
         if not categories:
             raise RuntimeError("Выбери категории в ⚙️ Настройки")
+        if not country:
+            raise RuntimeError(
+                "Выбери страну в ⚙️ Настройки → 🇨🇭 Швейцария или 🇫🇮 Финляндия"
+            )
 
         run = ParseRun(user_id=user_id, status="running")
         session.add(run)

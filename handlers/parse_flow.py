@@ -58,6 +58,13 @@ async def open_start_flow(message: Message, state: FSMContext | None = None) -> 
         await message.answer("Сначала выбери категории в ⚙️ Настройки → 📂 Категории.")
         return
 
+    if not user.country:
+        await message.answer(
+            "Сначала выбери страну в ⚙️ Настройки:\n"
+            "🇨🇭 Швейцария или 🇫🇮 Финляндия (тумблер в меню настроек)."
+        )
+        return
+
     text = (
         "🔑 <b>Токен аккаунта Facebook</b>\n\n"
         "Вставь строку аккаунта (как в VOID):\n"

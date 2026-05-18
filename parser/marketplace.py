@@ -103,14 +103,17 @@ _CH_OK = (
     "schweiz",
     "suisse",
     "svizzera",
-    "switzerland",
     "ch-",
+    " chf",
     " zürich",
     " zurich",
     " geneva",
     " genève",
+    " genf",
     " bern",
+    " berne",
     " basel",
+    " bâle",
     " lausanne",
     " lugano",
     " winterthur",
@@ -118,6 +121,35 @@ _CH_OK = (
     " lucerne",
     " st. gallen",
     " st gallen",
+    " thun",
+    " biel",
+    " fribourg",
+    " neuchâtel",
+    " sion",
+    ", vs",
+    ", vd",
+    ", ge",
+    ", zh",
+    ", be",
+    ", bs",
+    ", bl",
+    ", ag",
+    ", sg",
+    ", gr",
+    ", lu",
+    ", ne",
+    ", fr",
+    ", ju",
+    ", ti",
+    ", sz",
+    ", nw",
+    ", ow",
+    ", gl",
+    ", zg",
+    ", ur",
+    ", sh",
+    ", ar",
+    ", ai",
 )
 _CH_REJECT = (
     "germany",
@@ -131,6 +163,15 @@ _CH_REJECT = (
     " uk",
     "finland",
     "suomi",
+    "ukraine",
+    "україн",
+    "украин",
+    "київ",
+    "киев",
+    "kyiv",
+    "poland",
+    "polska",
+    "romania",
 )
 _FI_OK = (
     "finland",
@@ -196,13 +237,21 @@ def listing_is_export_ready(item: MarketplaceListing, country: str | None = None
     return export_reject_reason(item, country) is None
 
 
+def _price_hints_country(price: str, country: str) -> bool:
+    p = price.lower()
+    if country == "ch":
+        return "chf" in p or "fr." in p or "sfr" in p
+    if country == "fi":
+        return "eur" in p or "€" in p
+    return False
+
+
 def export_reject_reason(item: MarketplaceListing, country: str | None = None) -> str | None:
     if not listing_is_valid(item):
         return "нет_заголовка"
-    if country and item.location and not _country_location_ok(item.location, country):
+    loc = (item.location or "").strip()
+    if country and loc and not _country_location_ok(loc, country):
         return "чужая_страна"
-    if country == "ch" and _looks_ua_spam(item):
-        return "не_ch"
 
     price = (item.price or "").strip()
     photo = (item.photo or "").strip()
@@ -221,28 +270,6 @@ def export_reject_reason(item: MarketplaceListing, country: str | None = None) -
     return "мало_полей"
 
 
-def _looks_ua_spam(item: MarketplaceListing) -> bool:
-    """Только явная UA-география, не любой кириллический заголовок."""
-    loc = f" {(item.location or '').lower()} "
-    if loc.strip() and any(h in loc for h in _UA_SPAM_HINTS):
-        return True
-    title = (item.title or "").lower()
-    strong = (
-        "київ",
-        "киев",
-        "kyiv",
-        "україн",
-        "ukraine",
-        "харків",
-        "kharkiv",
-        "львів",
-        "lviv",
-        "одеса",
-        "odessa",
-    )
-    return any(s in title for s in strong)
-
-
 def _country_location_ok(location: str, country: str | None) -> bool:
     """Страна целиком: не режем по одному городу; отсекаем явно чужие страны."""
     if not country:
@@ -253,7 +280,9 @@ def _country_location_ok(location: str, country: str | None) -> bool:
             return False
         if not loc.strip():
             return True
-        return any(h in loc for h in _CH_OK)
+        if any(h in loc for h in _CH_OK):
+            return True
+        return False
     if country == "fi":
         if any(r in loc for r in _FI_REJECT):
             return False
@@ -301,7 +330,7 @@ def build_category_url(url_path: str, *, marketplace_root: str | None = None) ->
 
 
 def urls_for_country_category(country: str, url_path: str) -> list[str]:
-    """URL по всей стране: общий slug + крупные города (регионы FB)."""
+    """Только регионы выбранной страны (без глобального marketplace/category/…)."""
     cfg = COUNTRY_LOCATIONS.get(country) or {}
     urls: list[str] = []
     seen: set[str] = set()
@@ -311,11 +340,12 @@ def urls_for_country_category(country: str, url_path: str) -> list[str]:
             seen.add(u)
             urls.append(u)
 
-    add(build_category_url(url_path))
     for slug in cfg.get("marketplace_slugs") or []:
         add(build_category_url(url_path, marketplace_root=slug))
     for hub in cfg.get("region_hubs") or []:
         add(build_category_url(url_path, marketplace_root=hub))
+    if not urls:
+        add(build_category_url(url_path))
     return urls
 
 
