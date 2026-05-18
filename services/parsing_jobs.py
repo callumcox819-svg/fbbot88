@@ -256,6 +256,9 @@ async def _parse_impl(
     try:
         current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
         await status_progress()
+        logger.info(
+            "hint: не запускай VOID-парсер с тем же токеном одновременно — сессия сбивается"
+        )
         await apply_marketplace_region(
             token,
             country,

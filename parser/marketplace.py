@@ -247,12 +247,31 @@ def _price_hints_country(price: str, country: str) -> bool:
     return False
 
 
+def _location_explicitly_foreign(location: str, country: str) -> bool:
+    """Только явно чужая страна в тексте локации (не «нет Zürich в списке»)."""
+    loc = (location or "").strip()
+    if not loc:
+        return False
+    blob = f" {loc.lower()} "
+    if country == "ch":
+        return any(r in blob for r in _CH_REJECT)
+    if country == "fi":
+        return any(r in blob for r in _FI_REJECT)
+    return False
+
+
 def export_reject_reason(item: MarketplaceListing, country: str | None = None) -> str | None:
     if not listing_is_valid(item):
         return "нет_заголовка"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
-    if country and loc and not _country_location_ok(loc, country):
+    if country and _location_explicitly_foreign(loc, country):
+        return "чужая_страна"
+    if country == "ch" and price and _price_hints_country(price, "ch"):
+        pass
+    elif country == "fi" and price and _price_hints_country(price, "fi"):
+        pass
+    elif country and loc and not _country_location_ok(loc, country):
         return "чужая_страна"
 
     photo = (item.photo or "").strip()
@@ -283,7 +302,7 @@ def _country_location_ok(location: str, country: str | None) -> bool:
             return True
         if any(h in loc for h in _CH_OK):
             return True
-        return False
+        return True
     if country == "fi":
         if any(r in loc for r in _FI_REJECT):
             return False
