@@ -1,4 +1,4 @@
-"""Фоновый парсинг: только JSON в конце, когда набран полный лимит."""
+"""Фоновый парсинг: JSON в конце или частичный JSON по ⏹ Стоп."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from aiogram.types import FSInputFile
 from sqlalchemy import select
 
 from config import config
-from data.preset_categories import COUNTRY_LOCATIONS
 from database import Session
 from models import ParseRun, User
 from parser.account_token import (
@@ -31,7 +30,6 @@ from parser.marketplace import (
     fetch_category_listings,
     is_connection_error,
     listing_is_export_ready,
-    listing_is_valid,
     listings_to_json,
 )
 from parser.marketplace_region import apply_marketplace_region
@@ -47,12 +45,10 @@ logger = logging.getLogger(__name__)
 
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
-    "дубликат": "Дубликаты (ID)",
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
     "старше_3ч": "Старше 3 ч",
-    "время_неизвестно": "Время неизвестно",
 }
 
 
@@ -172,7 +168,7 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>Свежие до 3 ч · 1 продавец = 1 карточка · категория+город один раз. "
+        "<i>Свежие до 3 ч (если FB показал время) · 1 продавец = 1 карточка. "
         "⏹ Стоп — JSON.</i>",
     ]
     if stats:
@@ -188,11 +184,6 @@ def _progress_text(
             for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
                 label = _REJECT_LABELS.get(key, key)
                 lines.append(f"→ {label}: <b>{count}</b>")
-        else:
-            last_reject = stats.get("last_reject")
-            if last_reject and stats.get("rejected", 0) > 0:
-                label = _REJECT_LABELS.get(last_reject, last_reject)
-                lines.append(f"<i>Последний отсев: {label}</i>")
     if step:
         lines.append(f"📍 {step}")
     return "\n".join(lines)
@@ -206,19 +197,10 @@ async def _send_json_file(
     json_limit: int,
     *,
     caption: str,
-    max_age_hours: float | None = None,
-    skip_age_recheck: bool = False,
 ) -> int:
-    age = None if skip_age_recheck else max_age_hours
-    export_items = [
-        x
-        for x in collected
-        if listing_is_export_ready(x, country, max_age_hours=age)
-    ][:json_limit]
-    if skip_age_recheck and not export_items and collected:
-        export_items = collected[:json_limit]
-    if not export_items:
+    if not collected:
         return 0
+    export_items = collected[:json_limit]
     payload = listings_to_json(export_items)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
         f.write(payload)
@@ -245,7 +227,6 @@ async def _parse_impl(
 ) -> None:
     token = parse_account_token(token_raw)
     max_age_hours = config.listing_max_age_hours
-    # Browse doc_id — только для смены региона, не для категорий (иначе пустая лента).
     gql_doc = config.fb_marketplace_doc_id
 
     async with Session() as session:
@@ -273,11 +254,10 @@ async def _parse_impl(
     collected: list = []
     seen_ids: set[str] = set()
     session_sellers: set[str] = set()
-    visited_feeds: set[str] = set()
     cat_count = len(categories)
     cat_idx = 0
-    page_mostly_dup = {"value": False}
     empty_rounds = 0
+    max_empty_rounds = cat_count * 5
     connect_fails = 0
 
     t_start = time.monotonic()
@@ -285,13 +265,8 @@ async def _parse_impl(
     job = _jobs.get(telegram_id)
     stats = job.stats if job else {}
     token_dead_flag = {"value": False}
-    last_ui_update = {"t": 0.0}
 
-    async def status_progress(*, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - last_ui_update["t"] < 2.0:
-            return
-        last_ui_update["t"] = now
+    async def status_progress() -> None:
         stats["accepted"] = len(collected)
         if on_status:
             await on_status(
@@ -312,7 +287,7 @@ async def _parse_impl(
             if len(collected) >= json_limit:
                 return
             sec = int(time.monotonic() - t_start)
-            current_step["text"] = f"⏳ {sec} сек — {current_step.get('detail', 'ожидание…')}"
+            current_step["text"] = f"⏳ {sec} сек — {current_step.get('detail', '…')}"
             await status_progress()
 
     hb_task = asyncio.create_task(heartbeat())
@@ -323,7 +298,7 @@ async def _parse_impl(
     elif country == "fi":
         country_label = " 🇫🇮"
     current_step["text"] = f"Категорий: {cat_count}{country_label}"
-    await status_progress(force=True)
+    await status_progress()
     logger.info("parse start tg=%s limit=%s cats=%s country=%s", telegram_id, json_limit, cat_count, country)
 
     async with Session() as session:
@@ -331,22 +306,13 @@ async def _parse_impl(
     try:
         current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
         await status_progress()
-        logger.info(
-            "hint: не запускай VOID-парсер с тем же токеном одновременно — сессия сбивается"
+        await apply_marketplace_region(
+            token,
+            country,
+            user_agent=config.fb_user_agent,
+            proxy_url=proxy_url_boot,
+            timeout_sec=18.0,
         )
-        try:
-            await asyncio.wait_for(
-                apply_marketplace_region(
-                    token,
-                    country,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url_boot,
-                    timeout_sec=12.0,
-                ),
-                timeout=45.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("region switch timeout — продолжаем парсинг")
     except AccountTokenDeadError:
         token_dead_flag["value"] = True
         await _notify_token_dead(bot, telegram_id, on_status)
@@ -356,29 +322,9 @@ async def _parse_impl(
         while len(collected) < json_limit and not stop.is_set():
             cat = categories[cat_idx % cat_count]
             cat_idx += 1
-            hub_round = (cat_idx - 1) // cat_count
-            hubs = (COUNTRY_LOCATIONS.get(country or "") or {}).get("region_hubs") or []
-            hub_slug = hubs[hub_round % len(hubs)] if hubs else "ch"
-            feed_key = f"{cat.url_path}@{hub_slug}"
-            if feed_key in visited_feeds:
-                logger.info("skip feed already visited %s", feed_key)
-                empty_rounds += 1
-                max_empty = cat_count * (2 if collected else 5)
-                if empty_rounds >= max_empty:
-                    break
-                continue
-            visited_feeds.add(feed_key)
-            page_mostly_dup["value"] = False
-            current_step["detail"] = f"{cat.label} · {hub_slug}"
-            current_step["text"] = f"Категория: {cat.label} ({hub_slug})"
+            current_step["detail"] = cat.label
+            current_step["text"] = f"Категория: {cat.label}"
             await status_progress()
-            logger.info(
-                "category %s hub=%s path=%s gql=%s",
-                cat.label,
-                hub_slug,
-                cat.url_path,
-                bool(gql_doc),
-            )
 
             async with Session() as session:
                 proxy_url = await pick_random_proxy_url(session, user_id)
@@ -390,31 +336,24 @@ async def _parse_impl(
 
             async def on_page_found(n: int) -> None:
                 stats["pages"] = stats.get("pages", 0) + 1
-                current_step["text"] = (
-                    f"⏳ {current_step.get('detail', cat.label)} · +{n} на странице"
-                )
+                stats["found"] = stats.get("found", 0) + n
                 await status_progress()
 
             cat_added = 0
+            enrich_if = frozenset({"мало_полей", "нет_заголовка"})
 
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, empty_rounds
-                enrich_if = frozenset({"мало_полей", "нет_заголовка"})
-                batch_dup = 0
-                batch_new = 0
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
                     if item.listing_id in seen_ids:
-                        batch_dup += 1
-                        _record_reject(stats, "дубликат")
                         continue
-                    batch_new += 1
-                    seen_ids.add(item.listing_id)
                     stats["checked"] = stats.get("checked", 0) + 1
                     sk = seller_key_from_item(item)
                     if sk and (sk in blocked_sellers or sk in session_sellers):
                         _record_reject(stats, "повторный_продавец")
+                        seen_ids.add(item.listing_id)
                         continue
                     reason = export_reject_reason(
                         item, country, max_age_hours=max_age_hours
@@ -426,7 +365,7 @@ async def _parse_impl(
                                 item,
                                 user_agent=config.fb_user_agent,
                                 proxy_url=proxy_used,
-                                timeout_sec=10.0,
+                                timeout_sec=12.0,
                             )
                         except AccountTokenDeadError:
                             token_dead_flag["value"] = True
@@ -434,13 +373,16 @@ async def _parse_impl(
                         sk = seller_key_from_item(item)
                         if sk and (sk in blocked_sellers or sk in session_sellers):
                             _record_reject(stats, "повторный_продавец")
+                            seen_ids.add(item.listing_id)
                             continue
                         reason = export_reject_reason(
                             item, country, max_age_hours=max_age_hours
                         )
                     if reason:
                         _record_reject(stats, reason)
+                        seen_ids.add(item.listing_id)
                         continue
+                    seen_ids.add(item.listing_id)
                     if sk:
                         session_sellers.add(sk)
                         blocked_sellers.add(sk)
@@ -452,11 +394,7 @@ async def _parse_impl(
                     current_step["detail"] = (
                         f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
                     )
-                    await status_progress(force=True)
-                stats["found"] = stats.get("found", 0) + batch_new
-                if len(page_items) >= 8 and batch_dup >= len(page_items) * 0.85:
-                    page_mostly_dup["value"] = True
-                await status_progress()
+                    await status_progress()
 
             def should_stop() -> bool:
                 return stop.is_set() or len(collected) >= json_limit
@@ -482,10 +420,8 @@ async def _parse_impl(
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
                         should_stop=should_stop,
-                        hub_round=hub_round,
+                        hub_round=cat_idx,
                         graphql_doc_id=gql_doc,
-                        max_listing_age_hours=max_age_hours,
-                        stop_on_duplicate_page=lambda: page_mostly_dup["value"],
                     )
                     connect_fails = 0
                     break
@@ -510,24 +446,19 @@ async def _parse_impl(
                     if connect_fails >= 3 and len(collected) == 0:
                         hint = (
                             "❌ <b>Нет связи с Facebook</b>\n\n"
-                            "С сервера Railway без рабочего прокси FB часто недоступен.\n"
-                            "⚙️ Настройки → 🌐 Прокси — добавь SOCKS5 (CH/FI).\n"
-                            "Проверь host:port:user:pass."
+                            "Добавь SOCKS5 прокси страны поиска в ⚙️ Настройки → 🌐 Прокси."
                         )
                         if on_status:
                             await on_status(hint)
                         raise RuntimeError("Нет связи с Facebook") from err
                 empty_rounds += 1
-                max_empty = cat_count * (2 if collected else 5)
-                if empty_rounds >= max_empty:
+                if empty_rounds >= max_empty_rounds:
                     break
                 continue
 
             if cat_added == 0:
                 empty_rounds += 1
-                current_step["detail"] = f"{cat.label}: 0 в JSON (см. отсев)"
-                max_empty = cat_count * (2 if collected else 5)
-                if empty_rounds >= max_empty:
+                if empty_rounds >= max_empty_rounds:
                     break
             await status_progress()
     except AccountTokenDeadError:
@@ -573,77 +504,36 @@ async def _parse_impl(
     if token_dead:
         return
 
-    if not full:
-        if stopped and got > 0:
-            sent = await _send_json_file(
-                bot,
-                telegram_id,
-                collected,
-                country,
-                json_limit,
-                caption=f"⏹ Остановлено — JSON: {got} объявлений",
-                skip_age_recheck=True,
-            )
-            if on_status:
-                if sent:
-                    tail = _progress_text(sent, json_limit, stats=stats)
-                    await on_status(
-                        f"⏹ <b>Остановлено.</b> Отправлен частичный JSON: "
-                        f"<b>{sent}</b> из {json_limit}.\n\n{tail}"
-                    )
-                else:
-                    await on_status(
-                        f"⏹ Остановлено. Собрано {got}, но ни одна карточка не прошла финальную проверку."
-                    )
-            return
-        reason = "остановлен" if stopped else "объявления не найдены"
-        if on_status:
-            extra = ""
-            reasons = stats.get("reject_reasons") or {}
-            if reasons.get("повторный_продавец", 0) > got:
-                extra = (
-                    "\n\n💡 Много <b>повторных продавцов</b> — это ваш личный ЧС "
-                    "(1 объявление на продавца). Новые категории/регионы дадут других людей."
-                )
-            await on_status(
-                f"⚠️ Парсинг {reason}.\n"
-                f"Собрано <b>{got}/{json_limit}</b> — JSON <b>не отправлен</b>."
-                f"{extra}\n\n"
-                "Чаще всего:\n"
-                "• токен аккаунта протух — вставь новый\n"
-                "• Facebook отдаёт пустую страницу — проверь прокси CH/FI\n"
-                "• в логах Railway: <code>parsed 0 items</code> и <code>links=0</code>\n"
-                "• мало полных карточек — обнови токен / прокси CH"
-            )
-        return
-
-    export_items = [
-        x
-        for x in collected
-        if listing_is_export_ready(x, country, max_age_hours=max_age_hours)
-    ][:json_limit]
-    if len(export_items) < json_limit:
-        if on_status:
-            await on_status(
-                f"⚠️ Полных объявлений только <b>{len(export_items)}/{json_limit}</b>.\n"
-                "JSON не отправлен — нужны цена/продавец/фото как в VOID.\n"
-                "Проверь токен, прокси 🇨🇭 и категории."
-            )
-        return
-
-    payload = listings_to_json(export_items)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
-        f.write(payload)
-        path = f.name
-
-    try:
-        await bot.send_document(
+    if stopped and got > 0:
+        sent = await _send_json_file(
+            bot,
             telegram_id,
-            FSInputFile(path, filename=f"marketplace_{json_limit}.json"),
-            caption=f"✅ JSON: {json_limit} объявлений",
+            collected,
+            country,
+            json_limit,
+            caption=f"⏹ Остановлено — {len(collected)} объявлений",
         )
-    finally:
-        Path(path).unlink(missing_ok=True)
+        if on_status:
+            await on_status(
+                f"⏹ <b>Остановлено.</b> Отправлен JSON: <b>{sent}</b> объявлений."
+            )
+        return
 
+    if not full:
+        if on_status:
+            await on_status(
+                f"⚠️ Собрано <b>{got}/{json_limit}</b>. JSON не отправлен (лимит не набран).\n"
+                "Проверь токен и прокси страны (CH/FI)."
+            )
+        return
+
+    await _send_json_file(
+        bot,
+        telegram_id,
+        collected,
+        country,
+        json_limit,
+        caption=f"✅ JSON: {json_limit} объявлений",
+    )
     if on_status:
         await on_status(f"✅ Готово. Отправлен JSON: <b>{json_limit}</b> объявлений.")

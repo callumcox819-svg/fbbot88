@@ -456,11 +456,10 @@ def urls_for_country_category(
     hubs = cfg.get("region_hubs") or []
 
     if hub_round is not None:
-        # Один URL за проход — не switzerland+hub (одни и те же 20 карточек дважды).
+        if slugs:
+            add(build_category_url(url_path, marketplace_root=slugs[0]))
         if hubs:
             add(build_category_url(url_path, marketplace_root=hubs[hub_round % len(hubs)]))
-        elif slugs:
-            add(build_category_url(url_path, marketplace_root=slugs[0]))
         if urls:
             return urls
 
@@ -489,10 +488,8 @@ async def fetch_category_listings(
     should_stop: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
-    max_listing_age_hours: float | None = None,
-    stop_on_duplicate_page: Callable[[], bool] | None = None,
 ) -> list[MarketplaceListing]:
-    """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
+    """Категория; при CH/FI — регионы страны, одна HTML-страница на URL (как при стабильных 40+)."""
     if country and country in COUNTRY_LOCATIONS:
         urls = urls_for_country_category(country, url_path, hub_round=hub_round)
     else:
@@ -507,105 +504,47 @@ async def fetch_category_listings(
             break
         if len(out) >= limit:
             break
+        short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
         if on_url_progress:
-            short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
             await on_url_progress(i, total_urls, short)
         fetch_url = with_country_geo(url, country)
-        short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
-        cursor: str | None = None
-        has_next = True
-        empty_feed_pages = 0
+        logger.info("GET %s", fetch_url)
         try:
-            for page_no in range(1, _MAX_CATEGORY_FEED_PAGES + 1):
-                if should_stop and should_stop():
-                    break
+            batch, meta, _cursor, _has_next = await _fetch_page(
+                token,
+                url=fetch_url,
+                user_agent=user_agent,
+                proxy_url=proxy_url,
+                timeout_sec=timeout_sec,
+                category_label=category_label,
+                graphql_doc_id=graphql_doc_id,
+                cursor=None,
+            )
+            logger.info(
+                "parsed %s items from %s (html=%s, links=%s)",
+                len(batch),
+                short,
+                meta.get("html_len"),
+                meta.get("link_count"),
+            )
+            page_new: list[MarketplaceListing] = []
+            for item in batch:
+                if not listing_is_valid(item):
+                    continue
+                if item.listing_id in seen_ids:
+                    continue
+                seen_ids.add(item.listing_id)
+                page_new.append(item)
+                out.append(item)
                 if len(out) >= limit:
                     break
-                if not has_next and page_no > 1:
-                    break
-                if on_url_progress:
-                    page_hint = f" стр.{page_no}" if page_no > 1 else ""
-                    await on_url_progress(i, total_urls, f"{short[:40]}{page_hint}")
-                logger.info("GET %s page=%s cursor=%s", fetch_url, page_no, bool(cursor))
-                try:
-                    batch, meta, cursor, has_next = await _fetch_page(
-                        token,
-                        url=fetch_url,
-                        user_agent=user_agent,
-                        proxy_url=proxy_url,
-                        timeout_sec=timeout_sec,
-                        category_label=category_label,
-                        graphql_doc_id=graphql_doc_id,
-                        cursor=cursor,
-                    )
-                except RuntimeError as e:
-                    if page_no == 1:
-                        raise
-                    logger.info("stop pagination at page %s: %s", page_no, e)
-                    break
-                except Exception as e:
-                    if page_no == 1:
-                        raise
-                    logger.warning("pagination page %s failed: %s", page_no, e)
-                    break
 
-                logger.info(
-                    "parsed %s items from %s p%s (html=%s, links=%s, next=%s)",
-                    len(batch),
-                    short,
-                    page_no,
-                    meta.get("html_len"),
-                    meta.get("link_count"),
-                    has_next,
-                )
-                page_new: list[MarketplaceListing] = []
-                for item in batch:
-                    if not listing_is_valid(item):
-                        continue
-                    if item.listing_id in seen_ids:
-                        continue
-                    seen_ids.add(item.listing_id)
-                    page_new.append(item)
-                    out.append(item)
-                    if len(out) >= limit:
-                        break
-
-                if batch and not page_new:
-                    logger.debug(
-                        "url %s p%s: parsed %s, 0 new (duplicates or invalid)",
-                        short,
-                        page_no,
-                        len(batch),
-                    )
-                if on_page_found and page_new:
-                    await on_page_found(len(page_new))
-                page_dup_only = False
-                if on_page_items and page_new:
-                    await on_page_items(page_new)
-                    if stop_on_duplicate_page and stop_on_duplicate_page():
-                        page_dup_only = True
-                if page_dup_only:
-                    logger.info("stop %s: page mostly duplicates", short)
-                    break
-                if not batch:
-                    empty_feed_pages += 1
-                    if empty_feed_pages >= 3:
-                        logger.info("stop %s: 3 empty pages", short)
-                        break
-                else:
-                    empty_feed_pages = 0
-                if len(out) >= limit:
-                    break
-                if max_listing_age_hours and _feed_page_all_too_old(batch, max_listing_age_hours):
-                    logger.info(
-                        "stop pagination %s: page %s all older than %sh",
-                        short,
-                        page_no,
-                        max_listing_age_hours,
-                    )
-                    break
-                if not has_next or not cursor:
-                    break
+            if on_page_found and page_new:
+                await on_page_found(len(page_new))
+            if on_page_items and page_new:
+                await on_page_items(page_new)
+            if len(out) >= limit:
+                break
         except RuntimeError as e:
             if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                 logger.info("skip url %s: %s", url, e)

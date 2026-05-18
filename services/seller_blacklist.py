@@ -26,6 +26,16 @@ def seller_key_from_item(item) -> str:
     return ""
 
 
+async def clear_blocked_sellers(session: AsyncSession, user_id: int) -> int:
+    from sqlalchemy import delete
+
+    res = await session.execute(
+        delete(BlockedSeller).where(BlockedSeller.user_id == user_id)
+    )
+    await session.commit()
+    return res.rowcount or 0
+
+
 async def load_blocked_seller_keys(session: AsyncSession, user_id: int) -> set[str]:
     res = await session.execute(
         select(BlockedSeller.seller_key).where(BlockedSeller.user_id == user_id)
