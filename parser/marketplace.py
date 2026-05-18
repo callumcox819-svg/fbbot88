@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin
 
 import aiohttp
@@ -203,7 +203,8 @@ async def fetch_category_listings(
     country: str | None,
     proxy_url: str | None,
     limit: int,
-    timeout_sec: float = 45.0,
+    timeout_sec: float = 22.0,
+    on_url_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
     if country and country in COUNTRY_LOCATIONS:
@@ -213,10 +214,15 @@ async def fetch_category_listings(
 
     seen_ids: set[str] = set()
     out: list[MarketplaceListing] = []
+    total_urls = len(urls)
 
-    for url in urls:
+    for i, url in enumerate(urls, start=1):
         if len(out) >= limit:
             break
+        if on_url_progress:
+            short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
+            await on_url_progress(i, total_urls, short)
+        logger.info("GET %s", url)
         try:
             batch = await _fetch_page(
                 token,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -84,8 +85,14 @@ async def start_parsing(
     _jobs[telegram_id] = JobState(task=task)
 
 
-def _progress_text(done: int, total: int) -> str:
-    return f"🔎 Сбор объявлений: <b>{done}/{total}</b>\n<i>В чат ничего не шлём — только JSON в конце.</i>"
+def _progress_text(done: int, total: int, *, step: str = "") -> str:
+    lines = [
+        f"🔎 <b>Сбор: {done}/{total}</b>",
+        "<i>Бот работает — цифра растёт. JSON пришлёт файлом в конце.</i>",
+    ]
+    if step:
+        lines.append(f"📍 {step}")
+    return "\n".join(lines)
 
 
 async def _parse_impl(
@@ -124,41 +131,68 @@ async def _parse_impl(
     max_empty_rounds = cat_count * 5
     connect_fails = 0
 
-    async def status_progress(extra: str = "") -> None:
+    t_start = time.monotonic()
+    current_step = {"text": "Старт…"}
+
+    async def status_progress() -> None:
         if on_status:
-            text = _progress_text(len(collected), json_limit)
-            if extra:
-                text += f"\n<i>{extra}</i>"
-            await on_status(text)
+            await on_status(_progress_text(len(collected), json_limit, step=current_step["text"]))
 
-    await status_progress("Подключение к Facebook…")
+    async def heartbeat() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(12)
+            if len(collected) >= json_limit:
+                return
+            sec = int(time.monotonic() - t_start)
+            current_step["text"] = f"⏳ {sec} сек — {current_step.get('detail', 'ожидание…')}"
+            await status_progress()
 
-    while len(collected) < json_limit and not stop.is_set():
-        cat = categories[cat_idx % cat_count]
-        cat_idx += 1
-        need = json_limit - len(collected)
+    hb_task = asyncio.create_task(heartbeat())
 
-        async with Session() as session:
-            proxy_url = await pick_random_proxy_url(session, user_id)
+    country_label = ""
+    if country == "ch":
+        country_label = " 🇨🇭"
+    elif country == "fi":
+        country_label = " 🇫🇮"
+    current_step["text"] = f"Категорий: {cat_count}{country_label}"
+    await status_progress()
+    logger.info("parse start tg=%s limit=%s cats=%s country=%s", telegram_id, json_limit, cat_count, country)
 
-        batch = None
-        last_err: Exception | None = None
-        for proxy_try in (proxy_url, None):
-            if proxy_try is None and proxy_url is None:
-                break
-            try:
-                batch = await fetch_category_listings(
-                    token,
-                    url_path=cat.url_path,
-                    category_label=cat.label,
-                    user_agent=config.fb_user_agent,
-                    country=country,
-                    proxy_url=proxy_try,
-                    limit=min(max(need * 2, 30), 120),
-                    timeout_sec=35.0,
-                )
-                connect_fails = 0
-                break
+    try:
+        while len(collected) < json_limit and not stop.is_set():
+            cat = categories[cat_idx % cat_count]
+            cat_idx += 1
+            need = json_limit - len(collected)
+            current_step["detail"] = cat.label
+            current_step["text"] = f"Категория: {cat.label}"
+            await status_progress()
+
+            async with Session() as session:
+                proxy_url = await pick_random_proxy_url(session, user_id)
+
+            async def on_url(i: int, n: int, short: str) -> None:
+                current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"
+                await status_progress()
+
+            batch = None
+            last_err: Exception | None = None
+            for proxy_try in (proxy_url, None):
+                if proxy_try is None and proxy_url is None:
+                    break
+                try:
+                    batch = await fetch_category_listings(
+                        token,
+                        url_path=cat.url_path,
+                        category_label=cat.label,
+                        user_agent=config.fb_user_agent,
+                        country=country,
+                        proxy_url=proxy_try,
+                        limit=min(max(need * 2, 30), 120),
+                        timeout_sec=22.0,
+                        on_url_progress=on_url,
+                    )
+                    connect_fails = 0
+                    break
             except Exception as e:
                 last_err = e
                 if proxy_try and is_connection_error(e):
@@ -203,7 +237,13 @@ async def _parse_impl(
         else:
             empty_rounds = 0
 
-        await status_progress()
+            await status_progress()
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
 
     got = len(collected)
     full = got >= json_limit

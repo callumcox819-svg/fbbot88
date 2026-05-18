@@ -101,8 +101,20 @@ async def on_token_input(message: Message, state: FSMContext, db_user: User) -> 
 
 async def _launch_parse(message: Message, telegram_id: int, db_user: User, token_raw: str) -> None:
     # Статус без reply-клавиатуры — иначе edit_text часто не работает
+    async with Session() as session:
+        from sqlalchemy import select
+        from models import User as U
+
+        u = (await session.execute(select(U).where(U.id == db_user.id))).scalar_one()
+        lim = int(u.json_limit or 50)
+        from services.categories import list_user_categories
+
+        n_cat = len(await list_user_categories(session, db_user.id))
+
     status_msg = await message.answer(
-        "🔎 <b>0/?</b> — запуск…",
+        f"🔎 <b>0/{lim}</b>\n"
+        f"<i>Парсинг запущен ({n_cat} кат.). Сообщение обновляется каждые ~12 сек.</i>\n"
+        f"<i>⏹ Стоп поиск — отменить.</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
