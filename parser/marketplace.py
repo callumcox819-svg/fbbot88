@@ -77,6 +77,31 @@ def _country_location_ok(location: str, country: str | None) -> bool:
     return any(h in loc for h in hints)
 
 
+def normalize_category_path(url_or_path: str) -> str:
+    """
+    https://www.facebook.com/marketplace/category/sports → category/sports
+    sports → category/sports
+    """
+    path = (url_or_path or "").strip()
+    if "facebook.com/marketplace/" in path:
+        path = path.split("facebook.com/marketplace/", 1)[1]
+    path = path.strip("/").split("?")[0]
+    if not path:
+        raise ValueError("Пустой путь категории")
+    if not path.startswith("category/"):
+        if path.startswith("category"):
+            path = path.replace("category", "category/", 1)
+        else:
+            path = f"category/{path}"
+    return path
+
+
+def build_category_url(url_path: str) -> str:
+    """Как в браузере: https://www.facebook.com/marketplace/category/sports"""
+    path = normalize_category_path(url_path)
+    return urljoin(_FB_BASE, f"{path}/")
+
+
 async def fetch_category_listings(
     token: AccountToken,
     *,
@@ -88,46 +113,28 @@ async def fetch_category_listings(
     limit: int,
     timeout_sec: float = 45.0,
 ) -> list[MarketplaceListing]:
-    """Собрать объявления из категории (с учётом страны через hub-города)."""
-    hubs: list[str | None]
-    if country and country in COUNTRY_LOCATIONS:
-        hubs = list(COUNTRY_LOCATIONS[country]["hubs"])  # type: ignore[arg-type]
-    else:
-        hubs = [None]
+    """Собрать объявления из категории. Страна — фильтр по городу в объявлении."""
+    url = build_category_url(url_path)
+    logger.info("fetch category url=%s country=%s", url, country or "all")
 
-    seen: set[str] = set()
+    batch = await _fetch_page(
+        token,
+        url=url,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=timeout_sec,
+        category_label=category_label,
+    )
+
     out: list[MarketplaceListing] = []
-
-    for hub in hubs:
+    for item in batch:
+        if country and not _country_location_ok(item.location, country):
+            continue
+        out.append(item)
         if len(out) >= limit:
             break
-        url = _build_category_url(url_path, hub)
-        batch = await _fetch_page(
-            token,
-            url=url,
-            user_agent=user_agent,
-            proxy_url=proxy_url,
-            timeout_sec=timeout_sec,
-            category_label=category_label,
-        )
-        for item in batch:
-            if item.listing_id in seen:
-                continue
-            if not _country_location_ok(item.location, country):
-                continue
-            seen.add(item.listing_id)
-            out.append(item)
-            if len(out) >= limit:
-                break
 
     return out[:limit]
-
-
-def _build_category_url(url_path: str, hub: str | None) -> str:
-    path = url_path.strip().lstrip("/")
-    if hub:
-        return urljoin(_FB_BASE, f"{hub}/{path}")
-    return urljoin(_FB_BASE, path)
 
 
 def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
@@ -169,6 +176,10 @@ async def _fetch_page(
         "Cookie": cookies_header(token.cookies),
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.facebook.com/marketplace/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     async with _session_for_proxy(proxy_url) as session:

@@ -81,10 +81,11 @@ async def add_custom_category(session: AsyncSession, user_id: int, url: str) -> 
     if len(cats) >= MAX_CATEGORIES_PER_USER:
         return f"Максимум {MAX_CATEGORIES_PER_USER} категорий"
 
-    path = url.strip()
-    if "facebook.com/marketplace/" in path:
-        path = path.split("facebook.com/marketplace/", 1)[1].strip("/")
-    if not path:
+    from parser.marketplace import normalize_category_path
+
+    try:
+        path = normalize_category_path(url)
+    except ValueError:
         return "Некорректная ссылка"
 
     key = f"custom:{path[:60]}"

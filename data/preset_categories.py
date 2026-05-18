@@ -49,13 +49,8 @@ PRESET_BY_KEY = {c.key: c for c in PRESET_CATEGORIES}
 
 MAX_CATEGORIES_PER_USER = 7
 
-COUNTRY_LOCATIONS: dict[str, dict[str, str | list[str]]] = {
-    "ch": {
-        "label": "🇨🇭 Швейцария",
-        "hubs": ["zurich", "geneva", "bern", "basel", "lausanne"],
-    },
-    "fi": {
-        "label": "🇫🇮 Финляндия",
-        "hubs": ["helsinki", "tampere", "turku", "oulu"],
-    },
+# Фильтр страны — по полю location в объявлении (URL всегда /marketplace/category/…)
+COUNTRY_LOCATIONS: dict[str, dict[str, str]] = {
+    "ch": {"label": "🇨🇭 Швейцария"},
+    "fi": {"label": "🇫🇮 Финляндия"},
 }
