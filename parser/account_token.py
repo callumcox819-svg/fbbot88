@@ -86,3 +86,29 @@ def account_token_from_storage(stored: str) -> AccountToken:
 
 def cookies_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+class AccountTokenDeadError(RuntimeError):
+    """Cookies/access_token Facebook больше не принимаются."""
+
+
+TOKEN_DEAD_USER_MESSAGE = (
+    "❌ Все токены не валидны или истекли, попробуйте получить их заново"
+)
+
+
+def is_account_token_dead(exc: BaseException) -> bool:
+    if isinstance(exc, AccountTokenDeadError):
+        return True
+    s = str(exc).lower()
+    return any(
+        x in s
+        for x in (
+            "недействителен",
+            "cookies истекли",
+            "страницу входа",
+            "loginform",
+            "invalid token",
+            "session has expired",
+        )
+    )

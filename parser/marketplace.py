@@ -13,7 +13,7 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from data.preset_categories import COUNTRY_LOCATIONS
-from parser.account_token import AccountToken, cookies_header
+from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
 
 logger = logging.getLogger(__name__)
 
@@ -660,7 +660,7 @@ async def enrich_listing(
         return item
 
     if _looks_like_login_wall(html):
-        return item
+        raise AccountTokenDeadError("login wall on item page")
 
     parsed = _parse_html(html, item.category)
     best: MarketplaceListing | None = None
@@ -801,16 +801,14 @@ async def _fetch_page(
             if resp.status >= 400:
                 raise RuntimeError(f"Facebook HTTP {resp.status}")
             if "login" in str(resp.url).lower():
-                raise RuntimeError("Токен аккаунта недействителен — вставь новую строку")
+                raise AccountTokenDeadError("redirect to login")
 
     meta = {
         "html_len": len(html),
         "link_count": html.count("/marketplace/item/"),
     }
     if _looks_like_login_wall(html):
-        raise RuntimeError(
-            "Facebook отдал страницу входа — обнови токен аккаунта (cookies истекли)"
-        )
+        raise AccountTokenDeadError("login wall in HTML")
 
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)

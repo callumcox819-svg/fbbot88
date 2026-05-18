@@ -18,7 +18,12 @@ from sqlalchemy import select
 from config import config
 from database import Session
 from models import ParseRun, User
-from parser.account_token import parse_account_token
+from parser.account_token import (
+    AccountTokenDeadError,
+    TOKEN_DEAD_USER_MESSAGE,
+    is_account_token_dead,
+    parse_account_token,
+)
 from parser.marketplace import (
     enrich_listing,
     fetch_category_listings,
@@ -49,6 +54,20 @@ def get_parse_stats(telegram_id: int) -> dict | None:
     if not job or not job.stats:
         return None
     return dict(job.stats)
+
+
+async def _notify_token_dead(
+    bot: Bot,
+    telegram_id: int,
+    on_status: Callable[[str], Awaitable[None]] | None,
+) -> None:
+    logger.warning("account token dead tg=%s", telegram_id)
+    if on_status:
+        await on_status(TOKEN_DEAD_USER_MESSAGE)
+    try:
+        await bot.send_message(telegram_id, TOKEN_DEAD_USER_MESSAGE)
+    except Exception:
+        logger.exception("failed to send token-dead message tg=%s", telegram_id)
 
 
 async def refresh_parse_status(telegram_id: int) -> bool:
@@ -98,10 +117,15 @@ async def start_parsing(
         except asyncio.CancelledError:
             if on_status:
                 await on_status("⏹ Остановлено.")
+        except AccountTokenDeadError:
+            await _notify_token_dead(bot, telegram_id, on_status)
         except Exception as e:
-            logger.exception("parse failed tg=%s", telegram_id)
-            if on_status:
-                await on_status(f"❌ Ошибка: {e}")
+            if is_account_token_dead(e):
+                await _notify_token_dead(bot, telegram_id, on_status)
+            else:
+                logger.exception("parse failed tg=%s", telegram_id)
+                if on_status:
+                    await on_status(f"❌ Ошибка: {e}")
         finally:
             _jobs.pop(telegram_id, None)
 
@@ -181,6 +205,7 @@ async def _parse_impl(
     current_step = {"text": "Старт…"}
     job = _jobs.get(telegram_id)
     stats = job.stats if job else {}
+    token_dead_flag = {"value": False}
 
     async def status_progress() -> None:
         stats["accepted"] = len(collected)
@@ -251,13 +276,17 @@ async def _parse_impl(
                         return
                     if item.listing_id in seen_ids:
                         continue
-                    await enrich_listing(
-                        token,
-                        item,
-                        user_agent=config.fb_user_agent,
-                        proxy_url=proxy_used,
-                        timeout_sec=14.0,
-                    )
+                    try:
+                        await enrich_listing(
+                            token,
+                            item,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_used,
+                            timeout_sec=14.0,
+                        )
+                    except AccountTokenDeadError:
+                        token_dead_flag["value"] = True
+                        raise
                     stats["checked"] = stats.get("checked", 0) + 1
                     if not listing_is_export_ready(item, country):
                         stats["rejected"] = stats.get("rejected", 0) + 1
@@ -300,8 +329,12 @@ async def _parse_impl(
                     )
                     connect_fails = 0
                     break
+                except AccountTokenDeadError:
+                    raise
                 except Exception as e:
                     last_err = e
+                    if is_account_token_dead(e):
+                        raise AccountTokenDeadError(str(e)) from e
                     if proxy_try and is_connection_error(e):
                         logger.warning("proxy failed for %s, retry direct: %s", cat.label, e)
                         continue
@@ -309,6 +342,8 @@ async def _parse_impl(
 
             if batch is None and last_err:
                 err = last_err
+                if is_account_token_dead(err):
+                    raise AccountTokenDeadError(str(err)) from err
                 logger.warning("category %s failed: %s", cat.label, err)
                 if is_connection_error(err):
                     connect_fails += 1
@@ -333,6 +368,9 @@ async def _parse_impl(
                 if empty_rounds >= max_empty_rounds:
                     break
             await status_progress()
+    except AccountTokenDeadError:
+        token_dead_flag["value"] = True
+        await _notify_token_dead(bot, telegram_id, on_status)
     finally:
         hb_task.cancel()
         try:
@@ -343,8 +381,11 @@ async def _parse_impl(
     got = len(collected)
     full = got >= json_limit
     stopped = stop.is_set()
+    token_dead = token_dead_flag["value"]
 
-    if stopped:
+    if token_dead:
+        status_key = "token_expired"
+    elif stopped:
         status_key = "stopped"
     elif full:
         status_key = "done"
@@ -361,9 +402,14 @@ async def _parse_impl(
         run.listings_count = got
         run.categories_used = cat_count
         run.finished_at = datetime.utcnow()
-        if not full:
+        if token_dead:
+            run.error_message = "token_expired"
+        elif not full:
             run.error_message = f"Собрано {got}/{json_limit}"
         await session.commit()
+
+    if token_dead:
+        return
 
     if not full:
         reason = "остановлен" if stopped else "объявления не найдены"
