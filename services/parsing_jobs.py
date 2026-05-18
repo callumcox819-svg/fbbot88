@@ -193,49 +193,49 @@ async def _parse_impl(
                     )
                     connect_fails = 0
                     break
-            except Exception as e:
-                last_err = e
-                if proxy_try and is_connection_error(e):
-                    logger.warning("proxy failed for %s, retry direct: %s", cat.label, e)
-                    continue
-                break
+                except Exception as e:
+                    last_err = e
+                    if proxy_try and is_connection_error(e):
+                        logger.warning("proxy failed for %s, retry direct: %s", cat.label, e)
+                        continue
+                    break
 
-        if batch is None:
-            err = last_err or RuntimeError("unknown")
-            logger.warning("category %s failed: %s", cat.label, err)
-            if is_connection_error(err):
-                connect_fails += 1
-                if connect_fails >= 3 and len(collected) == 0:
-                    hint = (
-                        "❌ <b>Нет связи с Facebook</b>\n\n"
-                        "С сервера Railway без рабочего прокси FB часто недоступен.\n"
-                        "⚙️ Настройки → 🌐 Прокси — добавь SOCKS5 (CH/FI).\n"
-                        "Проверь host:port:user:pass."
-                    )
-                    if on_status:
-                        await on_status(hint)
-                    raise RuntimeError("Нет связи с Facebook") from err
-            empty_rounds += 1
-            if empty_rounds >= max_empty_rounds:
-                break
-            continue
-
-        added = 0
-        for item in batch:
-            if stop.is_set() or len(collected) >= json_limit:
-                break
-            if item.listing_id in seen_ids:
+            if batch is None:
+                err = last_err or RuntimeError("unknown")
+                logger.warning("category %s failed: %s", cat.label, err)
+                if is_connection_error(err):
+                    connect_fails += 1
+                    if connect_fails >= 3 and len(collected) == 0:
+                        hint = (
+                            "❌ <b>Нет связи с Facebook</b>\n\n"
+                            "С сервера Railway без рабочего прокси FB часто недоступен.\n"
+                            "⚙️ Настройки → 🌐 Прокси — добавь SOCKS5 (CH/FI).\n"
+                            "Проверь host:port:user:pass."
+                        )
+                        if on_status:
+                            await on_status(hint)
+                        raise RuntimeError("Нет связи с Facebook") from err
+                empty_rounds += 1
+                if empty_rounds >= max_empty_rounds:
+                    break
                 continue
-            seen_ids.add(item.listing_id)
-            collected.append(item)
-            added += 1
 
-        if added == 0:
-            empty_rounds += 1
-            if empty_rounds >= max_empty_rounds:
-                break
-        else:
-            empty_rounds = 0
+            added = 0
+            for item in batch:
+                if stop.is_set() or len(collected) >= json_limit:
+                    break
+                if item.listing_id in seen_ids:
+                    continue
+                seen_ids.add(item.listing_id)
+                collected.append(item)
+                added += 1
+
+            if added == 0:
+                empty_rounds += 1
+                if empty_rounds >= max_empty_rounds:
+                    break
+            else:
+                empty_rounds = 0
 
             await status_progress()
     finally:
