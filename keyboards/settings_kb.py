@@ -1,6 +1,10 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from data.preset_categories import COUNTRY_LOCATIONS, MAX_CATEGORIES_PER_USER, PRESET_CATEGORIES
+from data.preset_categories import (
+    COUNTRY_LOCATIONS,
+    MAX_CATEGORIES_PER_USER,
+    presets_for_country,
+)
 
 
 def settings_menu_kb_with_country(country: str | None, *, active_cats: int = 0) -> InlineKeyboardMarkup:
@@ -53,12 +57,14 @@ def preset_cat_btn_label(label: str, active: bool) -> str:
     return f"{'🟢' if active else '🔴'} {label}"
 
 
-def preset_categories_kb(active_keys: set[str]) -> InlineKeyboardMarkup:
+def preset_categories_kb(
+    active_keys: set[str], *, country: str | None = None
+) -> InlineKeyboardMarkup:
     """Тумблеры: 🟢 — будет парситься, 🔴 — выключено."""
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
 
-    for cat in PRESET_CATEGORIES:
+    for cat in presets_for_country(country):
         on = cat.key in active_keys
         row.append(
             InlineKeyboardButton(

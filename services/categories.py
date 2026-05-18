@@ -1,7 +1,11 @@
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from data.preset_categories import MAX_CATEGORIES_PER_USER, PRESET_BY_KEY
+from data.preset_categories import (
+    MAX_CATEGORIES_PER_USER,
+    PRESET_BY_KEY,
+    preset_keys_for_country,
+)
 from models import UserCategory
 
 
@@ -10,12 +14,30 @@ async def get_active_preset_keys(session: AsyncSession, user_id: int) -> set[str
     return {c.category_key for c in cats if c.is_preset}
 
 
+async def clear_preset_categories(session: AsyncSession, user_id: int) -> None:
+    await session.execute(
+        delete(UserCategory).where(
+            UserCategory.user_id == user_id,
+            UserCategory.is_preset.is_(True),
+        )
+    )
+    await session.commit()
+
+
 async def toggle_preset_category(
-    session: AsyncSession, user_id: int, key: str
+    session: AsyncSession, user_id: int, key: str, *, country: str | None
 ) -> tuple[set[str], str | None]:
     """Вкл/выкл готовую категорию (сохранение сразу)."""
     if key not in PRESET_BY_KEY:
         return await get_active_preset_keys(session, user_id), "Неизвестная категория"
+    if country not in ("ch", "fi"):
+        return await get_active_preset_keys(session, user_id), (
+            "Сначала выбери 🇨🇭 или 🇫🇮 в настройках"
+        )
+    if key not in preset_keys_for_country(country):
+        return await get_active_preset_keys(session, user_id), (
+            "Эта категория для другой страны — выбери категории из списка"
+        )
 
     all_cats = await list_user_categories(session, user_id)
     custom_count = sum(1 for c in all_cats if not c.is_preset)

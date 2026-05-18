@@ -8,12 +8,12 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
-from data.preset_categories import COUNTRY_LOCATIONS
+from data.preset_categories import CH_MARKETPLACE_LOCATION_ID, COUNTRY_LOCATIONS
 from parser.marketplace_region import append_geo_to_marketplace_url
 from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
 
@@ -593,11 +593,55 @@ def normalize_listing_for_export(item: MarketplaceListing, country: str | None) 
 
 
 def _all_marketplace_roots() -> frozenset[str]:
-    roots: set[str] = set()
+    roots: set[str] = {CH_MARKETPLACE_LOCATION_ID}
     for cfg in COUNTRY_LOCATIONS.values():
-        roots.update(cfg.get("marketplace_slugs") or [])
+        roots.update(str(x) for x in (cfg.get("marketplace_slugs") or []))
         roots.update(cfg.get("region_hubs") or [])
+        lid = cfg.get("filter_location_id")
+        if lid:
+            roots.add(str(lid))
     return frozenset(roots)
+
+
+def _is_search_category_path(path: str) -> bool:
+    return "/search" in path or "category_id=" in path
+
+
+def _normalize_search_path(path: str) -> str:
+    """103767472995143/search?category_id=…&query=…"""
+    if path.startswith("http"):
+        parsed = urlparse(path)
+        tail = parsed.path
+        if "facebook.com/marketplace/" in tail:
+            tail = tail.split("facebook.com/marketplace/", 1)[1]
+        elif "/marketplace/" in path:
+            tail = path.split("/marketplace/", 1)[1]
+        else:
+            tail = parsed.path.lstrip("/")
+        qs = parse_qs(parsed.query)
+    else:
+        if "facebook.com/marketplace/" in path:
+            path = path.split("facebook.com/marketplace/", 1)[1]
+        path = path.strip("/")
+        if "?" in path:
+            tail, q = path.split("?", 1)
+            qs = parse_qs(q)
+        else:
+            tail, qs = path, {}
+
+    parts = tail.strip("/").split("/")
+    loc_id = parts[0] if parts else CH_MARKETPLACE_LOCATION_ID
+    cat_id = (qs.get("category_id") or [""])[0]
+    query = (qs.get("query") or [""])[0]
+    if not cat_id:
+        raise ValueError("Нет category_id в ссылке search")
+    q = quote_plus(query) if query else ""
+    out = f"{loc_id}/search?category_id={cat_id}"
+    if q:
+        out += f"&query={q}"
+    ref = (qs.get("referral_ui_component") or ["category_menu_item"])[0]
+    out += f"&referral_ui_component={quote_plus(ref)}"
+    return out
 
 
 def _split_marketplace_path(path: str) -> tuple[str | None, str | None]:
@@ -621,11 +665,15 @@ def _split_marketplace_path(path: str) -> tuple[str | None, str | None]:
 
 def normalize_category_path(url_or_path: str) -> str:
     """
-    Сохраняет страну/город в пути, если есть в ссылке:
     …/marketplace/finland/category/baby → finland/category/baby
-    …/marketplace/category/sports → category/sports
+    …/marketplace/103767472995143/search/?category_id=… → search path
     """
-    path = (url_or_path or "").strip()
+    raw = (url_or_path or "").strip()
+    if not raw:
+        raise ValueError("Пустой путь категории")
+    if _is_search_category_path(raw):
+        return _normalize_search_path(raw)
+    path = raw
     if "facebook.com/marketplace/" in path:
         path = path.split("facebook.com/marketplace/", 1)[1]
     path = path.strip("/").split("?")[0]
@@ -650,10 +698,12 @@ def _category_slug(url_path: str) -> str:
 def build_category_url(url_path: str, *, marketplace_root: str | None = None) -> str:
     """
     marketplace/category/sports/
-    marketplace/finland/category/baby/  (если путь уже с finland/)
-    marketplace/zurich/category/sports/ (marketplace_root)
+    marketplace/finland/category/baby/
+    marketplace/103767472995143/search?category_id=…
     """
     norm = normalize_category_path(url_path)
+    if _is_search_category_path(norm):
+        return urljoin(_FB_BASE, norm if norm.endswith("/") else f"{norm}/")
     root, slug = _split_marketplace_path(norm)
     if root and slug:
         return urljoin(_FB_BASE, f"{root}/category/{slug}/")
@@ -685,9 +735,16 @@ def urls_for_country_category(
             urls.append(u)
 
     norm = normalize_category_path(url_path)
+    if _is_search_category_path(norm):
+        add(build_category_url(norm))
+        return urls
+
     embed_root, _ = _split_marketplace_path(norm)
-    country_slugs = set(cfg.get("marketplace_slugs") or [])
+    country_slugs = set(str(x) for x in (cfg.get("marketplace_slugs") or []))
     country_hubs = set(cfg.get("region_hubs") or [])
+    loc_id = str(cfg.get("filter_location_id") or "")
+    if loc_id:
+        country_slugs.add(loc_id)
     if embed_root and (embed_root in country_slugs or embed_root in country_hubs):
         add(build_category_url(norm))
         return urls
@@ -1111,7 +1168,7 @@ async def enrich_listing(
     if country and country in COUNTRY_LOCATIONS:
         slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
         if slugs:
-            referer = f"https://www.facebook.com/marketplace/{slugs[0]}/"
+            referer = f"https://www.facebook.com/marketplace/{str(slugs[0]).strip('/')}/"
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),

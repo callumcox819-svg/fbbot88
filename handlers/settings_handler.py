@@ -20,9 +20,16 @@ from utils.telegram_edit import edit_text_keep_markup
 router = Router()
 
 
-def _preset_categories_text(active_count: int) -> str:
+def _preset_categories_text(active_count: int, country: str | None) -> str:
+    if country == "ch":
+        hint = "🇨🇭 Категории Marketplace Switzerland (ваши search-ссылки)."
+    elif country == "fi":
+        hint = "🇫🇮 Категории finland/helsinki + фильтр страны."
+    else:
+        hint = "Сначала выбери 🇨🇭 или 🇫🇮 в настройках."
     return (
         "✨ <b>Готовые категории Marketplace</b>\n\n"
+        f"{hint}\n\n"
         f"Выбрано: <b>{active_count}/{MAX_CATEGORIES_PER_USER}</b>\n"
         "Нажимай категории — окно <b>не закроется</b>.\n"
         "Когда закончишь — <b>◀️ Назад</b>.\n\n"
@@ -94,6 +101,8 @@ async def toggle_country(callback: CallbackQuery, db_user: User) -> None:
         if user.country == code:
             user.country = None
         else:
+            if user.country and user.country != code:
+                await cat_svc.clear_preset_categories(session, user.id)
             user.country = code
         await session.commit()
         country = user.country
@@ -209,8 +218,8 @@ async def cat_preset(callback: CallbackQuery, db_user: User) -> None:
         active = await cat_svc.get_active_preset_keys(session, db_user.id)
     await edit_text_keep_markup(
         callback.message,
-        _preset_categories_text(len(active)),
-        reply_markup=preset_categories_kb(active),
+        _preset_categories_text(len(active), db_user.country),
+        reply_markup=preset_categories_kb(active, country=db_user.country),
     )
 
 
@@ -218,7 +227,9 @@ async def cat_preset(callback: CallbackQuery, db_user: User) -> None:
 async def cat_toggle(callback: CallbackQuery, db_user: User) -> None:
     key = callback.data.split(":")[-1]
     async with Session() as session:
-        active, err = await cat_svc.toggle_preset_category(session, db_user.id, key)
+        active, err = await cat_svc.toggle_preset_category(
+            session, db_user.id, key, country=db_user.country
+        )
 
     if err:
         await callback.answer(err, show_alert=True)
@@ -233,8 +244,8 @@ async def cat_toggle(callback: CallbackQuery, db_user: User) -> None:
 
     await edit_text_keep_markup(
         callback.message,
-        _preset_categories_text(len(active)),
-        reply_markup=preset_categories_kb(active),
+        _preset_categories_text(len(active), db_user.country),
+        reply_markup=preset_categories_kb(active, country=db_user.country),
     )
 
 
@@ -247,7 +258,7 @@ async def cat_custom(callback: CallbackQuery, state: FSMContext) -> None:
         "🇫🇮 <code>https://www.facebook.com/marketplace/finland/category/baby/</code>\n"
         "🇫🇮 <code>https://www.facebook.com/marketplace/helsinki/category/baby/</code>\n"
         "🇨🇭 <code>https://www.facebook.com/marketplace/switzerland/category/electronics/</code>\n"
-        "🇨🇭 <code>https://www.facebook.com/marketplace/zurich/category/electronics/</code>\n"
+        "🇨🇭 <code>https://www.facebook.com/marketplace/103767472995143/search/?category_id=…</code>\n"
         "Или без страны: <code>…/marketplace/category/electronics</code> — бот сам подставит FI/CH.",
         parse_mode="HTML",
     )
