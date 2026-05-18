@@ -303,44 +303,25 @@ def listing_age_hours(item: MarketplaceListing) -> float | None:
 
 def listing_is_too_old(item: MarketplaceListing, max_age_hours: float) -> bool:
     """
-    Мягкий фильтр «свежести».
-    Жёстко по unix-timestamp; по тексту — только явно старые (вчера, дни, недели).
-    «5 hours ago» на ленте не режем при лимите 3ч — иначе 7/100 вместо 40+.
+    Лимит 24 ч: режем вчера/дни/недели и timestamp > 24ч.
+    «5 hours ago» / «12 tuntia» — пропускаем (как при стабильных 40+ в ленте).
     """
     if max_age_hours <= 0:
         return False
-    if item.created_timestamp:
-        return (time.time() - item.created_timestamp) / 3600.0 > max_age_hours
+    age_h = listing_age_hours(item)
+    if age_h is not None:
+        return age_h > max_age_hours
     cd = (item.created_date or "").lower().strip()
     if not cd:
         return False
-    if any(
-        x in cd
-        for x in (
-            "week",
-            "woche",
-            "semaine",
-            "month",
-            "monat",
-            "mois",
-            "kuukaus",
-            "viikko",
-            "päivää",
-            "päivä",
-        )
-    ):
-        if re.search(r"\d+\s*(?:d|days?|tage?|jours?|päiv)", cd):
-            return True
-        if "week" in cd or "woche" in cd or "month" in cd or "viikko" in cd or "kuukaus" in cd:
-            return True
-    if re.search(r"\d+\s*tuntia\s+sitten", cd):
-        m = re.search(r"(\d+)\s*tuntia", cd)
-        if m and int(m.group(1)) > 3:
-            return True
     if any(x in cd for x in ("yesterday", "gestern", "hier", "eilen")):
         return True
-    hours = _parse_relative_time_hours(cd)
-    if hours is not None and hours >= 24:
+    if re.search(r"\d+\s*(?:d|days?|tage?|jours?|päiv)", cd):
+        return True
+    if any(
+        x in cd
+        for x in ("week", "woche", "semaine", "month", "monat", "mois", "kuukaus", "viikko")
+    ):
         return True
     return False
 
@@ -390,7 +371,7 @@ def export_reject_reason(
     if not listing_is_valid(item):
         return "нет_заголовка"
     if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
-        return "старше_3ч"
+        return "старше_24ч"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
     if country and _location_explicitly_foreign(loc, country):

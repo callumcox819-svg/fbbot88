@@ -48,7 +48,7 @@ _REJECT_LABELS: dict[str, str] = {
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
-    "старше_3ч": "Старше 3 ч",
+    "старше_24ч": "Старше 24 ч",
 }
 
 
@@ -169,7 +169,7 @@ def _progress_text(
 ) -> str:
     age_hint = ""
     if max_age_hours > 0:
-        age_hint = f" · явно старше {int(max_age_hours)}ч отсев"
+        age_hint = f" · до {int(max_age_hours)} ч"
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
         f"<i>1 продавец = 1 карточка{age_hint}. ⏹ Стоп — JSON.</i>",
