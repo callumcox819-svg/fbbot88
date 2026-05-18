@@ -36,8 +36,28 @@ from parser.marketplace import (
 from parser.marketplace_region import apply_marketplace_region
 from services.categories import list_user_categories
 from services.proxies import pick_random_proxy_url
+from services.seller_blacklist import (
+    load_blocked_seller_keys,
+    remember_seller,
+    seller_key_from_item,
+)
 
 logger = logging.getLogger(__name__)
+
+_REJECT_LABELS: dict[str, str] = {
+    "повторный_продавец": "Повторные продавцы",
+    "дубликат": "Дубликаты (ID)",
+    "чужая_страна": "Чужая страна",
+    "мало_полей": "Мало полей",
+    "нет_заголовка": "Нет заголовка",
+}
+
+
+def _record_reject(stats: dict, reason: str) -> None:
+    stats["rejected"] = stats.get("rejected", 0) + 1
+    stats["last_reject"] = reason
+    reasons = stats.setdefault("reject_reasons", {})
+    reasons[reason] = reasons.get(reason, 0) + 1
 
 
 @dataclass
@@ -90,7 +110,6 @@ def request_stop(telegram_id: int) -> bool:
     if not job:
         return False
     job.stop_event.set()
-    job.task.cancel()
     return True
 
 
@@ -116,9 +135,6 @@ async def start_parsing(
                 stop=stop,
                 on_status=on_status,
             )
-        except asyncio.CancelledError:
-            if on_status:
-                await on_status("⏹ Остановлено.")
         except AccountTokenDeadError:
             await _notify_token_dead(bot, telegram_id, on_status)
         except Exception as e:
@@ -153,7 +169,7 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>«В JSON» — карточки для выбранной страны (CH/FI). JSON в конце.</i>",
+        "<i>«В JSON» — карточки CH/FI. Полный лимит — JSON в конце; ⏹ Стоп — частичный JSON.</i>",
     ]
     if stats:
         lines.append(
@@ -162,12 +178,47 @@ def _progress_text(
             f"проверено: <b>{stats.get('checked', 0)}</b> · "
             f"отклонено: <b>{stats.get('rejected', 0)}</b>"
         )
-        last_reject = stats.get("last_reject")
-        if last_reject and stats.get("rejected", 0) > 0:
-            lines.append(f"<i>Последний отсев: {last_reject}</i>")
+        reasons = stats.get("reject_reasons") or {}
+        if reasons:
+            lines.append("<b>Причины отсева:</b>")
+            for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
+                label = _REJECT_LABELS.get(key, key)
+                lines.append(f"→ {label}: <b>{count}</b>")
+        else:
+            last_reject = stats.get("last_reject")
+            if last_reject and stats.get("rejected", 0) > 0:
+                label = _REJECT_LABELS.get(last_reject, last_reject)
+                lines.append(f"<i>Последний отсев: {label}</i>")
     if step:
         lines.append(f"📍 {step}")
     return "\n".join(lines)
+
+
+async def _send_json_file(
+    bot: Bot,
+    telegram_id: int,
+    collected: list,
+    country: str | None,
+    json_limit: int,
+    *,
+    caption: str,
+) -> int:
+    export_items = [x for x in collected if listing_is_export_ready(x, country)][:json_limit]
+    if not export_items:
+        return 0
+    payload = listings_to_json(export_items)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+        f.write(payload)
+        path = f.name
+    try:
+        await bot.send_document(
+            telegram_id,
+            FSInputFile(path, filename=f"marketplace_{len(export_items)}.json"),
+            caption=caption,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+    return len(export_items)
 
 
 async def _parse_impl(
@@ -201,13 +252,14 @@ async def _parse_impl(
         await session.commit()
         await session.refresh(run)
         run_id = run.id
+        blocked_sellers = await load_blocked_seller_keys(session, user_id)
 
     collected: list = []
     seen_ids: set[str] = set()
+    session_sellers: set[str] = set()
     cat_count = len(categories)
     cat_idx = 0
     empty_rounds = 0
-    max_empty_rounds = cat_count * 5
     connect_fails = 0
 
     t_start = time.monotonic()
@@ -303,10 +355,17 @@ async def _parse_impl(
                     if stop.is_set() or len(collected) >= json_limit:
                         return
                     if item.listing_id in seen_ids:
+                        _record_reject(stats, "дубликат")
+                        await status_progress()
                         continue
                     stats["checked"] = stats.get("checked", 0) + 1
+                    sk = seller_key_from_item(item)
+                    if sk and (sk in blocked_sellers or sk in session_sellers):
+                        _record_reject(stats, "повторный_продавец")
+                        await status_progress()
+                        continue
                     reason = export_reject_reason(item, country)
-                    if reason:
+                    if reason and not stop.is_set():
                         try:
                             await enrich_listing(
                                 token,
@@ -318,13 +377,22 @@ async def _parse_impl(
                         except AccountTokenDeadError:
                             token_dead_flag["value"] = True
                             raise
+                        sk = seller_key_from_item(item)
+                        if sk and (sk in blocked_sellers or sk in session_sellers):
+                            _record_reject(stats, "повторный_продавец")
+                            await status_progress()
+                            continue
                         reason = export_reject_reason(item, country)
                     if reason:
-                        stats["rejected"] = stats.get("rejected", 0) + 1
-                        stats["last_reject"] = reason
+                        _record_reject(stats, reason)
                         await status_progress()
                         continue
                     seen_ids.add(item.listing_id)
+                    if sk:
+                        session_sellers.add(sk)
+                        blocked_sellers.add(sk)
+                        async with Session() as session:
+                            await remember_seller(session, user_id, item)
                     collected.append(item)
                     cat_added += 1
                     empty_rounds = 0
@@ -357,6 +425,7 @@ async def _parse_impl(
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
                         should_stop=should_stop,
+                        hub_round=cat_idx,
                         graphql_doc_id=config.fb_marketplace_doc_id,
                     )
                     connect_fails = 0
@@ -390,14 +459,16 @@ async def _parse_impl(
                             await on_status(hint)
                         raise RuntimeError("Нет связи с Facebook") from err
                 empty_rounds += 1
-                if empty_rounds >= max_empty_rounds:
+                max_empty = cat_count * (2 if collected else 5)
+                if empty_rounds >= max_empty:
                     break
                 continue
 
             if cat_added == 0:
                 empty_rounds += 1
-                current_step["detail"] = f"{cat.label}: 0 в JSON (см. отклонено)"
-                if empty_rounds >= max_empty_rounds:
+                current_step["detail"] = f"{cat.label}: 0 в JSON (см. отсев)"
+                max_empty = cat_count * (2 if collected else 5)
+                if empty_rounds >= max_empty:
                     break
             await status_progress()
     except AccountTokenDeadError:
@@ -444,11 +515,40 @@ async def _parse_impl(
         return
 
     if not full:
+        if stopped and got > 0:
+            sent = await _send_json_file(
+                bot,
+                telegram_id,
+                collected,
+                country,
+                json_limit,
+                caption=f"⏹ Остановлено — JSON: {got} объявлений",
+            )
+            if on_status:
+                if sent:
+                    tail = _progress_text(sent, json_limit, stats=stats)
+                    await on_status(
+                        f"⏹ <b>Остановлено.</b> Отправлен частичный JSON: "
+                        f"<b>{sent}</b> из {json_limit}.\n\n{tail}"
+                    )
+                else:
+                    await on_status(
+                        f"⏹ Остановлено. Собрано {got}, но ни одна карточка не прошла финальную проверку."
+                    )
+            return
         reason = "остановлен" if stopped else "объявления не найдены"
         if on_status:
+            extra = ""
+            reasons = stats.get("reject_reasons") or {}
+            if reasons.get("повторный_продавец", 0) > got:
+                extra = (
+                    "\n\n💡 Много <b>повторных продавцов</b> — это ваш личный ЧС "
+                    "(1 объявление на продавца). Новые категории/регионы дадут других людей."
+                )
             await on_status(
                 f"⚠️ Парсинг {reason}.\n"
-                f"Собрано <b>{got}/{json_limit}</b> — JSON <b>не отправлен</b>.\n\n"
+                f"Собрано <b>{got}/{json_limit}</b> — JSON <b>не отправлен</b>."
+                f"{extra}\n\n"
                 "Чаще всего:\n"
                 "• токен аккаунта протух — вставь новый\n"
                 "• Facebook отдаёт пустую страницу — проверь прокси CH/FI\n"

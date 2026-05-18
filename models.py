@@ -41,6 +41,9 @@ class User(Base):
     proxies = relationship("Proxy", back_populates="user", cascade="all, delete-orphan")
     categories = relationship("UserCategory", back_populates="user", cascade="all, delete-orphan")
     parse_runs = relationship("ParseRun", back_populates="user", cascade="all, delete-orphan")
+    blocked_sellers = relationship(
+        "BlockedSeller", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Proxy(Base):
@@ -74,6 +77,22 @@ class UserCategory(Base):
     is_preset = Column(Boolean, default=True)
 
     user = relationship("User", back_populates="categories")
+
+
+class BlockedSeller(Base):
+    """Личный ЧС: один продавец — одно объявление в JSON (как VOID «повторные продавцы»)."""
+
+    __tablename__ = "blocked_sellers"
+    __table_args__ = (UniqueConstraint("user_id", "seller_key", name="uq_user_seller"),)
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    seller_key = Column(String, nullable=False, index=True)
+    seller_name = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="blocked_sellers")
 
 
 class ParseRun(Base):

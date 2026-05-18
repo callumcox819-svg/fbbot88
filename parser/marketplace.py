@@ -73,6 +73,7 @@ class MarketplaceListing:
     price: str = ""
     link: str = ""
     seller_name: str = ""
+    seller_id: str = ""
     photo: str = ""
     location: str = ""
     category: str = ""
@@ -351,8 +352,13 @@ def with_country_geo(url: str, country: str | None) -> str:
     return url
 
 
-def urls_for_country_category(country: str, url_path: str) -> list[str]:
-    """Только регионы выбранной страны (без глобального marketplace/category/…)."""
+def urls_for_country_category(
+    country: str,
+    url_path: str,
+    *,
+    hub_round: int | None = None,
+) -> list[str]:
+    """Регионы выбранной страны. hub_round — один хаб за проход (не все 10 сразу)."""
     cfg = COUNTRY_LOCATIONS.get(country) or {}
     urls: list[str] = []
     seen: set[str] = set()
@@ -362,9 +368,20 @@ def urls_for_country_category(country: str, url_path: str) -> list[str]:
             seen.add(u)
             urls.append(u)
 
-    for slug in cfg.get("marketplace_slugs") or []:
+    slugs = cfg.get("marketplace_slugs") or []
+    hubs = cfg.get("region_hubs") or []
+
+    if hub_round is not None:
+        if slugs:
+            add(build_category_url(url_path, marketplace_root=slugs[0]))
+        if hubs:
+            add(build_category_url(url_path, marketplace_root=hubs[hub_round % len(hubs)]))
+        if urls:
+            return urls
+
+    for slug in slugs:
         add(build_category_url(url_path, marketplace_root=slug))
-    for hub in cfg.get("region_hubs") or []:
+    for hub in hubs:
         add(build_category_url(url_path, marketplace_root=hub))
     if not urls:
         add(build_category_url(url_path))
@@ -385,11 +402,12 @@ async def fetch_category_listings(
     on_page_found: Callable[[int], Awaitable[None]] | None = None,
     on_page_items: Callable[[list[MarketplaceListing]], Awaitable[None]] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    hub_round: int | None = None,
     graphql_doc_id: str | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
     if country and country in COUNTRY_LOCATIONS:
-        urls = urls_for_country_category(country, url_path)
+        urls = urls_for_country_category(country, url_path, hub_round=hub_round)
     else:
         urls = [build_category_url(url_path)]
 
@@ -553,6 +571,7 @@ def _parse_chunk(chunk: str, lid: str) -> dict[str, Any]:
     return {
         "title": _first_match(_TITLE_RE, chunk),
         "price": _first_match(_PRICE_RE, chunk),
+        "seller_id": seller_id,
         "seller_name": _first_match(_SELLER_RE, chunk),
         "photo": _first_match(_PHOTO_RE, chunk),
         "location": _first_match(_LOCATION_RE, chunk),
@@ -649,6 +668,7 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
         "listing_id": lid,
         "title": title,
         "price": price,
+        "seller_id": seller_id,
         "seller_name": seller_name,
         "photo": photo,
         "location": location,
@@ -752,6 +772,7 @@ async def enrich_listing(
         _merge_listing(item, {
             "title": best.title,
             "price": best.price,
+            "seller_id": best.seller_id,
             "seller_name": best.seller_name,
             "photo": best.photo,
             "location": best.location,
