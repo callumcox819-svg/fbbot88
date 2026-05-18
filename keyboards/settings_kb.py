@@ -65,5 +65,5 @@ def preset_categories_kb(active_keys: set[str]) -> InlineKeyboardMarkup:
             )
         ]
     )
-    rows.append([InlineKeyboardButton(text="◀️ Назад в настройки", callback_data="set:back")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="set:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

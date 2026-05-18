@@ -10,8 +10,19 @@ from keyboards.settings_kb import preset_categories_kb, settings_menu_kb_with_co
 from models import User
 from services import categories as cat_svc
 from services import proxies as proxy_svc
+from utils.telegram_edit import edit_text_keep_markup
 
 router = Router()
+
+
+def _preset_categories_text(active_count: int) -> str:
+    return (
+        "✨ <b>Готовые категории Marketplace</b>\n\n"
+        f"Выбрано: <b>{active_count}/{MAX_CATEGORIES_PER_USER}</b>\n"
+        "Нажимай категории — окно <b>не закроется</b>.\n"
+        "Когда закончишь — <b>◀️ Назад</b>.\n\n"
+        "<i>🟢 — в парсинг · 🔴 — выкл.</i>"
+    )
 
 
 class SettingsStates(StatesGroup):
@@ -162,12 +173,9 @@ async def cat_preset(callback: CallbackQuery, db_user: User) -> None:
     await callback.answer()
     async with Session() as session:
         active = await cat_svc.get_active_preset_keys(session, db_user.id)
-    await callback.message.edit_text(
-        "✨ <b>Готовые категории Marketplace</b>\n\n"
-        f"Нажми — переключить. Активные <b>🟢</b> пойдут в парсинг "
-        f"(макс. <b>{MAX_CATEGORIES_PER_USER}</b> за раз).\n\n"
-        "<i>Список — основные разделы FB Marketplace.</i>",
-        parse_mode="HTML",
+    await edit_text_keep_markup(
+        callback.message,
+        _preset_categories_text(len(active)),
         reply_markup=preset_categories_kb(active),
     )
 
@@ -185,21 +193,15 @@ async def cat_toggle(callback: CallbackQuery, db_user: User) -> None:
     from data.preset_categories import PRESET_BY_KEY
 
     preset = PRESET_BY_KEY.get(key)
-    name = preset.label if preset else key
+    name = (preset.label if preset else key).replace("🟢 ", "").replace("🔴 ", "")
     on = key in active
-    await callback.answer(f"{'Включено' if on else 'Выключено'}: {name}")
+    await callback.answer(f"{'🟢' if on else '🔴'} {name}")
 
-    await callback.message.edit_reply_markup(reply_markup=preset_categories_kb(active))
-    try:
-        n = len(active)
-        await callback.message.edit_text(
-            "✨ <b>Готовые категории Marketplace</b>\n\n"
-            f"Активно для парсинга: <b>{n}/{MAX_CATEGORIES_PER_USER}</b>\n"
-            "<i>🟢 — парсится, 🔴 — нет</i>",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    await edit_text_keep_markup(
+        callback.message,
+        _preset_categories_text(len(active)),
+        reply_markup=preset_categories_kb(active),
+    )
 
 
 @router.callback_query(F.data == "set:cat:custom")
