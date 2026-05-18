@@ -19,11 +19,16 @@ logger = logging.getLogger(__name__)
 
 _FB_BASE = "https://www.facebook.com/marketplace/"
 _LISTING_ID_RE = re.compile(r"/marketplace/item/(\d+)")
-_TITLE_RE = re.compile(r'"marketplace_listing_title"\s*:\s*"((?:\\.|[^"\\])*)"')
-_PRICE_RE = re.compile(r'"formatted_amount"\s*:\s*"((?:\\.|[^"\\])*)"')
+_LISTING_ID_JSON_RE = re.compile(r'"(?:listing_)?id"\s*:\s*"(\d{8,})"')
+_TITLE_RE = re.compile(
+    r'"marketplace_listing_title"\s*:\s*"((?:\\.|[^"\\])*)"|"title"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
+_PRICE_RE = re.compile(
+    r'"formatted_amount"\s*:\s*"((?:\\.|[^"\\])*)"|"amount"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
 _SELLER_RE = re.compile(r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"')
 _PHOTO_RE = re.compile(r'"uri"\s*:\s*"(https://[^"]*scontent[^"]*)"')
-_LOCATION_RE = re.compile(r'"city"\s*:\s*"([^"]+)"')
+_LOCATION_RE = re.compile(r'"city"\s*:\s*"([^"]+)"|"location_text"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"')
 
 
 @dataclass
@@ -224,13 +229,20 @@ async def fetch_category_listings(
             await on_url_progress(i, total_urls, short)
         logger.info("GET %s", url)
         try:
-            batch = await _fetch_page(
+            batch, meta = await _fetch_page(
                 token,
                 url=url,
                 user_agent=user_agent,
                 proxy_url=proxy_url,
                 timeout_sec=timeout_sec,
                 category_label=category_label,
+            )
+            logger.info(
+                "parsed %s items from %s (html=%s, links=%s)",
+                len(batch),
+                short if on_url_progress else url,
+                meta.get("html_len"),
+                meta.get("link_count"),
             )
         except RuntimeError as e:
             if "HTTP 400" in str(e) or "HTTP 404" in str(e):
@@ -286,6 +298,36 @@ def is_connection_error(exc: BaseException) -> bool:
     )
 
 
+def _looks_like_login_wall(html: str) -> bool:
+    h = html.lower()
+    if "id=\"loginform\"" in h or 'id="loginform"' in h:
+        return True
+    if "checkpoint" in h and len(html) < 800_000:
+        return True
+    if "marketplace/item/" not in h and ("login" in h[:8000] or "log in" in h[:8000]):
+        return True
+    return False
+
+
+def _first_group(matches: list) -> list[str]:
+    out: list[str] = []
+    for m in matches:
+        g = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else "")
+        if g:
+            out.append(_unescape(g))
+    return out
+
+
+def _collect_listing_ids(html: str) -> list[str]:
+    seen: list[str] = []
+    for pattern in (_LISTING_ID_RE, _LISTING_ID_JSON_RE):
+        for m in pattern.finditer(html):
+            lid = m.group(1)
+            if lid not in seen:
+                seen.append(lid)
+    return seen
+
+
 async def _fetch_page(
     token: AccountToken,
     *,
@@ -294,7 +336,7 @@ async def _fetch_page(
     proxy_url: str | None,
     timeout_sec: float,
     category_label: str,
-) -> list[MarketplaceListing]:
+) -> tuple[list[MarketplaceListing], dict[str, int]]:
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
@@ -314,27 +356,36 @@ async def _fetch_page(
             if "login" in str(resp.url).lower():
                 raise RuntimeError("Токен аккаунта недействителен — вставь новую строку")
 
-    return _parse_html(html, category_label)
+    meta = {
+        "html_len": len(html),
+        "link_count": html.count("/marketplace/item/"),
+    }
+    if _looks_like_login_wall(html):
+        raise RuntimeError(
+            "Facebook отдал страницу входа — обнови токен аккаунта (cookies истекли)"
+        )
+
+    return _parse_html(html, category_label), meta
 
 
 def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
     by_id: dict[str, MarketplaceListing] = {}
-    titles = [_unescape(m.group(1)) for m in _TITLE_RE.finditer(html)]
-    prices = [_unescape(m.group(1)) for m in _PRICE_RE.finditer(html)]
-    sellers = [_unescape(m.group(1)) for m in _SELLER_RE.finditer(html)]
-    photos = [_unescape(m.group(1)) for m in _PHOTO_RE.finditer(html)]
-    locations = [_unescape(m.group(1)) for m in _LOCATION_RE.finditer(html)]
+    titles = _first_group(list(_TITLE_RE.finditer(html)))
+    prices = _first_group(list(_PRICE_RE.finditer(html)))
+    sellers = _first_group(list(_SELLER_RE.finditer(html)))
+    photos = _first_group(list(_PHOTO_RE.finditer(html)))
+    locs: list[str] = []
+    for m in _LOCATION_RE.finditer(html):
+        locs.append(_unescape(m.group(1) or m.group(2) or ""))
 
-    ids_in_order: list[str] = []
-    for m in _LISTING_ID_RE.finditer(html):
-        lid = m.group(1)
-        if lid not in ids_in_order:
-            ids_in_order.append(lid)
+    ids_in_order = _collect_listing_ids(html)
 
     for i, lid in enumerate(ids_in_order):
         title = titles[i] if i < len(titles) else ""
+        if not title and titles:
+            title = titles[0]
         if not title:
-            continue
+            title = f"Listing {lid}"
         by_id[lid] = MarketplaceListing(
             listing_id=lid,
             title=title,
@@ -342,7 +393,7 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
             link=f"https://www.facebook.com/marketplace/item/{lid}/",
             seller_name=sellers[i] if i < len(sellers) else "",
             photo=photos[i] if i < len(photos) else "",
-            location=locations[i] if i < len(locations) else "",
+            location=locs[i] if i < len(locs) else "",
             category=category_label,
         )
     return list(by_id.values())

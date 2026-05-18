@@ -232,10 +232,12 @@ async def _parse_impl(
 
             if added == 0:
                 empty_rounds += 1
+                current_step["detail"] = f"{cat.label}: 0 объявлений с этой категории"
                 if empty_rounds >= max_empty_rounds:
                     break
             else:
                 empty_rounds = 0
+                current_step["detail"] = f"+{added} из {cat.label}"
 
             await status_progress()
     finally:
@@ -271,13 +273,15 @@ async def _parse_impl(
         await session.commit()
 
     if not full:
-        reason = "остановлен" if stopped else "объявления закончились"
+        reason = "остановлен" if stopped else "объявления не найдены"
         if on_status:
             await on_status(
                 f"⚠️ Парсинг {reason}.\n"
-                f"Собрано <b>{got}/{json_limit}</b> — JSON <b>не отправлен</b> "
-                f"(нужно полное количество).\n"
-                "Смени категории, прокси или токен и запусти снова."
+                f"Собрано <b>{got}/{json_limit}</b> — JSON <b>не отправлен</b>.\n\n"
+                "Чаще всего:\n"
+                "• токен аккаунта протух — вставь новый\n"
+                "• Facebook отдаёт пустую страницу — проверь прокси CH/FI\n"
+                "• в логах Railway: <code>parsed 0 items</code> и <code>links=0</code>"
             )
         return
 
