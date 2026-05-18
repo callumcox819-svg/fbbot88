@@ -16,6 +16,7 @@ from aiogram.types import FSInputFile
 from sqlalchemy import select
 
 from config import config
+from data.preset_categories import COUNTRY_LOCATIONS
 from database import Session
 from models import ParseRun, User
 from parser.account_token import (
@@ -171,8 +172,8 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>Свежие до 3 ч (если FB указал время). 1 продавец = 1 карточка. "
-        "⏹ Стоп — JSON с тем, что уже в «В JSON».</i>",
+        "<i>Свежие до 3 ч · 1 продавец = 1 карточка · категория+город один раз. "
+        "⏹ Стоп — JSON.</i>",
     ]
     if stats:
         lines.append(
@@ -272,8 +273,10 @@ async def _parse_impl(
     collected: list = []
     seen_ids: set[str] = set()
     session_sellers: set[str] = set()
+    visited_feeds: set[str] = set()
     cat_count = len(categories)
     cat_idx = 0
+    page_mostly_dup = {"value": False}
     empty_rounds = 0
     connect_fails = 0
 
@@ -353,11 +356,29 @@ async def _parse_impl(
         while len(collected) < json_limit and not stop.is_set():
             cat = categories[cat_idx % cat_count]
             cat_idx += 1
-            need = json_limit - len(collected)
-            current_step["detail"] = cat.label
-            current_step["text"] = f"Категория: {cat.label}"
+            hub_round = (cat_idx - 1) // cat_count
+            hubs = (COUNTRY_LOCATIONS.get(country or "") or {}).get("region_hubs") or []
+            hub_slug = hubs[hub_round % len(hubs)] if hubs else "ch"
+            feed_key = f"{cat.url_path}@{hub_slug}"
+            if feed_key in visited_feeds:
+                logger.info("skip feed already visited %s", feed_key)
+                empty_rounds += 1
+                max_empty = cat_count * (2 if collected else 5)
+                if empty_rounds >= max_empty:
+                    break
+                continue
+            visited_feeds.add(feed_key)
+            page_mostly_dup["value"] = False
+            current_step["detail"] = f"{cat.label} · {hub_slug}"
+            current_step["text"] = f"Категория: {cat.label} ({hub_slug})"
             await status_progress()
-            logger.info("category %s path=%s gql=%s", cat.label, cat.url_path, bool(gql_doc))
+            logger.info(
+                "category %s hub=%s path=%s gql=%s",
+                cat.label,
+                hub_slug,
+                cat.url_path,
+                bool(gql_doc),
+            )
 
             async with Session() as session:
                 proxy_url = await pick_random_proxy_url(session, user_id)
@@ -369,9 +390,8 @@ async def _parse_impl(
 
             async def on_page_found(n: int) -> None:
                 stats["pages"] = stats.get("pages", 0) + 1
-                stats["found"] = stats.get("found", 0) + n
                 current_step["text"] = (
-                    f"⏳ {current_step.get('detail', cat.label)} · +{n} новых"
+                    f"⏳ {current_step.get('detail', cat.label)} · +{n} на странице"
                 )
                 await status_progress()
 
@@ -380,12 +400,16 @@ async def _parse_impl(
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, empty_rounds
                 enrich_if = frozenset({"мало_полей", "нет_заголовка"})
+                batch_dup = 0
+                batch_new = 0
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
                     if item.listing_id in seen_ids:
+                        batch_dup += 1
                         _record_reject(stats, "дубликат")
                         continue
+                    batch_new += 1
                     seen_ids.add(item.listing_id)
                     stats["checked"] = stats.get("checked", 0) + 1
                     sk = seller_key_from_item(item)
@@ -429,6 +453,9 @@ async def _parse_impl(
                         f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
                     )
                     await status_progress(force=True)
+                stats["found"] = stats.get("found", 0) + batch_new
+                if len(page_items) >= 8 and batch_dup >= len(page_items) * 0.85:
+                    page_mostly_dup["value"] = True
                 await status_progress()
 
             def should_stop() -> bool:
@@ -455,9 +482,10 @@ async def _parse_impl(
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
                         should_stop=should_stop,
-                        hub_round=cat_idx,
+                        hub_round=hub_round,
                         graphql_doc_id=gql_doc,
                         max_listing_age_hours=max_age_hours,
+                        stop_on_duplicate_page=lambda: page_mostly_dup["value"],
                     )
                     connect_fails = 0
                     break

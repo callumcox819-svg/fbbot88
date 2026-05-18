@@ -456,10 +456,11 @@ def urls_for_country_category(
     hubs = cfg.get("region_hubs") or []
 
     if hub_round is not None:
-        if slugs:
-            add(build_category_url(url_path, marketplace_root=slugs[0]))
+        # Один URL за проход — не switzerland+hub (одни и те же 20 карточек дважды).
         if hubs:
             add(build_category_url(url_path, marketplace_root=hubs[hub_round % len(hubs)]))
+        elif slugs:
+            add(build_category_url(url_path, marketplace_root=slugs[0]))
         if urls:
             return urls
 
@@ -489,6 +490,7 @@ async def fetch_category_listings(
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
     max_listing_age_hours: float | None = None,
+    stop_on_duplicate_page: Callable[[], bool] | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
     if country and country in COUNTRY_LOCATIONS:
@@ -577,8 +579,14 @@ async def fetch_category_listings(
                     )
                 if on_page_found and page_new:
                     await on_page_found(len(page_new))
+                page_dup_only = False
                 if on_page_items and page_new:
                     await on_page_items(page_new)
+                    if stop_on_duplicate_page and stop_on_duplicate_page():
+                        page_dup_only = True
+                if page_dup_only:
+                    logger.info("stop %s: page mostly duplicates", short)
+                    break
                 if not batch:
                     empty_feed_pages += 1
                     if empty_feed_pages >= 3:
