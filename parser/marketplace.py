@@ -253,8 +253,6 @@ def export_reject_reason(item: MarketplaceListing, country: str | None = None) -
     price = (item.price or "").strip()
     if country and loc and not _country_location_ok(loc, country):
         return "чужая_страна"
-    if country and loc and any(r in f" {loc.lower()} " for r in (_CH_REJECT if country == "ch" else _FI_REJECT)):
-        return "чужая_страна"
 
     photo = (item.photo or "").strip()
     seller = (item.seller_name or "").strip()
