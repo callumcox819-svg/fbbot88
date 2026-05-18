@@ -171,8 +171,8 @@ def _progress_text(
 ) -> str:
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        "<i>«В JSON» — свежие (до 3 ч). 1-я страница — HTML; 2-я+ нужен FB_MARKETPLACE_DOC_ID. "
-        "⏹ Стоп — частичный JSON.</i>",
+        "<i>Свежие до 3 ч (если FB указал время). 1 продавец = 1 карточка. "
+        "⏹ Стоп — JSON с тем, что уже в «В JSON».</i>",
     ]
     if stats:
         lines.append(
@@ -206,12 +206,16 @@ async def _send_json_file(
     *,
     caption: str,
     max_age_hours: float | None = None,
+    skip_age_recheck: bool = False,
 ) -> int:
+    age = None if skip_age_recheck else max_age_hours
     export_items = [
         x
         for x in collected
-        if listing_is_export_ready(x, country, max_age_hours=max_age_hours)
+        if listing_is_export_ready(x, country, max_age_hours=age)
     ][:json_limit]
+    if skip_age_recheck and not export_items and collected:
+        export_items = collected[:json_limit]
     if not export_items:
         return 0
     payload = listings_to_json(export_items)
@@ -278,8 +282,13 @@ async def _parse_impl(
     job = _jobs.get(telegram_id)
     stats = job.stats if job else {}
     token_dead_flag = {"value": False}
+    last_ui_update = {"t": 0.0}
 
-    async def status_progress() -> None:
+    async def status_progress(*, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - last_ui_update["t"] < 2.0:
+            return
+        last_ui_update["t"] = now
         stats["accepted"] = len(collected)
         if on_status:
             await on_status(
@@ -311,7 +320,7 @@ async def _parse_impl(
     elif country == "fi":
         country_label = " 🇫🇮"
     current_step["text"] = f"Категорий: {cat_count}{country_label}"
-    await status_progress()
+    await status_progress(force=True)
     logger.info("parse start tg=%s limit=%s cats=%s country=%s", telegram_id, json_limit, cat_count, country)
 
     async with Session() as session:
@@ -370,30 +379,30 @@ async def _parse_impl(
 
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, empty_rounds
+                enrich_if = frozenset({"мало_полей", "нет_заголовка"})
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
                     if item.listing_id in seen_ids:
                         _record_reject(stats, "дубликат")
-                        await status_progress()
                         continue
+                    seen_ids.add(item.listing_id)
                     stats["checked"] = stats.get("checked", 0) + 1
                     sk = seller_key_from_item(item)
                     if sk and (sk in blocked_sellers or sk in session_sellers):
                         _record_reject(stats, "повторный_продавец")
-                        await status_progress()
                         continue
                     reason = export_reject_reason(
                         item, country, max_age_hours=max_age_hours
                     )
-                    if reason and not stop.is_set():
+                    if reason in enrich_if and not stop.is_set():
                         try:
                             await enrich_listing(
                                 token,
                                 item,
                                 user_agent=config.fb_user_agent,
                                 proxy_url=proxy_used,
-                                timeout_sec=14.0,
+                                timeout_sec=10.0,
                             )
                         except AccountTokenDeadError:
                             token_dead_flag["value"] = True
@@ -401,16 +410,13 @@ async def _parse_impl(
                         sk = seller_key_from_item(item)
                         if sk and (sk in blocked_sellers or sk in session_sellers):
                             _record_reject(stats, "повторный_продавец")
-                            await status_progress()
                             continue
                         reason = export_reject_reason(
                             item, country, max_age_hours=max_age_hours
                         )
                     if reason:
                         _record_reject(stats, reason)
-                        await status_progress()
                         continue
-                    seen_ids.add(item.listing_id)
                     if sk:
                         session_sellers.add(sk)
                         blocked_sellers.add(sk)
@@ -422,7 +428,8 @@ async def _parse_impl(
                     current_step["detail"] = (
                         f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
                     )
-                    await status_progress()
+                    await status_progress(force=True)
+                await status_progress()
 
             def should_stop() -> bool:
                 return stop.is_set() or len(collected) >= json_limit
@@ -547,7 +554,7 @@ async def _parse_impl(
                 country,
                 json_limit,
                 caption=f"⏹ Остановлено — JSON: {got} объявлений",
-                max_age_hours=max_age_hours,
+                skip_age_recheck=True,
             )
             if on_status:
                 if sent:

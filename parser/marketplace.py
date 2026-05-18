@@ -279,9 +279,13 @@ def _parse_relative_time_hours(text: str) -> float | None:
     m = re.search(r"(\d+)\s*(?:min(?:ute)?s?|min\.?|мин)", t)
     if m:
         return int(m.group(1)) / 60.0
-    m = re.search(r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?)", t)
+    m = re.search(
+        r"(?:il y a|vor)\s*(\d+)\s*(?:heures?|h|std\.?|stunden?)|"
+        r"(\d+)\s*(?:h|hr|hours?|heures?|std\.?|stunden?)",
+        t,
+    )
     if m:
-        return float(m.group(1))
+        return float(m.group(1) or m.group(2))
     m = re.search(r"(\d+)\s*(?:d|days?|tage?|jours?)", t)
     if m:
         return float(m.group(1)) * 24.0
@@ -342,9 +346,7 @@ def export_reject_reason(
         return "нет_заголовка"
     if max_age_hours is not None:
         age_h = listing_age_hours(item)
-        if age_h is None:
-            return "время_неизвестно"
-        if age_h > max_age_hours:
+        if age_h is not None and age_h > max_age_hours:
             return "старше_3ч"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
