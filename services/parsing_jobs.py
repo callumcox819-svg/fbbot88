@@ -132,7 +132,7 @@ def _progress_text(
     if stats:
         lines.append(
             f"📊 Страниц: <b>{stats.get('pages', 0)}</b> · "
-            f"найдено: <b>{stats.get('found', 0)}</b> · "
+            f"новых: <b>{stats.get('found', 0)}</b> · "
             f"проверено: <b>{stats.get('checked', 0)}</b> · "
             f"отклонено: <b>{stats.get('rejected', 0)}</b>"
         )
@@ -238,9 +238,42 @@ async def _parse_impl(
                 stats["pages"] = stats.get("pages", 0) + 1
                 stats["found"] = stats.get("found", 0) + n
                 current_step["text"] = (
-                    f"⏳ {current_step.get('detail', cat.label)} · +{n} с страницы"
+                    f"⏳ {current_step.get('detail', cat.label)} · +{n} новых"
                 )
                 await status_progress()
+
+            cat_added = 0
+
+            async def on_page_items(page_items: list) -> None:
+                nonlocal cat_added, empty_rounds
+                for item in page_items:
+                    if stop.is_set() or len(collected) >= json_limit:
+                        return
+                    if item.listing_id in seen_ids:
+                        continue
+                    await enrich_listing(
+                        token,
+                        item,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_used,
+                        timeout_sec=14.0,
+                    )
+                    stats["checked"] = stats.get("checked", 0) + 1
+                    if not listing_is_export_ready(item, country):
+                        stats["rejected"] = stats.get("rejected", 0) + 1
+                        await status_progress()
+                        continue
+                    seen_ids.add(item.listing_id)
+                    collected.append(item)
+                    cat_added += 1
+                    empty_rounds = 0
+                    current_step["detail"] = (
+                        f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
+                    )
+                    await status_progress()
+
+            def should_stop() -> bool:
+                return stop.is_set() or len(collected) >= json_limit
 
             batch = None
             last_err: Exception | None = None
@@ -249,6 +282,7 @@ async def _parse_impl(
                 if proxy_try is None and proxy_url is None:
                     break
                 try:
+                    proxy_used = proxy_try
                     batch = await fetch_category_listings(
                         token,
                         url_path=cat.url_path,
@@ -256,13 +290,14 @@ async def _parse_impl(
                         user_agent=config.fb_user_agent,
                         country=country,
                         proxy_url=proxy_try,
-                        limit=min(max(need * 2, 30), 120),
+                        limit=json_limit * 3,
                         timeout_sec=22.0,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
+                        on_page_items=on_page_items,
+                        should_stop=should_stop,
                         graphql_doc_id=config.fb_marketplace_doc_id,
                     )
-                    proxy_used = proxy_try
                     connect_fails = 0
                     break
                 except Exception as e:
@@ -272,8 +307,8 @@ async def _parse_impl(
                         continue
                     break
 
-            if batch is None:
-                err = last_err or RuntimeError("unknown")
+            if batch is None and last_err:
+                err = last_err
                 logger.warning("category %s failed: %s", cat.label, err)
                 if is_connection_error(err):
                     connect_fails += 1
@@ -292,44 +327,11 @@ async def _parse_impl(
                     break
                 continue
 
-            need_now = json_limit - len(collected)
-            candidates = [
-                it
-                for it in batch
-                if listing_is_valid(it)
-                and it.listing_id not in seen_ids
-            ][: max(need_now * 3, 15)]
-
-            added = 0
-            for item in candidates:
-                if stop.is_set() or len(collected) >= json_limit:
-                    break
-                await enrich_listing(
-                    token,
-                    item,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_used,
-                    timeout_sec=14.0,
-                )
-                stats["checked"] = stats.get("checked", 0) + 1
-                if not listing_is_export_ready(item, country):
-                    stats["rejected"] = stats.get("rejected", 0) + 1
-                    await status_progress()
-                    continue
-                seen_ids.add(item.listing_id)
-                collected.append(item)
-                added += 1
-                await status_progress()
-
-            if added == 0:
+            if cat_added == 0:
                 empty_rounds += 1
-                current_step["detail"] = f"{cat.label}: 0 объявлений с этой категории"
+                current_step["detail"] = f"{cat.label}: 0 в JSON (см. отклонено)"
                 if empty_rounds >= max_empty_rounds:
                     break
-            else:
-                empty_rounds = 0
-                current_step["detail"] = f"+{added} из {cat.label}"
-
             await status_progress()
     finally:
         hb_task.cancel()

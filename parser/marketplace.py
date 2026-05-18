@@ -309,6 +309,8 @@ async def fetch_category_listings(
     timeout_sec: float = 22.0,
     on_url_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
     on_page_found: Callable[[int], Awaitable[None]] | None = None,
+    on_page_items: Callable[[list[MarketplaceListing]], Awaitable[None]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
     graphql_doc_id: str | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
@@ -322,6 +324,8 @@ async def fetch_category_listings(
     total_urls = len(urls)
 
     for i, url in enumerate(urls, start=1):
+        if should_stop and should_stop():
+            break
         if len(out) >= limit:
             break
         if on_url_progress:
@@ -345,8 +349,30 @@ async def fetch_category_listings(
                 meta.get("html_len"),
                 meta.get("link_count"),
             )
-            if on_page_found and batch:
-                await on_page_found(len(batch))
+            page_new: list[MarketplaceListing] = []
+            for item in batch:
+                if not listing_is_valid(item):
+                    continue
+                if item.listing_id in seen_ids:
+                    continue
+                seen_ids.add(item.listing_id)
+                page_new.append(item)
+                out.append(item)
+                if len(out) >= limit:
+                    break
+
+            if batch and not page_new:
+                logger.debug(
+                    "url %s: parsed %s, 0 new (duplicates or invalid)",
+                    short if on_url_progress else url,
+                    len(batch),
+                )
+            if on_page_found and page_new:
+                await on_page_found(len(page_new))
+            if on_page_items and page_new:
+                await on_page_items(page_new)
+            if len(out) >= limit:
+                break
         except RuntimeError as e:
             if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                 logger.info("skip url %s: %s", url, e)
@@ -355,20 +381,6 @@ async def fetch_category_listings(
         except Exception as e:
             logger.warning("skip url %s: %s", url, e)
             continue
-
-        for item in batch:
-            if not listing_is_valid(item):
-                continue
-            if item.listing_id in seen_ids:
-                continue
-            if country and item.location and not _country_location_ok(item.location, country):
-                continue
-            if country == "ch" and _looks_ua_spam(item):
-                continue
-            seen_ids.add(item.listing_id)
-            out.append(item)
-            if len(out) >= limit:
-                break
 
     logger.info(
         "category %s country=%s urls=%s collected=%s",
