@@ -197,23 +197,10 @@ _FI_REJECT = (
     "switzerland",
     "schweiz",
     "russia",
-)
-_UA_SPAM_HINTS = (
-    "україн",
-    "украин",
-    "київ",
-    "киев",
-    "kyiv",
-    "kiev",
-    "львів",
-    "lviv",
-    "одес",
-    "харків",
-    "kharkiv",
-    "dnipro",
-    "запоріж",
-    "poltava",
     "ukraine",
+    "україн",
+    "київ",
+    "kyiv",
 )
 _MIN_LISTING_ID_LEN = 12
 
