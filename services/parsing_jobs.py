@@ -29,7 +29,7 @@ from parser.marketplace import (
     export_reject_reason,
     fetch_category_listings,
     is_connection_error,
-    listing_is_export_ready,
+    listing_is_wrong_country,
     listings_to_json,
 )
 from parser.marketplace_region import apply_marketplace_region
@@ -203,7 +203,11 @@ async def _send_json_file(
 ) -> int:
     if not collected:
         return 0
-    export_items = collected[:json_limit]
+    export_items = [
+        x for x in collected if not country or not listing_is_wrong_country(x, country)
+    ][:json_limit]
+    if not export_items:
+        return 0
     payload = listings_to_json(export_items)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
         f.write(payload)
@@ -344,8 +348,6 @@ async def _parse_impl(
                 await status_progress()
 
             cat_added = 0
-            enrich_if = frozenset({"мало_полей", "нет_заголовка"})
-
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, empty_rounds
                 for item in page_items:
@@ -359,10 +361,12 @@ async def _parse_impl(
                         _record_reject(stats, "повторный_продавец")
                         seen_ids.add(item.listing_id)
                         continue
-                    reason = export_reject_reason(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if reason in enrich_if and not stop.is_set():
+                    if not stop.is_set() and (
+                        not item.seller_name
+                        or not item.person_link
+                        or not item.price
+                        or not item.photo
+                    ):
                         try:
                             await enrich_listing(
                                 token,
@@ -375,13 +379,13 @@ async def _parse_impl(
                             token_dead_flag["value"] = True
                             raise
                         sk = seller_key_from_item(item)
-                        if sk and (sk in blocked_sellers or sk in session_sellers):
-                            _record_reject(stats, "повторный_продавец")
-                            seen_ids.add(item.listing_id)
-                            continue
-                        reason = export_reject_reason(
-                            item, country, max_age_hours=max_age_hours
-                        )
+                    reason = export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
+                    if sk and (sk in blocked_sellers or sk in session_sellers):
+                        _record_reject(stats, "повторный_продавец")
+                        seen_ids.add(item.listing_id)
+                        continue
                     if reason:
                         _record_reject(stats, reason)
                         seen_ids.add(item.listing_id)
@@ -424,7 +428,7 @@ async def _parse_impl(
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
                         should_stop=should_stop,
-                        hub_round=cat_idx,
+                        hub_round=(cat_idx - 1) // cat_count,
                         graphql_doc_id=gql_doc,
                     )
                     connect_fails = 0

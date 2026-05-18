@@ -65,12 +65,22 @@ def _filter_location_id(country: str) -> str | None:
     return str(lid) if lid else None
 
 
-def _fb_headers(token: AccountToken, user_agent: str, referer: str) -> dict[str, str]:
+def _accept_language(country: str) -> str:
+    if country == "fi":
+        return "fi-FI,fi;q=0.9,en;q=0.8"
+    if country == "ch":
+        return "de-CH,fr-CH,de;q=0.9,fr;q=0.8,en;q=0.7"
+    return "en-US,en;q=0.9"
+
+
+def _fb_headers(
+    token: AccountToken, user_agent: str, referer: str, *, country: str = ""
+) -> dict[str, str]:
     return {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
         "Accept": "text/html,application/xhtml+xml,application/json",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": _accept_language(country),
         "Referer": referer,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
@@ -156,7 +166,9 @@ async def apply_marketplace_region(
 
     cfg = COUNTRY_LOCATIONS[country]
     label = cfg.get("label", country)
-    headers_base = _fb_headers(token, user_agent, "https://www.facebook.com/marketplace/")
+    headers_base = _fb_headers(
+        token, user_agent, "https://www.facebook.com/marketplace/", country=country
+    )
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
     urls: list[str] = []

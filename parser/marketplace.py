@@ -206,6 +206,9 @@ _FI_REJECT = (
     "switzerland",
     "schweiz",
     "russia",
+    "ukraine",
+    "україн",
+    "украин",
 )
 _UA_SPAM_HINTS = (
     "україн",
@@ -215,16 +218,58 @@ _UA_SPAM_HINTS = (
     "kyiv",
     "kiev",
     "львів",
+    "львов",
     "lviv",
+    "lwow",
     "одес",
+    "odesa",
     "харків",
+    "харьков",
     "kharkiv",
     "dnipro",
+    "дніпр",
     "запоріж",
+    "zaporizh",
     "poltava",
+    "полтав",
+    "украина",
     "ukraine",
+    "рогатин",
+    "золочів",
+    "золочев",
+    "област",
+    "районський",
+    "районский",
 )
 _MIN_LISTING_ID_LEN = 12
+
+
+def _accept_language(country: str | None) -> str:
+    if country == "fi":
+        return "fi-FI,fi;q=0.9,en;q=0.8"
+    if country == "ch":
+        return "de-CH,fr-CH,de;q=0.9,fr;q=0.8,en;q=0.7"
+    return "en-US,en;q=0.9"
+
+
+def _text_has_ua_markers(text: str) -> bool:
+    t = (text or "").lower()
+    if not t.strip():
+        return False
+    if any(m in t for m in _UA_SPAM_HINTS):
+        return True
+    if re.search(r"ський|ский|івськ|овськ", t):
+        return True
+    return False
+
+
+def listing_is_wrong_country(item: MarketplaceListing, country: str | None) -> bool:
+    """UA/чужая лента при выбранных CH/FI."""
+    if not country:
+        return False
+    if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
+        return True
+    return _location_explicitly_foreign(item.location or "", country)
 
 
 def listing_is_valid(item: MarketplaceListing) -> bool:
@@ -374,7 +419,7 @@ def export_reject_reason(
         return "старше_24ч"
     loc = (item.location or "").strip()
     price = (item.price or "").strip()
-    if country and _location_explicitly_foreign(loc, country):
+    if country and listing_is_wrong_country(item, country):
         return "чужая_страна"
 
     photo = (item.photo or "").strip()
@@ -543,6 +588,7 @@ async def fetch_category_listings(
                 category_label=category_label,
                 graphql_doc_id=graphql_doc_id,
                 cursor=None,
+                country=country,
             )
             logger.info(
                 "parsed %s items from %s (html=%s, links=%s)",
@@ -1022,6 +1068,7 @@ async def _fetch_page(
     category_label: str,
     graphql_doc_id: str | None = None,
     cursor: str | None = None,
+    country: str | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
     if graphql_doc_id and cursor:
@@ -1072,7 +1119,7 @@ async def _fetch_page(
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
         "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": _accept_language(country),
         "Referer": "https://www.facebook.com/marketplace/",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
