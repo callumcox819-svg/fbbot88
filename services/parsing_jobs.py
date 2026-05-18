@@ -27,6 +27,7 @@ from parser.account_token import (
 from parser.marketplace import (
     enrich_listing,
     export_reject_reason,
+    normalize_listing_for_export,
     fetch_category_listings,
     is_connection_error,
     listing_is_wrong_country,
@@ -49,6 +50,7 @@ _REJECT_LABELS: dict[str, str] = {
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
+    "нет_данных": "Нет продавца/описания",
 }
 
 
@@ -204,8 +206,12 @@ async def _send_json_file(
     if not collected:
         return 0
     export_items = [
-        x for x in collected if not country or not listing_is_wrong_country(x, country)
+        x
+        for x in collected
+        if not country or not listing_is_wrong_country(x, country)
     ][:json_limit]
+    for x in export_items:
+        normalize_listing_for_export(x, country)
     if not export_items:
         return 0
     payload = listings_to_json(export_items)
@@ -361,19 +367,15 @@ async def _parse_impl(
                         _record_reject(stats, "повторный_продавец")
                         seen_ids.add(item.listing_id)
                         continue
-                    if not stop.is_set() and (
-                        not item.seller_name
-                        or not item.person_link
-                        or not item.price
-                        or not item.photo
-                    ):
+                    if not stop.is_set():
                         try:
                             await enrich_listing(
                                 token,
                                 item,
                                 user_agent=config.fb_user_agent,
                                 proxy_url=proxy_used,
-                                timeout_sec=12.0,
+                                timeout_sec=20.0,
+                                country=country,
                             )
                         except AccountTokenDeadError:
                             token_dead_flag["value"] = True
@@ -396,6 +398,7 @@ async def _parse_impl(
                         blocked_sellers.add(sk)
                         async with Session() as session:
                             await remember_seller(session, user_id, country, item)
+                    normalize_listing_for_export(item, country)
                     collected.append(item)
                     cat_added += 1
                     empty_rounds = 0

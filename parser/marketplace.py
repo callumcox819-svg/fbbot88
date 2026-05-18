@@ -31,7 +31,11 @@ _PRICE_RE = re.compile(
     r'"formatted_price"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"|'
     r'"listing_price"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
-_SELLER_RE = re.compile(r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"')
+_SELLER_RE = re.compile(
+    r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"marketplace_listing_seller"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"seller"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
 _PHOTO_RE = re.compile(r'"uri"\s*:\s*"(https://[^"]*scontent[^"]*)"')
 _LOCATION_RE = re.compile(r'"city"\s*:\s*"([^"]+)"|"location_text"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"')
 _DESC_RE = re.compile(
@@ -194,6 +198,64 @@ _FI_OK = (
     "jyväskylä",
     "jyvaskyla",
     "lahti",
+    "pori",
+    "kuopio",
+    "joensuu",
+    "vaasa",
+    "rovaniemi",
+    "mikkeli",
+    "seinäjoki",
+    "seinajoki",
+    "hämeenlinna",
+    "hameenlinna",
+    "lappeenranta",
+    "kotka",
+    "porvoo",
+    " kemi",
+    " raahe",
+    " uusimaa",
+    " pirkanmaa",
+    " varsinais",
+    " pohjanmaa",
+    " satakunta",
+    " €",
+    " eur",
+)
+_FI_TITLE_REJECT = (
+    "schweiz",
+    "schweizer",
+    " svizzera",
+    " suisse",
+    " chf",
+    "switzerland",
+    "zürich",
+    "zurich",
+    "basel",
+    "bern",
+    "lausanne",
+)
+_CH_TITLE_REJECT = (
+    "suomi",
+    "finland",
+    "helsinki",
+    "tampere",
+    "espoo",
+    "vantaa",
+)
+_CH_CANTON_SUFFIX_RE = re.compile(
+    r",\s*(ZH|BE|GE|VD|VS|AG|SG|BL|LU|SZ|TG|GR|FR|SO|BS|AR|AI|NW|OW|GL|ZG|UR|SH|JU|NE|TI)\s*$",
+    re.IGNORECASE,
+)
+_CH_PLACE_RE = re.compile(
+    r"\b(glarus|liestal|zurzach|opfikon|freienbach|rapperswil|schötz|schotz|arth|"
+    r"gipf|oberfrick|kirchberg|winterthur|basel|bern|zürich|zurich|luzern|lucerne|"
+    r"genf|geneva|genève|lausanne|lugano|biel|thun|fribourg|sion|neuchatel|neuchâtel|"
+    r"yverdon|bulle|herisau|frauenfeld|bellinzona|locarno|montreux|vevey|nyon|morges|"
+    r"pully|renens|uster|dübendorf|dubendorf|kloten|baden|wettingen|brugg|aarau|"
+    r"solothurn|grenchen|burgdorf|langenthal|wil\b|gossau|spiez|interlaken|brig|visp|"
+    r"martigny|sierre|zermatt|crans|olten|muttenz|reinach|allschwil|pratteln|emmen|"
+    r"kriens|lenzburg|root\b|chur|davos|st\.?\s*moritz|appenzell|stans|sarnen|altdorf)\b",
+    re.IGNORECASE,
 )
 _FI_REJECT = (
     "sweden",
@@ -263,13 +325,68 @@ def _text_has_ua_markers(text: str) -> bool:
     return False
 
 
+def _location_suggests_ch(location: str) -> bool:
+    loc = f" {(location or '').lower()} "
+    if not loc.strip():
+        return False
+    if any(h in loc for h in _CH_OK):
+        return True
+    if _CH_CANTON_SUFFIX_RE.search((location or "").strip()):
+        return True
+    if _CH_PLACE_RE.search(location or ""):
+        return True
+    return False
+
+
+def _location_suggests_fi(location: str) -> bool:
+    loc = f" {(location or '').lower()} "
+    if not loc.strip():
+        return False
+    if any(h in loc for h in _FI_OK):
+        return True
+    return False
+
+
+def _location_matches_country(location: str, country: str) -> bool:
+    """
+    Непустая локация должна соответствовать CH/FI.
+    Пустая — ок (регион задаётся URL helsinki/finland).
+    """
+    loc = (location or "").strip()
+    if not loc:
+        return True
+    if country == "fi":
+        if _text_has_ua_markers(loc):
+            return False
+        if any(r in f" {loc.lower()} " for r in _FI_REJECT):
+            return False
+        if _location_suggests_ch(loc):
+            return False
+        return _location_suggests_fi(loc)
+    if country == "ch":
+        if any(r in f" {loc.lower()} " for r in _CH_REJECT):
+            return False
+        if _location_suggests_fi(loc):
+            return False
+        return _location_suggests_ch(loc)
+    return True
+
+
 def listing_is_wrong_country(item: MarketplaceListing, country: str | None) -> bool:
-    """UA/чужая лента при выбранных CH/FI."""
+    """UA/CH/FI: не та страна в локации или заголовке."""
     if not country:
         return False
     if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
         return True
-    return _location_explicitly_foreign(item.location or "", country)
+    title = (item.title or "").lower()
+    if country == "fi" and any(x in title for x in _FI_TITLE_REJECT):
+        return True
+    if country == "ch" and any(x in title for x in _CH_TITLE_REJECT):
+        return True
+    loc = (item.location or "").strip()
+    if loc and not _location_matches_country(loc, country):
+        return True
+    return _location_explicitly_foreign(loc, country)
 
 
 def listing_is_valid(item: MarketplaceListing) -> bool:
@@ -424,6 +541,10 @@ def export_reject_reason(
 
     photo = (item.photo or "").strip()
     seller = (item.seller_name or "").strip()
+    desc = (item.item_desc or "").strip()
+
+    if not seller and not desc:
+        return "нет_данных"
 
     if price and photo:
         return None
@@ -439,27 +560,32 @@ def export_reject_reason(
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
-    """Страна целиком: не режем по одному городу; отсекаем явно чужие страны."""
     if not country:
         return True
-    loc = f" {(location or '').lower()} "
-    if country == "ch":
-        if any(r in loc for r in _CH_REJECT):
-            return False
-        if not loc.strip():
-            return True
-        if any(h in loc for h in _CH_OK):
-            return True
-        return True
+    return _location_matches_country(location or "", country)
+
+
+def format_price_for_country(price: str, country: str | None) -> str:
+    p = (price or "").strip()
+    if not p or not country:
+        return p
+    low = p.lower()
     if country == "fi":
-        if any(r in loc for r in _FI_REJECT):
-            return False
-        if not loc.strip():
-            return True
-        if any(h in loc for h in _FI_OK):
-            return True
-        return True
-    return True
+        if "€" in p or "eur" in low:
+            return p
+        if re.match(r"^[\d\s.,]+$", p.replace(",", ".")):
+            return f"{p} €"
+    if country == "ch":
+        if "chf" in low or "fr." in low or "sfr" in low:
+            return p
+        if re.match(r"^[\d\s.,]+$", p.replace(",", ".")):
+            return f"{p} CHF"
+    return p
+
+
+def normalize_listing_for_export(item: MarketplaceListing, country: str | None) -> None:
+    if country:
+        item.price = format_price_for_country(item.price, country)
 
 
 def normalize_category_path(url_or_path: str) -> str:
@@ -931,16 +1057,22 @@ async def enrich_listing(
     *,
     user_agent: str,
     proxy_url: str | None,
-    timeout_sec: float = 18.0,
+    timeout_sec: float = 20.0,
+    country: str | None = None,
 ) -> MarketplaceListing:
-    """Догружает цену, описание, даты с карточки объявления."""
+    """Догружает цену, описание, продавца с карточки объявления."""
     url = item.link or f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
+    referer = "https://www.facebook.com/marketplace/"
+    if country and country in COUNTRY_LOCATIONS:
+        slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
+        if slugs:
+            referer = f"https://www.facebook.com/marketplace/{slugs[0]}/"
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
         "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.facebook.com/marketplace/",
+        "Accept-Language": _accept_language(country),
+        "Referer": referer,
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     try:
@@ -956,14 +1088,16 @@ async def enrich_listing(
     if _looks_like_login_wall(html):
         raise AccountTokenDeadError("login wall on item page")
 
-    parsed = _parse_html(html, item.category)
-    best: MarketplaceListing | None = None
-    for p in parsed:
-        if p.listing_id == item.listing_id:
-            best = p
-            break
-    if not best and parsed:
-        best = parsed[0]
+    embedded = _parse_embedded_scripts(html)
+    best = embedded.get(item.listing_id)
+    if not best:
+        parsed = _parse_html(html, item.category)
+        for p in parsed:
+            if p.listing_id == item.listing_id:
+                best = p
+                break
+        if not best and parsed:
+            best = parsed[0]
     if best:
         _merge_listing(item, {
             "title": best.title,
