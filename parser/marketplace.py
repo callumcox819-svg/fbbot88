@@ -209,6 +209,10 @@ def listing_is_export_ready(item: MarketplaceListing, country: str | None = None
         score += 1
     if item.item_desc:
         score += 1
+    if item.price and (item.photo or item.seller_name):
+        return True
+    if item.seller_name and item.photo:
+        return True
     return score >= 3
 
 
@@ -304,6 +308,7 @@ async def fetch_category_listings(
     limit: int,
     timeout_sec: float = 22.0,
     on_url_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    on_page_found: Callable[[int], Awaitable[None]] | None = None,
     graphql_doc_id: str | None = None,
 ) -> list[MarketplaceListing]:
     """Категория; при CH/FI — обход регионов страны, фильтр по стране в объявлении."""
@@ -340,6 +345,8 @@ async def fetch_category_listings(
                 meta.get("html_len"),
                 meta.get("link_count"),
             )
+            if on_page_found and batch:
+                await on_page_found(len(batch))
         except RuntimeError as e:
             if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                 logger.info("skip url %s: %s", url, e)

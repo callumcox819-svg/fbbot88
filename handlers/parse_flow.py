@@ -10,7 +10,7 @@ from database import Session
 from keyboards.main_menu import main_menu_kb
 from models import User
 from parser.account_token import is_account_token_line, parse_account_token
-from services.parsing_jobs import is_parsing, start_parsing
+from services.parsing_jobs import is_parsing, refresh_parse_status, start_parsing
 from services.users import get_or_create_user
 
 router = Router()
@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 
 class ParseStates(StatesGroup):
     waiting_account_token = State()
+
+
+def _parse_progress_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="parse:refresh")],
+        ]
+    )
 
 
 def _token_kb(has_last: bool) -> InlineKeyboardMarkup:
@@ -59,6 +67,16 @@ async def open_start_flow(message: Message, state: FSMContext | None = None) -> 
     if state:
         await state.set_state(ParseStates.waiting_account_token)
     await message.answer(text, parse_mode="HTML", reply_markup=_token_kb(has_last))
+
+
+@router.callback_query(F.data == "parse:refresh")
+async def parse_refresh_stats(callback: CallbackQuery) -> None:
+    tg_id = callback.from_user.id
+    if not is_parsing(tg_id):
+        await callback.answer("Парсинг не запущен", show_alert=True)
+        return
+    ok = await refresh_parse_status(tg_id)
+    await callback.answer("Обновлено" if ok else "Нет данных", show_alert=not ok)
 
 
 @router.callback_query(F.data == "parse:cancel")
@@ -112,16 +130,22 @@ async def _launch_parse(message: Message, telegram_id: int, db_user: User, token
         n_cat = len(await list_user_categories(session, db_user.id))
 
     status_msg = await message.answer(
-        f"🔎 <b>0/{lim}</b>\n"
-        f"<i>Парсинг запущен ({n_cat} кат.). Сообщение обновляется каждые ~12 сек.</i>\n"
+        f"🔎 <b>В JSON: 0/{lim}</b>\n"
+        f"<i>Парсинг запущен ({n_cat} кат.). Статистика обновляется по ходу.</i>\n"
         f"<i>⏹ Стоп поиск — отменить.</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,
+        reply_markup=_parse_progress_kb(),
     )
 
     async def on_status(text: str) -> None:
         try:
-            await status_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+            await status_msg.edit_text(
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=_parse_progress_kb(),
+            )
         except TelegramBadRequest as e:
             if "message is not modified" in str(e).lower():
                 return

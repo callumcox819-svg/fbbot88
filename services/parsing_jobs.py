@@ -37,9 +37,26 @@ logger = logging.getLogger(__name__)
 class JobState:
     task: asyncio.Task
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    stats: dict = field(default_factory=dict)
+    push_status: Callable[[], Awaitable[None]] | None = None
 
 
 _jobs: dict[int, JobState] = {}
+
+
+def get_parse_stats(telegram_id: int) -> dict | None:
+    job = _jobs.get(telegram_id)
+    if not job or not job.stats:
+        return None
+    return dict(job.stats)
+
+
+async def refresh_parse_status(telegram_id: int) -> bool:
+    job = _jobs.get(telegram_id)
+    if job and job.push_status:
+        await job.push_status()
+        return True
+    return False
 
 
 def is_parsing(telegram_id: int) -> bool:
@@ -89,14 +106,36 @@ async def start_parsing(
             _jobs.pop(telegram_id, None)
 
     task = asyncio.create_task(_run())
-    _jobs[telegram_id] = JobState(task=task)
+    _jobs[telegram_id] = JobState(
+        task=task,
+        stats={
+            "pages": 0,
+            "found": 0,
+            "checked": 0,
+            "rejected": 0,
+            "accepted": 0,
+        },
+    )
 
 
-def _progress_text(done: int, total: int, *, step: str = "") -> str:
+def _progress_text(
+    done: int,
+    total: int,
+    *,
+    step: str = "",
+    stats: dict | None = None,
+) -> str:
     lines = [
-        f"🔎 <b>Сбор: {done}/{total}</b>",
-        "<i>Бот работает — цифра растёт. JSON пришлёт файлом в конце.</i>",
+        f"🔎 <b>В JSON: {done}/{total}</b>",
+        "<i>«В JSON» — прошли фильтр (цена/продавец/фото). JSON в конце.</i>",
     ]
+    if stats:
+        lines.append(
+            f"📊 Страниц: <b>{stats.get('pages', 0)}</b> · "
+            f"найдено: <b>{stats.get('found', 0)}</b> · "
+            f"проверено: <b>{stats.get('checked', 0)}</b> · "
+            f"отклонено: <b>{stats.get('rejected', 0)}</b>"
+        )
     if step:
         lines.append(f"📍 {step}")
     return "\n".join(lines)
@@ -140,10 +179,23 @@ async def _parse_impl(
 
     t_start = time.monotonic()
     current_step = {"text": "Старт…"}
+    job = _jobs.get(telegram_id)
+    stats = job.stats if job else {}
 
     async def status_progress() -> None:
+        stats["accepted"] = len(collected)
         if on_status:
-            await on_status(_progress_text(len(collected), json_limit, step=current_step["text"]))
+            await on_status(
+                _progress_text(
+                    len(collected),
+                    json_limit,
+                    step=current_step["text"],
+                    stats=stats,
+                )
+            )
+
+    if job:
+        job.push_status = status_progress
 
     async def heartbeat() -> None:
         while not stop.is_set():
@@ -179,10 +231,20 @@ async def _parse_impl(
 
             async def on_url(i: int, n: int, short: str) -> None:
                 current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"
+                current_step["text"] = f"⏳ {current_step['detail']}"
+                await status_progress()
+
+            async def on_page_found(n: int) -> None:
+                stats["pages"] = stats.get("pages", 0) + 1
+                stats["found"] = stats.get("found", 0) + n
+                current_step["text"] = (
+                    f"⏳ {current_step.get('detail', cat.label)} · +{n} с страницы"
+                )
                 await status_progress()
 
             batch = None
             last_err: Exception | None = None
+            proxy_used: str | None = None
             for proxy_try in (proxy_url, None):
                 if proxy_try is None and proxy_url is None:
                     break
@@ -197,8 +259,10 @@ async def _parse_impl(
                         limit=min(max(need * 2, 30), 120),
                         timeout_sec=22.0,
                         on_url_progress=on_url,
+                        on_page_found=on_page_found,
                         graphql_doc_id=config.fb_marketplace_doc_id,
                     )
+                    proxy_used = proxy_try
                     connect_fails = 0
                     break
                 except Exception as e:
@@ -236,29 +300,26 @@ async def _parse_impl(
                 and it.listing_id not in seen_ids
             ][: max(need_now * 3, 15)]
 
-            if candidates:
-                await asyncio.gather(
-                    *[
-                        enrich_listing(
-                            token,
-                            it,
-                            user_agent=config.fb_user_agent,
-                            proxy_url=proxy_try,
-                            timeout_sec=14.0,
-                        )
-                        for it in candidates
-                    ]
-                )
-
             added = 0
             for item in candidates:
                 if stop.is_set() or len(collected) >= json_limit:
                     break
+                await enrich_listing(
+                    token,
+                    item,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_used,
+                    timeout_sec=14.0,
+                )
+                stats["checked"] = stats.get("checked", 0) + 1
                 if not listing_is_export_ready(item, country):
+                    stats["rejected"] = stats.get("rejected", 0) + 1
+                    await status_progress()
                     continue
                 seen_ids.add(item.listing_id)
                 collected.append(item)
                 added += 1
+                await status_progress()
 
             if added == 0:
                 empty_rounds += 1
