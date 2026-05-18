@@ -6,7 +6,12 @@ from sqlalchemy import select
 
 from database import Session
 from data.preset_categories import MAX_CATEGORIES_PER_USER
-from keyboards.settings_kb import preset_categories_kb, settings_menu_kb_with_country
+from keyboards.settings_kb import (
+    json_limit_menu_kb,
+    json_limit_menu_text,
+    preset_categories_kb,
+    settings_menu_kb_with_country,
+)
 from models import User
 from services import categories as cat_svc
 from services import proxies as proxy_svc
@@ -98,17 +103,42 @@ async def toggle_country(callback: CallbackQuery, db_user: User) -> None:
 
 
 @router.callback_query(F.data == "set:json_limit")
-async def ask_json_limit(callback: CallbackQuery, state: FSMContext) -> None:
+async def json_limit_menu(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    await state.clear()
+    await callback.answer()
+    current = int(db_user.json_limit or 50)
+    await edit_text_keep_markup(
+        callback.message,
+        json_limit_menu_text(current),
+        reply_markup=json_limit_menu_kb(),
+    )
+
+
+@router.callback_query(F.data == "set:json_limit:edit")
+async def json_limit_edit(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
     await callback.answer()
     await state.set_state(SettingsStates.waiting_json_limit)
+    current = int(db_user.json_limit or 50)
     await callback.message.answer(
-        f"Введи число объявлений в одном JSON (1–500).\n"
-        f"Сейчас: максимум {MAX_CATEGORIES_PER_USER} категорий за запуск."
+        f"Введи новое число объявлений в JSON (1–500).\n"
+        f"Сейчас: <b>{current}</b>\n\n"
+        "/cancel — отмена",
+        parse_mode="HTML",
     )
 
 
 @router.message(SettingsStates.waiting_json_limit)
 async def save_json_limit(message: Message, state: FSMContext, db_user: User) -> None:
+    if (message.text or "").strip().lower() in ("/cancel", "отмена"):
+        await state.clear()
+        current = int(db_user.json_limit or 50)
+        await message.answer(
+            json_limit_menu_text(current),
+            parse_mode="HTML",
+            reply_markup=json_limit_menu_kb(),
+        )
+        return
+
     try:
         n = int((message.text or "").strip())
         if not 1 <= n <= 500:
@@ -123,7 +153,11 @@ async def save_json_limit(message: Message, state: FSMContext, db_user: User) ->
         await session.commit()
 
     await state.clear()
-    await message.answer(f"✅ Лимит JSON: <b>{n}</b>", parse_mode="HTML")
+    await message.answer(
+        f"✅ Сохранено.\n\n{json_limit_menu_text(n)}",
+        parse_mode="HTML",
+        reply_markup=json_limit_menu_kb(),
+    )
 
 
 @router.callback_query(F.data == "set:proxies")

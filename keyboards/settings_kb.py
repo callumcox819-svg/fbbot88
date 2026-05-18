@@ -33,6 +33,22 @@ def country_btn_label(code: str, active: bool) -> str:
     return f"🟢 {base}" if active else f"🔴 {base}"
 
 
+def json_limit_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="set:json_limit:edit")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="set:back")],
+        ]
+    )
+
+
+def json_limit_menu_text(current: int) -> str:
+    return (
+        "📦 <b>Количество объявлений в JSON</b>\n\n"
+        f"Текущее количество для JSON: <b>{current}</b>"
+    )
+
+
 def preset_cat_btn_label(label: str, active: bool) -> str:
     return f"{'🟢' if active else '🔴'} {label}"
 
