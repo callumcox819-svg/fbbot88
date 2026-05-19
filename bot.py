@@ -10,6 +10,7 @@ from config import config
 from database import init_db
 from handlers import admin, menu, parse_flow, settings_handler
 from middlewares.access import AccessMiddleware
+from services.bot_setup import configure_bot_ui
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +37,7 @@ async def main() -> None:
     dp.include_router(settings_handler.router)
     dp.include_router(admin.router)
 
+    await configure_bot_ui(bot)
     logger.info("Бот запущен (админы: %s)", config.admin_ids or "—")
     await dp.start_polling(bot)
 

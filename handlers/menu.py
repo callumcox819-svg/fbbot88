@@ -1,5 +1,5 @@
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
@@ -11,7 +11,20 @@ from services.users import get_or_create_user, user_has_access
 router = Router()
 
 
+async def _send_main_menu(message: Message, *, is_admin: bool) -> None:
+    await message.answer(
+        "👋 <b>FB Marketplace Parser</b>\n\n"
+        "▶️ <b>Старт поиска</b> — токен аккаунта FB → сбор JSON\n"
+        "⚙️ <b>Настройки</b> — прокси, страна (CH/FI), лимит JSON\n"
+        "⏹ <b>Стоп поиск</b> — остановить парсинг\n\n"
+        "<i>Меню всегда можно открыть командой /start</i>",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb(is_admin=is_admin),
+    )
+
+
 @router.message(CommandStart())
+@router.message(Command("menu"))
 async def cmd_start(message: Message) -> None:
     tg_id = message.from_user.id
     async with Session() as session:
@@ -19,19 +32,15 @@ async def cmd_start(message: Message) -> None:
 
     if not user_has_access(user):
         await message.answer(
-            f"🔒 Бот закрыт.\n\nТвой ID: <code>{tg_id}</code>\nОжидай выдачи доступа от админа.",
+            f"🔒 Бот закрыт.\n\n"
+            f"Твой ID: <code>{tg_id}</code>\n"
+            "Ожидай выдачи доступа от админа.\n\n"
+            "<i>После доступа нажми /start — появятся кнопки внизу.</i>",
             parse_mode="HTML",
         )
         return
 
-    await message.answer(
-        "👋 <b>FB Marketplace Parser</b>\n\n"
-        "▶️ <b>Старт поиска</b> — токен аккаунта FB → сбор JSON\n"
-        "⚙️ <b>Настройки</b> — прокси, страна (CH/FI), лимит JSON\n"
-        "⏹ <b>Стоп поиск</b> — остановить парсинг",
-        parse_mode="HTML",
-        reply_markup=main_menu_kb(is_admin=user.is_admin),
-    )
+    await _send_main_menu(message, is_admin=user.is_admin)
 
 
 @router.message(F.text == BTN_START)

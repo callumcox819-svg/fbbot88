@@ -13,7 +13,7 @@ _DENY = (
 )
 
 # Без проверки доступа
-_PUBLIC = {"/start"}
+_PUBLIC = {"/start", "/menu"}
 
 
 class AccessMiddleware(BaseMiddleware):
