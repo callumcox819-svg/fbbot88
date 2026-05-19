@@ -174,7 +174,7 @@ def _progress_text(
         age_hint = f" · до {int(max_age_hours)} ч"
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        f"<i>1 продавец = 1 карточка{age_hint}. ⏹ Стоп — JSON.</i>",
+        f"<i>1 продавец = 1 карточка{age_hint}. ⏹ Стоп — JSON (в т.ч. частичный).</i>",
     ]
     if stats:
         lines.append(
@@ -411,6 +411,8 @@ async def _parse_impl(
                         f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
                     )
                     await status_progress()
+                    if config.parse_item_delay_sec > 0:
+                        await asyncio.sleep(config.parse_item_delay_sec)
 
             def should_stop() -> bool:
                 return stop.is_set() or len(collected) >= json_limit
@@ -477,9 +479,10 @@ async def _parse_impl(
                 if empty_rounds >= max_empty_rounds:
                     break
             await status_progress()
+            if config.parse_category_delay_sec > 0 and not stop.is_set():
+                await asyncio.sleep(config.parse_category_delay_sec)
     except AccountTokenDeadError:
         token_dead_flag["value"] = True
-        await _notify_token_dead(bot, telegram_id, on_status)
     finally:
         hb_task.cancel()
         try:
@@ -517,39 +520,51 @@ async def _parse_impl(
             run.error_message = f"Собрано {got}/{json_limit}"
         await session.commit()
 
-    if token_dead:
-        return
+    if got > 0:
+        if token_dead:
+            caption = f"⚠️ Токен умер — частичный JSON ({got})"
+        elif stopped:
+            caption = f"⏹ Остановлено — {got} объявлений"
+        elif full:
+            caption = f"✅ Готово — {got} объявлений"
+        else:
+            caption = f"📦 Собрано {got}/{json_limit}"
 
-    if stopped and got > 0:
         sent = await _send_json_file(
             bot,
             telegram_id,
             collected,
             country,
             json_limit,
-            caption=f"⏹ Остановлено — {len(collected)} объявлений",
+            caption=caption,
         )
-        if on_status:
-            await on_status(
-                f"⏹ <b>Остановлено.</b> Отправлен JSON: <b>{sent}</b> объявлений."
+        lines = [f"📦 Отправлен JSON: <b>{sent}</b> объявлений."]
+        if token_dead:
+            lines.append("")
+            lines.append(TOKEN_DEAD_USER_MESSAGE)
+        elif not full and not stopped:
+            lines.append(
+                f"<i>Лимит {json_limit} не набран ({got}) — лента закончилась или много отсева.</i>"
             )
+        elif stopped:
+            lines.append("<i>Парсинг остановлен вручную.</i>")
+        elif full:
+            lines.append("<i>Лимит набран.</i>")
+        if on_status:
+            await on_status("\n".join(lines))
+        if token_dead:
+            try:
+                await bot.send_message(telegram_id, TOKEN_DEAD_USER_MESSAGE)
+            except Exception:
+                pass
         return
 
-    if not full:
-        if on_status:
-            await on_status(
-                f"⚠️ Собрано <b>{got}/{json_limit}</b>. JSON не отправлен (лимит не набран).\n"
-                "Проверь токен и прокси страны (CH/FI)."
-            )
+    if token_dead:
+        await _notify_token_dead(bot, telegram_id, on_status)
         return
 
-    await _send_json_file(
-        bot,
-        telegram_id,
-        collected,
-        country,
-        json_limit,
-        caption=f"✅ JSON: {json_limit} объявлений",
-    )
     if on_status:
-        await on_status(f"✅ Готово. Отправлен JSON: <b>{json_limit}</b> объявлений.")
+        await on_status(
+            "⚠️ <b>В JSON: 0 объявлений</b>\n\n"
+            "Проверь токен, прокси страны (CH/FI) и 🇨🇭/🇫🇮 в настройках."
+        )

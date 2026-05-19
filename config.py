@@ -26,6 +26,8 @@ class Config:
     fb_marketplace_doc_id: str | None
     fb_marketplace_browse_doc_id: str | None
     listing_max_age_hours: float
+    parse_item_delay_sec: float
+    parse_category_delay_sec: float
 
 
 def load_config() -> Config:
@@ -46,6 +48,8 @@ def load_config() -> Config:
             (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip() or None
         ),
         listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "24"),
+        parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "0.75"),
+        parse_category_delay_sec=float(os.getenv("PARSE_CATEGORY_DELAY_SEC") or "1.25"),
     )
 
 
