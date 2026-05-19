@@ -174,7 +174,7 @@ def _progress_text(
         age_hint = f" · до {int(max_age_hours)} ч"
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        f"<i>1 продавец = 1 карточка{age_hint}. ⏹ Стоп — JSON (в т.ч. частичный).</i>",
+        f"<i>1 продавец = 1 карточка{age_hint}. ~{int(config.parse_item_delay_sec)} с/объявление. ⏹ Стоп — JSON.</i>",
     ]
     if stats:
         lines.append(
