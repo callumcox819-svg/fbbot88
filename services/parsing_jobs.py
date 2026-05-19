@@ -36,11 +36,7 @@ from parser.marketplace import (
 from parser.marketplace_region import apply_marketplace_region
 from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
-from services.seller_blacklist import (
-    load_blocked_seller_keys,
-    remember_seller,
-    seller_key_from_item,
-)
+from services.seller_blacklist import seller_key_from_item
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +170,7 @@ def _progress_text(
         age_hint = f" · до {int(max_age_hours)} ч"
     lines = [
         f"🔎 <b>В JSON: {done}/{total}</b>",
-        f"<i>1 продавец = 1 карточка{age_hint}. ~{int(config.parse_item_delay_sec)} с/объявление. ⏹ Стоп — JSON.</i>",
+        f"<i>1 продавец = 1 карточка за запуск{age_hint}. ~{int(config.parse_item_delay_sec)} с/объявл. ⏹ Стоп — JSON.</i>",
     ]
     if stats:
         lines.append(
@@ -260,7 +256,6 @@ async def _parse_impl(
         await session.commit()
         await session.refresh(run)
         run_id = run.id
-        blocked_sellers = await load_blocked_seller_keys(session, user_id, country)
 
     collected: list = []
     seen_ids: set[str] = set()
@@ -268,8 +263,11 @@ async def _parse_impl(
     cat_count = len(categories)
     cat_idx = 0
     empty_rounds = 0
-    max_empty_rounds = cat_count * 5
+    stale_rounds = 0
+    max_empty_rounds = max(cat_count * 8, 24)
+    max_stale_rounds = max(cat_count * 15, 40)
     connect_fails = 0
+    stop_reason = ""
 
     t_start = time.monotonic()
     current_step = {"text": "Старт…"}
@@ -352,8 +350,11 @@ async def _parse_impl(
                 await status_progress()
 
             cat_added = 0
+            page_raw = 0
+
             async def on_page_items(page_items: list) -> None:
-                nonlocal cat_added, empty_rounds
+                nonlocal cat_added, empty_rounds, page_raw
+                page_raw = len(page_items)
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
@@ -361,7 +362,7 @@ async def _parse_impl(
                         continue
                     stats["checked"] = stats.get("checked", 0) + 1
                     sk = seller_key_from_item(item)
-                    if sk and (sk in blocked_sellers or sk in session_sellers):
+                    if sk and sk in session_sellers:
                         _record_reject(stats, "повторный_продавец")
                         seen_ids.add(item.listing_id)
                         continue
@@ -389,7 +390,7 @@ async def _parse_impl(
                     reason = export_reject_reason(
                         item, country, max_age_hours=max_age_hours
                     )
-                    if sk and (sk in blocked_sellers or sk in session_sellers):
+                    if sk and sk in session_sellers:
                         _record_reject(stats, "повторный_продавец")
                         seen_ids.add(item.listing_id)
                         continue
@@ -400,13 +401,11 @@ async def _parse_impl(
                     seen_ids.add(item.listing_id)
                     if sk:
                         session_sellers.add(sk)
-                        blocked_sellers.add(sk)
-                        async with Session() as session:
-                            await remember_seller(session, user_id, country, item)
                     normalize_listing_for_export(item, country)
                     collected.append(item)
                     cat_added += 1
                     empty_rounds = 0
+                    stale_rounds = 0
                     current_step["detail"] = (
                         f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
                     )
@@ -471,12 +470,20 @@ async def _parse_impl(
                         raise RuntimeError("Нет связи с Facebook") from err
                 empty_rounds += 1
                 if empty_rounds >= max_empty_rounds:
+                    stop_reason = "нет_связи"
                     break
                 continue
 
             if cat_added == 0:
-                empty_rounds += 1
+                if page_raw == 0:
+                    empty_rounds += 1
+                else:
+                    stale_rounds += 1
                 if empty_rounds >= max_empty_rounds:
+                    stop_reason = "лента_пустая"
+                    break
+                if stale_rounds >= max_stale_rounds:
+                    stop_reason = "те_же_карточки"
                     break
             await status_progress()
             if config.parse_category_delay_sec > 0 and not stop.is_set():
@@ -494,6 +501,12 @@ async def _parse_impl(
     full = got >= json_limit
     stopped = stop.is_set()
     token_dead = token_dead_flag["value"]
+    if full:
+        stop_reason = stop_reason or "лимит"
+    elif stopped:
+        stop_reason = stop_reason or "стоп"
+    elif not stop_reason:
+        stop_reason = "категории_исчерпаны"
 
     if token_dead:
         status_key = "token_expired"
@@ -502,7 +515,7 @@ async def _parse_impl(
     elif full:
         status_key = "done"
     else:
-        status_key = "error"
+        status_key = "partial"
 
     async with Session() as session:
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
@@ -543,9 +556,25 @@ async def _parse_impl(
             lines.append("")
             lines.append(TOKEN_DEAD_USER_MESSAGE)
         elif not full and not stopped:
-            lines.append(
-                f"<i>Лимит {json_limit} не набран ({got}) — лента закончилась или много отсева.</i>"
-            )
+            if stop_reason == "лента_пустая":
+                lines.append(
+                    f"<i>Лимит {json_limit} не набран ({got}): страницы категорий пустые.</i>"
+                )
+            elif stop_reason == "те_же_карточки":
+                lines.append(
+                    f"<i>Лимит {json_limit} не набран ({got}): прошли категории несколько раз, "
+                    f"новых продавцов в ленте не осталось (1 продавец = 1 за этот запуск).</i>"
+                )
+            else:
+                lines.append(
+                    f"<i>Лимит {json_limit} не набран ({got}) — много отсева или лента та же.</i>"
+                )
+            dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)
+            if dup:
+                lines.append(
+                    f"<i>Отсев «повторный продавец» в этом запуске: {dup} "
+                    f"(только внутри одного поиска, не между запусками).</i>"
+                )
         elif stopped:
             lines.append("<i>Парсинг остановлен вручную.</i>")
         elif full:
