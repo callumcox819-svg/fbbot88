@@ -158,26 +158,81 @@ async def save_json_limit(message: Message, state: FSMContext, db_user: User) ->
     )
 
 
-@router.callback_query(F.data == "set:proxies")
-async def proxies_menu(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
-    await callback.answer()
-    async with Session() as session:
-        rows = await proxy_svc.list_proxies(session, db_user.id)
+def _proxy_menu_text(rows: list) -> str:
     lines = [
         f"🌐 <b>Прокси</b> ({len(rows)})",
         "",
-        "Пришли список (по одному на строку):",
-        "<code>host:port:user:pass</code>",
+        "Нажми 🗑 у строки — удалить. Или ➕ добавить новые.",
+        "Формат: <code>host:port:user:pass</code>",
     ]
+    if rows:
+        lines.append("")
+        for p in rows[:15]:
+            lines.append(f"• <code>{p.host}:{p.port}</code>")
+        if len(rows) > 15:
+            lines.append(f"<i>… ещё {len(rows) - 15}</i>")
+    else:
+        lines.append("")
+        lines.append("<i>Список пуст — добавь прокси.</i>")
+    return "\n".join(lines)
+
+
+def _proxy_menu_kb(rows: list) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
     for p in rows[:15]:
-        lines.append(f"• <code>{p.host}:{p.port}</code> (id={p.id})")
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить", callback_data="set:proxy:add")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="set:back")],
-        ]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 {p.host}:{p.port}",
+                    callback_data=f"set:proxy:del:{p.id}",
+                )
+            ]
+        )
+    row2 = [InlineKeyboardButton(text="➕ Добавить", callback_data="set:proxy:add")]
+    if rows:
+        row2.append(
+            InlineKeyboardButton(text="🗑 Все", callback_data="set:proxy:delall")
+        )
+    buttons.append(row2)
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="set:back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _show_proxies_menu(message: Message, user_id: int) -> None:
+    async with Session() as session:
+        rows = await proxy_svc.list_proxies(session, user_id)
+    await message.edit_text(
+        _proxy_menu_text(rows),
+        parse_mode="HTML",
+        reply_markup=_proxy_menu_kb(rows),
     )
-    await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "set:proxies")
+async def proxies_menu(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    await state.clear()
+    await callback.answer()
+    await _show_proxies_menu(callback.message, db_user.id)
+
+
+@router.callback_query(F.data.regexp(r"^set:proxy:del:\d+$"))
+async def proxy_delete_one(callback: CallbackQuery, db_user: User) -> None:
+    proxy_id = int(callback.data.rsplit(":", 1)[-1])
+    async with Session() as session:
+        ok = await proxy_svc.delete_proxy(session, db_user.id, proxy_id)
+    if ok:
+        await callback.answer("Удалено")
+    else:
+        await callback.answer("Не найдено", show_alert=True)
+    await _show_proxies_menu(callback.message, db_user.id)
+
+
+@router.callback_query(F.data == "set:proxy:delall")
+async def proxy_delete_all(callback: CallbackQuery, db_user: User) -> None:
+    async with Session() as session:
+        n = await proxy_svc.delete_all_proxies(session, db_user.id)
+    await callback.answer(f"Удалено: {n}")
+    await _show_proxies_menu(callback.message, db_user.id)
 
 
 @router.callback_query(F.data == "set:proxy:add")
@@ -198,3 +253,10 @@ async def proxy_save(message: Message, state: FSMContext, db_user: User) -> None
         added, failed = await proxy_svc.add_proxies(session, db_user.id, lines)
     await state.clear()
     await message.answer(f"✅ Добавлено: {added}, ошибок: {failed}")
+    async with Session() as session:
+        rows = await proxy_svc.list_proxies(session, db_user.id)
+    await message.answer(
+        _proxy_menu_text(rows),
+        parse_mode="HTML",
+        reply_markup=_proxy_menu_kb(rows),
+    )

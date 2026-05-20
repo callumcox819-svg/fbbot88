@@ -84,6 +84,15 @@ async def delete_proxy(session: AsyncSession, user_id: int, proxy_id: int) -> bo
     return True
 
 
+async def delete_all_proxies(session: AsyncSession, user_id: int) -> int:
+    res = await session.execute(select(Proxy).where(Proxy.user_id == user_id))
+    rows = list(res.scalars().all())
+    for row in rows:
+        await session.delete(row)
+    await session.commit()
+    return len(rows)
+
+
 async def pick_random_proxy_url(session: AsyncSession, user_id: int) -> str | None:
     rows = await list_proxies(session, user_id)
     if not rows:
