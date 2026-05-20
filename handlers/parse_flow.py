@@ -135,8 +135,8 @@ async def _launch_parse(message: Message, telegram_id: int, db_user: User, token
 
     status_msg = await message.answer(
         f"🔎 <b>В JSON: 0/{lim}</b>\n"
-        f"<i>Парсинг: {n_cat} категорий Marketplace. Статистика обновляется по ходу.</i>\n"
-        f"<i>⏹ Стоп поиск — отменить.</i>",
+        f"<i>Парсинг: {n_cat} категорий. Не набрали {lim} — всё равно пришлём JSON.</i>\n"
+        f"<i>⏹ Стоп — сразу JSON с тем, что собрано.</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=_parse_progress_kb(),

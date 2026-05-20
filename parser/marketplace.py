@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
+from config import config
 from data.preset_categories import (
     CH_MARKETPLACE_LOCATION_ID,
     COUNTRY_LOCATIONS,
@@ -56,6 +58,16 @@ _CREATION_UNIX_RE = re.compile(
 )
 _MAX_CATEGORY_FEED_PAGES = 25
 _FEED_PAGE_SIZE = 24
+
+
+def _pages_per_category() -> int:
+    return max(1, min(int(config.marketplace_pages_per_category), _MAX_CATEGORY_FEED_PAGES))
+
+
+def _graphql_doc_for_feed(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    return config.fb_marketplace_browse_doc_id
 _JOIN_TIME_RE = re.compile(
     r'"(?:join_time|seller_join_time|marketplace_seller_join_time)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
@@ -789,8 +801,8 @@ async def fetch_category_listings(
     should_stop: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
-) -> list[MarketplaceListing]:
-    """Категория; при CH/FI — регионы страны, одна HTML-страница на URL (как при стабильных 40+)."""
+) -> tuple[list[MarketplaceListing], dict[str, Any]]:
+    """Категория CH/FI: листаем до конца ленты или лимита (как VOID)."""
     if country and country in COUNTRY_LOCATIONS:
         urls = urls_for_country_category(country, url_path, hub_round=hub_round)
     else:
@@ -799,6 +811,11 @@ async def fetch_category_listings(
     seen_ids: set[str] = set()
     out: list[MarketplaceListing] = []
     total_urls = len(urls)
+    feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    max_pages = _pages_per_category()
+    pages_fetched = 0
+    has_next_at_end = False
+    stopped_early = False
 
     for i, url in enumerate(urls, start=1):
         if should_stop and should_stop():
@@ -809,61 +826,98 @@ async def fetch_category_listings(
         if on_url_progress:
             await on_url_progress(i, total_urls, short)
         fetch_url = with_country_geo(url, country)
-        logger.info("GET %s", fetch_url)
-        try:
-            batch, meta, _cursor, _has_next = await _fetch_page(
-                token,
-                url=fetch_url,
-                user_agent=user_agent,
-                proxy_url=proxy_url,
-                timeout_sec=timeout_sec,
-                category_label=category_label,
-                graphql_doc_id=graphql_doc_id,
-                cursor=None,
-                country=country,
-            )
-            logger.info(
-                "parsed %s items from %s (html=%s, links=%s)",
-                len(batch),
-                short,
-                meta.get("html_len"),
-                meta.get("link_count"),
-            )
-            page_new: list[MarketplaceListing] = []
-            for item in batch:
-                if not listing_is_valid(item):
-                    continue
-                if item.listing_id in seen_ids:
-                    continue
-                seen_ids.add(item.listing_id)
-                page_new.append(item)
-                out.append(item)
-                if len(out) >= limit:
-                    break
-
-            if on_page_found and page_new:
-                await on_page_found(len(page_new))
-            if on_page_items and page_new:
-                await on_page_items(page_new)
+        cursor: str | None = None
+        for page_idx in range(max_pages):
+            if should_stop and should_stop():
+                break
             if len(out) >= limit:
                 break
-        except RuntimeError as e:
-            if "HTTP 400" in str(e) or "HTTP 404" in str(e):
-                logger.info("skip url %s: %s", url, e)
-                continue
-            raise
-        except Exception as e:
-            logger.warning("skip url %s: %s", url, e)
-            continue
+            logger.info("GET %s page=%s", fetch_url, page_idx + 1)
+            try:
+                batch, meta, cursor, has_next = await _fetch_page(
+                    token,
+                    url=fetch_url,
+                    user_agent=user_agent,
+                    proxy_url=proxy_url,
+                    timeout_sec=timeout_sec,
+                    category_label=category_label,
+                    graphql_doc_id=feed_doc,
+                    cursor=cursor,
+                    country=country,
+                )
+                pages_fetched += 1
+                has_next_at_end = bool(has_next and cursor)
+                logger.info(
+                    "parsed %s items from %s p%s (src=%s, links=%s, next=%s)",
+                    len(batch),
+                    short,
+                    page_idx + 1,
+                    meta.get("source"),
+                    meta.get("link_count"),
+                    has_next,
+                )
+                page_new: list[MarketplaceListing] = []
+                for item in batch:
+                    if not listing_is_valid(item):
+                        continue
+                    if item.listing_id in seen_ids:
+                        continue
+                    seen_ids.add(item.listing_id)
+                    page_new.append(item)
+                    out.append(item)
+                    if len(out) >= limit:
+                        break
 
+                if on_page_found and page_new:
+                    await on_page_found(len(page_new))
+                if on_page_items and page_new:
+                    await on_page_items(page_new)
+                if len(out) >= limit:
+                    stopped_early = True
+                    break
+                if should_stop and should_stop():
+                    stopped_early = True
+                    break
+                if not has_next or not cursor:
+                    has_next_at_end = False
+                    break
+                await asyncio.sleep(0.6)
+            except RuntimeError as e:
+                if "HTTP 400" in str(e) or "HTTP 404" in str(e):
+                    logger.info("skip url %s: %s", url, e)
+                    break
+                if page_idx == 0:
+                    raise
+                logger.info("stop pagination %s after p%s: %s", short, page_idx + 1, e)
+                break
+            except Exception as e:
+                if page_idx == 0:
+                    raise
+                logger.warning("stop pagination %s after p%s: %s", short, page_idx + 1, e)
+                break
+
+    exhausted = (
+        pages_fetched > 0
+        and not has_next_at_end
+        and not stopped_early
+    )
+    fetch_meta = {
+        "pages_fetched": pages_fetched,
+        "listings_seen": len(seen_ids),
+        "exhausted": exhausted,
+        "urls_tried": len(urls),
+    }
     logger.info(
-        "category %s country=%s urls=%s collected=%s",
+        "category %s country=%s urls=%s pages=%s seen=%s collected=%s exhausted=%s",
         category_label,
         country or "all",
         len(urls),
+        pages_fetched,
+        len(seen_ids),
         len(out),
+        exhausted,
     )
-    return out[:limit]
+    return out[:limit], fetch_meta
 
 
 def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
@@ -1311,7 +1365,8 @@ async def _fetch_page(
     country: str | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
-    if graphql_doc_id and cursor:
+    feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    if feed_doc and cursor:
         gql = await _fetch_graphql_category(
             token,
             seo_path=seo,
@@ -1319,7 +1374,7 @@ async def _fetch_page(
             proxy_url=proxy_url,
             timeout_sec=timeout_sec,
             category_label=category_label,
-            doc_id=graphql_doc_id,
+            doc_id=feed_doc,
             limit=_FEED_PAGE_SIZE,
             cursor=cursor,
         )
@@ -1333,7 +1388,7 @@ async def _fetch_page(
             }, next_cursor, has_next
         return [], {"html_len": 0, "link_count": 0, "parsed": 0, "source": "graphql"}, None, False
 
-    if graphql_doc_id and not cursor:
+    if feed_doc and not cursor:
         gql = await _fetch_graphql_category(
             token,
             seo_path=seo,
@@ -1341,7 +1396,7 @@ async def _fetch_page(
             proxy_url=proxy_url,
             timeout_sec=timeout_sec,
             category_label=category_label,
-            doc_id=graphql_doc_id,
+            doc_id=feed_doc,
             limit=_FEED_PAGE_SIZE,
             cursor=None,
         )
@@ -1383,11 +1438,10 @@ async def _fetch_page(
 
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)
+    meta["source"] = "html"
     next_cursor, has_next = _extract_cursor_from_html(html)
-    if not graphql_doc_id:
-        next_cursor, has_next = None, False
-    elif not next_cursor and items:
-        has_next = len(items) >= 12
+    if not next_cursor and items:
+        has_next = len(items) >= 12 and bool(feed_doc)
     return items, meta, next_cursor, has_next
 
 

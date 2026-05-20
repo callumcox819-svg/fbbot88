@@ -28,6 +28,7 @@ class Config:
     listing_max_age_hours: float
     parse_item_delay_sec: float
     parse_category_delay_sec: float
+    marketplace_pages_per_category: int
 
 
 def load_config() -> Config:
@@ -50,6 +51,7 @@ def load_config() -> Config:
         listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "24"),
         parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "10"),
         parse_category_delay_sec=float(os.getenv("PARSE_CATEGORY_DELAY_SEC") or "3"),
+        marketplace_pages_per_category=int(os.getenv("MARKETPLACE_PAGES_PER_CATEGORY") or "20"),
     )
 
 
