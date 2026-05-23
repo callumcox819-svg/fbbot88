@@ -334,7 +334,8 @@ async def _finalize_parse_run(
         lines.append("<i>Лимит набран.</i>")
     elif stop_reason == "категории_исчерпаны":
         lines.append(
-            f"<i>Все категории пройдены, новых объявлений нет ({got}/{json_limit}).</i>"
+            f"<i>Все категории пройдены ({got}/{json_limit}). "
+            f"Если мало — в Railway задай FB_MARKETPLACE_DOC_ID для глубокой ленты.</i>"
         )
     else:
         dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)

@@ -68,6 +68,39 @@ def _graphql_doc_for_feed(explicit: str | None) -> str | None:
     if explicit:
         return explicit
     return config.fb_marketplace_browse_doc_id
+
+
+_FEED_DOC_PATTERNS = (
+    re.compile(
+        r"MarketplaceCategoryFeedPaginationQuery[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"CometMarketplaceCategoryFeed[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"marketplace[^\"]{0,40}pagination[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+)
+
+
+def _extract_feed_doc_id_from_html(html: str) -> str | None:
+    """doc_id ленты категории из HTML — для 2+ страницы без ручного FB_MARKETPLACE_DOC_ID."""
+    for pat in _FEED_DOC_PATTERNS:
+        m = pat.search(html)
+        if m:
+            return m.group(1)
+    for raw in _SCRIPT_JSON_RE.findall(html):
+        if "marketplace" not in raw.lower() or "doc_id" not in raw:
+            continue
+        for m in re.finditer(r"\"doc_id\"\s*:\s*\"(\d{15,20})\"", raw):
+            if "Marketplace" in raw or "marketplace" in raw:
+                return m.group(1)
+    return None
+
+
 _JOIN_TIME_RE = re.compile(
     r'"(?:join_time|seller_join_time|marketplace_seller_join_time)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
@@ -827,12 +860,14 @@ async def fetch_category_listings(
             await on_url_progress(i, total_urls, short)
         fetch_url = with_country_geo(url, country)
         cursor: str | None = None
+        discovered_doc: str | None = None
         for page_idx in range(max_pages):
             if should_stop and should_stop():
                 break
             if len(out) >= limit:
                 break
-            logger.info("GET %s page=%s", fetch_url, page_idx + 1)
+            page_doc = feed_doc or discovered_doc
+            logger.info("GET %s page=%s doc=%s", fetch_url, page_idx + 1, bool(page_doc))
             try:
                 batch, meta, cursor, has_next = await _fetch_page(
                     token,
@@ -841,10 +876,13 @@ async def fetch_category_listings(
                     proxy_url=proxy_url,
                     timeout_sec=timeout_sec,
                     category_label=category_label,
-                    graphql_doc_id=feed_doc,
+                    graphql_doc_id=page_doc,
                     cursor=cursor,
                     country=country,
                 )
+                if meta.get("discovered_doc_id") and not discovered_doc:
+                    discovered_doc = str(meta["discovered_doc_id"])
+                    logger.info("discovered feed doc_id %s for %s", discovered_doc, short)
                 pages_fetched += 1
                 has_next_at_end = bool(has_next and cursor)
                 logger.info(
@@ -1439,9 +1477,13 @@ async def _fetch_page(
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)
     meta["source"] = "html"
+    doc_from_html = _extract_feed_doc_id_from_html(html)
+    if doc_from_html:
+        meta["discovered_doc_id"] = doc_from_html
     next_cursor, has_next = _extract_cursor_from_html(html)
+    effective_doc = feed_doc or doc_from_html
     if not next_cursor and items:
-        has_next = len(items) >= 12 and bool(feed_doc)
+        has_next = len(items) >= 12 and bool(effective_doc)
     return items, meta, next_cursor, has_next
 
 
