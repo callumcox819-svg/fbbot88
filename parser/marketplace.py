@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -141,6 +143,27 @@ _SCRIPT_JSON_RE = re.compile(
 )
 _WINDOW_BEFORE = 900
 _WINDOW_AFTER = 6500
+_LISTING_PROFILE_MAX_DIST = 80_000
+
+_category_feed_html: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "category_feed_html", default=None
+)
+_cached_item_doc_id: str | None = None
+
+_ITEM_DOC_PATTERNS = (
+    re.compile(
+        r"CometMarketplaceListingDetails[^}]{0,2000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"MarketplaceProductDetailsPage[^}]{0,2000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"ListingDetails[^}]{0,2000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+)
 
 _GENDER_RU = {
     "MALE": "Мужской",
@@ -997,7 +1020,16 @@ async def fetch_category_listings(
                 page_html = meta.get("raw_html")
                 if page_html:
                     html_s = str(page_html)
+                    _category_feed_html.set(html_s)
                     seller_index = build_feed_seller_index(html_s)
+                    n_prof = len(seller_index)
+                    if n_prof:
+                        logger.info(
+                            "feed sellers indexed: %s / %s from %s",
+                            n_prof,
+                            len(page_new),
+                            short,
+                        )
                     for it in page_new:
                         apply_feed_seller_index(it, seller_index)
                         sp = _patch_seller_from_html(html_s, it.listing_id)
@@ -1191,6 +1223,9 @@ def _index_sellers_from_relay_json(obj: Any, out: dict[str, dict[str, str]]) -> 
             "group_commerce_item_title",
             "title",
         )
+        typename = str(obj.get("__typename") or "")
+        if not title and "Listing" in typename:
+            title = _dig_str(obj, "marketplace_listing_title", "title") or "x"
         for key in ("id", "listing_id", "legacy_listing_id"):
             val = str(obj.get(key) or "").strip()
             if val.isdigit() and len(val) >= _MIN_LISTING_ID_LEN and title:
@@ -1299,11 +1334,163 @@ def _index_sellers_from_dom(html: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _proximity_listing_sellers(html: str) -> dict[str, dict[str, str]]:
+    """
+    VOID: в ленте listing и profile часто в разных JSON-блоках.
+    Связываем ближайший profile/ID к каждому /marketplace/item/ID.
+    """
+    if not html:
+        return {}
+    listings: list[tuple[int, str]] = []
+    for m in _LISTING_ID_RE.finditer(html):
+        lid = m.group(1)
+        if len(lid) >= _MIN_LISTING_ID_LEN and lid not in {x[1] for x in listings}:
+            listings.append((m.start(), lid))
+    profiles: list[tuple[int, str]] = []
+    for m in _PROFILE_LINK_RE.finditer(html):
+        pid = m.group(1)
+        if pid.isdigit():
+            profiles.append((m.start(), pid))
+    if not listings or not profiles:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for lpos, lid in listings:
+        best_pid = ""
+        best_dist = _LISTING_PROFILE_MAX_DIST + 1
+        for ppos, pid in profiles:
+            if pid == lid:
+                continue
+            dist = abs(ppos - lpos)
+            if dist < best_dist:
+                best_dist = dist
+                best_pid = pid
+        if best_pid and best_dist <= _LISTING_PROFILE_MAX_DIST:
+            ent = {
+                "seller_id": best_pid,
+                "person_link": (
+                    f"https://www.facebook.com/marketplace/profile/{best_pid}/"
+                ),
+            }
+            nm = _seller_name_for_profile_in_html(html, best_pid)
+            if nm:
+                ent["seller_name"] = nm
+            out[lid] = ent
+    return out
+
+
+def _extract_item_doc_id(html: str) -> str | None:
+    global _cached_item_doc_id
+    env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
+    if env:
+        return env
+    if _cached_item_doc_id:
+        return _cached_item_doc_id
+    if not html:
+        return None
+    for pat in _ITEM_DOC_PATTERNS:
+        m = pat.search(html)
+        if m:
+            _cached_item_doc_id = m.group(1)
+            logger.info("discovered item doc_id %s", _cached_item_doc_id)
+            return _cached_item_doc_id
+    return None
+
+
+def _seller_patch_from_graphql_payload(
+    data: Any, listing_id: str
+) -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    if _deep_seller_patch(data, listing_id, found):
+        return found
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if str(node.get("id") or "") == listing_id:
+                for key in _SELLER_BLOB_KEYS:
+                    blob = node.get(key)
+                    if isinstance(blob, dict):
+                        _apply_seller_blob(blob, listing_id, found)
+            for val in node.values():
+                walk(val)
+        elif isinstance(node, list):
+            for val in node:
+                walk(val)
+
+    walk(data)
+    return found
+
+
+async def _enrich_via_graphql_item(
+    token: AccountToken,
+    listing_id: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    country: str | None,
+    hint_html: str = "",
+) -> dict[str, Any]:
+    doc_id = _extract_item_doc_id(hint_html)
+    if not doc_id:
+        return {}
+    if not token.access_token and not token.cookies:
+        return {}
+
+    variable_sets = [
+        {"listingID": listing_id, "scale": 2},
+        {"listing_id": listing_id, "scale": 2},
+        {"id": listing_id},
+        {"forSaleItemID": listing_id},
+    ]
+    referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
+    if country:
+        referer = with_country_geo(referer, country)
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Accept-Language": _accept_language(country),
+        "Origin": "https://www.facebook.com",
+        "Referer": referer,
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    async with _session_for_proxy(proxy_url) as session:
+        for variables in variable_sets:
+            body: dict[str, str] = {
+                "doc_id": doc_id,
+                "variables": json.dumps(variables),
+            }
+            if token.access_token:
+                body["access_token"] = token.access_token
+            try:
+                async with session.post(
+                    "https://www.facebook.com/api/graphql/",
+                    headers=headers,
+                    data=body,
+                    timeout=timeout,
+                ) as resp:
+                    raw = await resp.text(errors="ignore")
+                    if resp.status >= 400:
+                        continue
+                    data = json.loads(raw)
+            except Exception as e:
+                logger.debug("item graphql %s: %s", listing_id, e)
+                continue
+            patch = _seller_patch_from_graphql_payload(data, listing_id)
+            if patch.get("seller_id") or patch.get("person_link"):
+                logger.info("item graphql ok %s profile=%s", listing_id, patch.get("seller_id", "")[:12])
+                return patch
+    return {}
+
+
 def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
     """Сводная карта listing_id → seller с целой страницы ленты."""
     if not html:
         return {}
     out: dict[str, dict[str, str]] = {}
+    for lid, ent in _proximity_listing_sellers(html).items():
+        out[lid] = dict(ent)
     for raw in _SCRIPT_JSON_RE.findall(html):
         try:
             _index_sellers_from_relay_json(json.loads(raw), out)
@@ -1713,19 +1900,41 @@ async def enrich_listing(
     country: str | None = None,
 ) -> MarketplaceListing:
     """Догружает цену, описание, продавца с карточки объявления."""
+    from services.seller_blacklist import _profile_id
+
     lid = item.listing_id
+    feed_hint = _category_feed_html.get() or ""
+    apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
+    if _profile_id(item):
+        return item
+
+    gql_patch = await _enrich_via_graphql_item(
+        token,
+        lid,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=timeout_sec,
+        country=country,
+        hint_html=feed_hint,
+    )
+    if gql_patch:
+        _merge_listing(item, gql_patch)
+        if _profile_id(item):
+            return item
+
     locale_q = ""
     if country == "fi":
         locale_q = "?locale=fi_FI"
     elif country == "ch":
         locale_q = "?locale=de_CH"
     urls = [
+        f"https://mbasic.facebook.com/marketplace/item/{lid}/",
         f"https://www.facebook.com/marketplace/item/{lid}{locale_q}",
         f"https://m.facebook.com/marketplace/item/{lid}/",
     ]
     if item.link:
         clean = item.link.split("?")[0].rstrip("/")
-        urls.insert(0, f"{clean}{locale_q}")
+        urls.insert(1, f"{clean}{locale_q}")
     referer = "https://www.facebook.com/marketplace/"
     if country and country in COUNTRY_LOCATIONS:
         slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
@@ -1751,6 +1960,7 @@ async def enrich_listing(
             continue
         if _looks_like_login_wall(html):
             raise AccountTokenDeadError("login wall on item page")
+        _extract_item_doc_id(html)
         _merge_item_from_html(item, html)
         sp = _patch_seller_from_item_page(html, lid)
         if sp:
@@ -1759,14 +1969,30 @@ async def enrich_listing(
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
                 item.seller_name = nm
-        from services.seller_blacklist import _profile_id
-
         if _profile_id(item):
             return item
-    from services.seller_blacklist import _profile_id
+        gql_patch = await _enrich_via_graphql_item(
+            token,
+            lid,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            country=country,
+            hint_html=html,
+        )
+        if gql_patch:
+            _merge_listing(item, gql_patch)
+            if _profile_id(item):
+                return item
 
     if not _profile_id(item):
-        logger.info("enrich %s: no person_link (VOID needs profile/ID)", lid)
+        prof_n = feed_hint.count("/marketplace/profile/") if feed_hint else 0
+        logger.info(
+            "enrich %s: no person_link (feed profiles=%s, token_graphql=%s)",
+            lid,
+            prof_n,
+            bool(token.access_token),
+        )
     return item
 
 
