@@ -939,7 +939,9 @@ async def fetch_category_listings(
                 page_html = meta.get("raw_html")
                 if page_html:
                     html_s = str(page_html)
+                    seller_index = build_feed_seller_index(html_s)
                     for it in page_new:
+                        apply_feed_seller_index(it, seller_index)
                         sp = _patch_seller_from_html(html_s, it.listing_id)
                         if sp:
                             _merge_listing(it, sp)
@@ -1119,6 +1121,190 @@ def _deep_seller_patch(obj: Any, listing_id: str, out: dict[str, Any]) -> bool:
             if _deep_seller_patch(val, listing_id, out):
                 return True
     return False
+
+
+def _index_sellers_from_relay_json(obj: Any, out: dict[str, dict[str, str]]) -> None:
+    """Все listing id + seller из больших Relay/Comet JSON на странице ленты."""
+    if isinstance(obj, dict):
+        lid = ""
+        title = _dig_str(
+            obj,
+            "marketplace_listing_title",
+            "group_commerce_item_title",
+            "title",
+        )
+        for key in ("id", "listing_id", "legacy_listing_id"):
+            val = str(obj.get(key) or "").strip()
+            if val.isdigit() and len(val) >= _MIN_LISTING_ID_LEN and title:
+                lid = val
+                break
+        if lid:
+            patch: dict[str, str] = {}
+            for sk in _SELLER_BLOB_KEYS:
+                blob = obj.get(sk)
+                if isinstance(blob, dict):
+                    tmp: dict[str, Any] = {}
+                    if _apply_seller_blob(blob, lid, tmp):
+                        for k in ("seller_id", "seller_name", "person_link"):
+                            if tmp.get(k):
+                                patch[k] = str(tmp[k])
+            if patch:
+                prev = out.get(lid, {})
+                prev.update(patch)
+                out[lid] = prev
+        for val in obj.values():
+            _index_sellers_from_relay_json(val, out)
+    elif isinstance(obj, list):
+        for val in obj:
+            _index_sellers_from_relay_json(val, out)
+
+
+_ITEM_NEAR_PROFILE_RE = (
+    re.compile(
+        rf"/marketplace/item/(?P<lid>\d{{{_MIN_LISTING_ID_LEN},}})"
+        rf"[\s\S]{{0,55000}}?"
+        rf"/marketplace/profile/(?P<pid>\d{{8,}})",
+        re.I,
+    ),
+    re.compile(
+        rf"/marketplace/profile/(?P<pid>\d{{8,}})"
+        rf"[\s\S]{{0,55000}}?"
+        rf"/marketplace/item/(?P<lid>\d{{{_MIN_LISTING_ID_LEN},}})",
+        re.I,
+    ),
+)
+
+
+def _seller_name_for_profile_in_html(html: str, profile_id: str) -> str:
+    for pat in (
+        re.compile(
+            rf'"/marketplace/profile/{re.escape(profile_id)}"'
+            rf'[\s\S]{{0,8000}}?"name"\s*:\s*"((?:\\.|[^"\\])*)"',
+            re.I,
+        ),
+        re.compile(
+            rf"/marketplace/profile/{re.escape(profile_id)}[^>]*>([^<]{{2,80}})<",
+            re.I,
+        ),
+        re.compile(
+            rf'aria-label="(?:View|Näytä|Voir|See)\s+([^"]{{2,80}})"'
+            rf'[\s\S]{{0,3000}}?/marketplace/profile/{re.escape(profile_id)}',
+            re.I,
+        ),
+    ):
+        m = pat.search(html)
+        if m:
+            name = _unescape(m.group(1)).strip()
+            if len(name) >= 2 and not name.startswith("Listing "):
+                return name
+    return ""
+
+
+def _index_sellers_from_dom(html: str) -> dict[str, dict[str, str]]:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return {}
+    soup = BeautifulSoup(html, "html.parser")
+    out: dict[str, dict[str, str]] = {}
+    for item_a in soup.select('a[href*="/marketplace/item/"]'):
+        href = item_a.get("href") or ""
+        m = _LISTING_ID_RE.search(href)
+        if not m:
+            continue
+        lid = m.group(1)
+        if len(lid) < _MIN_LISTING_ID_LEN:
+            continue
+        node = item_a.parent
+        for _ in range(12):
+            if not node:
+                break
+            prof = node.select_one('a[href*="/marketplace/profile/"]') if hasattr(
+                node, "select_one"
+            ) else None
+            if prof:
+                href2 = prof.get("href") or ""
+                m2 = _PROFILE_LINK_RE.search(href2)
+                if m2:
+                    pid = m2.group(1)
+                    if pid != lid:
+                        name = (prof.get_text(strip=True) or "")[:80]
+                        out[lid] = {
+                            "seller_id": pid,
+                            "person_link": (
+                                f"https://www.facebook.com/marketplace/profile/{pid}/"
+                            ),
+                            "seller_name": name,
+                        }
+                break
+            node = getattr(node, "parent", None)
+    return out
+
+
+def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
+    """Сводная карта listing_id → seller с целой страницы ленты."""
+    if not html:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for raw in _SCRIPT_JSON_RE.findall(html):
+        try:
+            _index_sellers_from_relay_json(json.loads(raw), out)
+        except json.JSONDecodeError:
+            continue
+    for pat in _ITEM_NEAR_PROFILE_RE:
+        for m in pat.finditer(html):
+            lid, pid = m.group("lid"), m.group("pid")
+            if pid == lid:
+                continue
+            ent = out.setdefault(lid, {})
+            ent.setdefault("seller_id", pid)
+            ent.setdefault(
+                "person_link",
+                f"https://www.facebook.com/marketplace/profile/{pid}/",
+            )
+    for lid, ent in list(out.items()):
+        pid = ent.get("seller_id", "")
+        if pid and not ent.get("seller_name"):
+            nm = _seller_name_for_profile_in_html(html, pid)
+            if nm:
+                ent["seller_name"] = nm
+    for lid, ent in _index_sellers_from_dom(html).items():
+        prev = out.setdefault(lid, {})
+        for k, v in ent.items():
+            if v and not prev.get(k):
+                prev[k] = v
+    return out
+
+
+def apply_feed_seller_index(item: MarketplaceListing, index: dict[str, dict[str, str]]) -> None:
+    patch = index.get(item.listing_id)
+    if patch:
+        _merge_listing(item, patch)
+
+
+def ensure_listing_seller(
+    item: MarketplaceListing,
+    country: str | None = None,
+    *,
+    max_age_hours: float | None = None,
+) -> bool:
+    """
+    Последняя попытка: если есть цена+фото+заголовок — пускаем в JSON
+    (уникальный ключ по listing_id, чтобы не терять ленту целиком).
+    """
+    from services.seller_blacklist import canonical_seller_key, listing_has_known_seller
+
+    if listing_has_known_seller(item):
+        return True
+    if export_reject_reason(item, country, max_age_hours=max_age_hours) is not None:
+        return False
+    price = (item.price or "").strip()
+    photo = (item.photo or "").strip()
+    title = (item.title or "").strip()
+    if not (price and photo and title):
+        return False
+    item.seller_name = (item.seller_name or "").strip() or f"mp-{item.listing_id[-10:]}"
+    return bool(canonical_seller_key(item))
 
 
 def _seller_name_near_listing_in_html(html: str, listing_id: str) -> str:
@@ -1503,6 +1689,9 @@ async def enrich_listing(
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
                 item.seller_name = nm
+        idx = build_feed_seller_index(html)
+        apply_feed_seller_index(item, idx)
+        ensure_listing_seller(item, country)
         if item.seller_id or item.person_link or (item.seller_name or "").strip():
             return item
     if not (item.seller_id or item.person_link or (item.seller_name or "").strip()):
@@ -1690,6 +1879,7 @@ async def _fetch_page(
 
 def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
     by_id: dict[str, MarketplaceListing] = _parse_embedded_scripts(html)
+    seller_index = build_feed_seller_index(html)
 
     ids_in_order = _collect_listing_ids(html)
     titles = _first_group(list(_TITLE_RE.finditer(html)))
@@ -1734,6 +1924,11 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
         seller_patch = _patch_seller_from_html(html, lid)
         if seller_patch:
             _merge_listing(by_id[lid], seller_patch)
+        apply_feed_seller_index(by_id[lid], seller_index)
+        if not (by_id[lid].seller_name or "").strip():
+            nm = _seller_name_near_listing_in_html(html, lid)
+            if nm:
+                by_id[lid].seller_name = nm
         by_id[lid].category = category_label
 
     out: list[MarketplaceListing] = []

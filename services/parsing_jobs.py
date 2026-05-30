@@ -27,6 +27,7 @@ from parser.account_token import (
 )
 from parser.marketplace import (
     enrich_listing,
+    ensure_listing_seller,
     export_reject_reason,
     normalize_listing_for_export,
     fetch_category_listings,
@@ -74,7 +75,7 @@ _REJECT_LABELS: dict[str, str] = {
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
     "нет_данных": "Нет продавца/описания",
-    "нет_продавца": "Нет имени в HTML",
+    "нет_продавца": "Нет продавца (даже запасной)",
 }
 
 
@@ -541,6 +542,10 @@ async def _parse_impl(
                 ):
                     _record_reject(stats, "повторный_продавец")
                     return False
+                if not listing_has_known_seller(item):
+                    ensure_listing_seller(
+                        item, country, max_age_hours=max_age_hours
+                    )
                 if not listing_has_known_seller(item):
                     _record_reject(stats, "нет_продавца")
                     return False
