@@ -80,11 +80,11 @@ class UserCategory(Base):
 
 
 class BlockedSeller(Base):
-    """Личный ЧС по стране: CH и FI — разные списки (разные ленты)."""
+    """Личный ЧС: свой у каждого user_id в БД; один seller_key — одна запись."""
 
     __tablename__ = "blocked_sellers"
     __table_args__ = (
-        UniqueConstraint("user_id", "seller_key", "country", name="uq_user_seller_country"),
+        UniqueConstraint("user_id", "seller_key", name="uq_user_seller"),
     )
 
     id = Column(Integer, primary_key=True)

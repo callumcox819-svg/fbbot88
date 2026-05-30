@@ -13,6 +13,7 @@ from keyboards.settings_kb import (
 )
 from models import User
 from services import proxies as proxy_svc
+from services.seller_blacklist import clear_blocked_sellers, count_blocked_sellers
 from utils.telegram_edit import edit_text_keep_markup
 
 router = Router()
@@ -205,6 +206,51 @@ async def _show_proxies_menu(message: Message, user_id: int) -> None:
         _proxy_menu_text(rows),
         parse_mode="HTML",
         reply_markup=_proxy_menu_kb(rows),
+    )
+
+
+def _chs_menu_text(count: int) -> str:
+    return (
+        f"🚫 <b>Чёрный список продавцов</b>\n\n"
+        f"Записей в БД (только ваш аккаунт): <b>{count}</b>\n\n"
+        "Сюда <b>не</b> попадают продавцы с парсинга автоматически.\n"
+        "В JSON за один прогон — одно объявление на продавца.\n\n"
+        "Очистить — удалить весь ваш ЧС."
+    )
+
+
+def _chs_menu_kb(count: int) -> InlineKeyboardMarkup:
+    row2 = []
+    if count:
+        row2.append(
+            InlineKeyboardButton(text="🗑 Очистить ЧС", callback_data="set:chs:clear")
+        )
+    row2.append(InlineKeyboardButton(text="◀️ Назад", callback_data="set:back"))
+    return InlineKeyboardMarkup(inline_keyboard=[row2])
+
+
+@router.callback_query(F.data == "set:chs")
+async def chs_menu(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    await state.clear()
+    await callback.answer()
+    async with Session() as session:
+        count = await count_blocked_sellers(session, db_user.id)
+    await callback.message.edit_text(
+        _chs_menu_text(count),
+        parse_mode="HTML",
+        reply_markup=_chs_menu_kb(count),
+    )
+
+
+@router.callback_query(F.data == "set:chs:clear")
+async def chs_clear(callback: CallbackQuery, db_user: User) -> None:
+    async with Session() as session:
+        n = await clear_blocked_sellers(session, db_user.id)
+    await callback.answer(f"Удалено: {n}")
+    await callback.message.edit_text(
+        _chs_menu_text(0),
+        parse_mode="HTML",
+        reply_markup=_chs_menu_kb(0),
     )
 
 

@@ -1,10 +1,10 @@
-"""Личный ЧС продавцов (только вручную добавленные в настройках бота)."""
+"""Личный ЧС: у каждого user_id свой список в БД (ручное добавление / очистка)."""
 
 from __future__ import annotations
 
 import re
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import BlockedSeller
@@ -31,7 +31,6 @@ def _profile_id(item) -> str:
 
 
 def canonical_seller_key(item) -> str:
-    """Ключ продавца: ID профиля или имя (как раньше, если ID нет в ленте)."""
     pid = _profile_id(item)
     if pid:
         return f"id:{pid}"
@@ -42,7 +41,6 @@ def canonical_seller_key(item) -> str:
 
 
 def seller_keys_for_item(item) -> frozenset[str]:
-    """Все ключи для проверки ЧС (id + имя — чтобы не пускать дубли при смене ключа)."""
     keys: set[str] = set()
     ck = canonical_seller_key(item)
     if ck:
@@ -62,7 +60,6 @@ def listing_has_known_seller(item) -> bool:
 
 
 def primary_seller_key(item) -> str:
-    """Для дедупа JSON: id приоритетнее имени."""
     pid = _profile_id(item)
     if pid:
         return f"id:{pid}"
@@ -76,7 +73,6 @@ def is_seller_blocked(item, blocked: set[str]) -> bool:
 
 
 def normalize_seller_identity(item) -> None:
-    """Единый person_link для софта (VOID и др. матчат по профилю)."""
     sid = (getattr(item, "seller_id", None) or "").strip()
     if sid.isdigit() and len(sid) >= 8:
         link = f"https://www.facebook.com/marketplace/profile/{sid}/"
@@ -94,24 +90,16 @@ def normalize_seller_identity(item) -> None:
         item.person_link = link
 
 
-def dedupe_listings_by_seller(items: list) -> list:
-    """Последняя линия защиты перед JSON: 1 продавец = 1 карточка."""
-    seen: set[str] = set()
-    out: list = []
-    for item in items:
-        ck = primary_seller_key(item)
-        if not ck or ck in seen:
-            continue
-        seen.add(ck)
-        out.append(item)
-    return out
+async def count_blocked_sellers(session: AsyncSession, user_id: int) -> int:
+    res = await session.execute(
+        select(func.count(BlockedSeller.id)).where(BlockedSeller.user_id == user_id)
+    )
+    return int(res.scalar() or 0)
 
 
 async def clear_blocked_sellers(
     session: AsyncSession, user_id: int, *, country: str | None = None
 ) -> int:
-    from sqlalchemy import delete
-
     q = delete(BlockedSeller).where(BlockedSeller.user_id == user_id)
     if country:
         q = q.where(BlockedSeller.country == country)
@@ -121,12 +109,12 @@ async def clear_blocked_sellers(
 
 
 async def load_blocked_seller_keys(
-    session: AsyncSession, user_id: int, country: str
+    session: AsyncSession, user_id: int, country: str | None = None
 ) -> set[str]:
+    """Все ключи ЧС пользователя (личный список, не зависит от текущей страны парса)."""
     res = await session.execute(
         select(BlockedSeller.seller_key, BlockedSeller.seller_name).where(
             BlockedSeller.user_id == user_id,
-            BlockedSeller.country == country,
         )
     )
     keys: set[str] = set()
@@ -139,33 +127,33 @@ async def load_blocked_seller_keys(
     return keys
 
 
-async def remember_seller(
-    session: AsyncSession, user_id: int, country: str, item
-) -> None:
+async def add_blocked_seller(
+    session: AsyncSession,
+    user_id: int,
+    country: str,
+    item,
+) -> bool:
+    """Добавить продавца в ЧС (один ключ — одна строка, дубли не плодим)."""
     item_keys = seller_keys_for_item(item)
     if not item_keys or not country:
-        return
+        return False
     name = (getattr(item, "seller_name", None) or "").strip() or None
+    primary = canonical_seller_key(item) or next(iter(item_keys))
     existing = await session.execute(
-        select(BlockedSeller.seller_key).where(
+        select(BlockedSeller.id).where(
             BlockedSeller.user_id == user_id,
-            BlockedSeller.country == country,
-            BlockedSeller.seller_key.in_(item_keys),
+            BlockedSeller.seller_key == primary,
         )
     )
-    have = {row[0] for row in existing.fetchall()}
-    added = False
-    for key in item_keys:
-        if key in have:
-            continue
-        session.add(
-            BlockedSeller(
-                user_id=user_id,
-                country=country,
-                seller_key=key,
-                seller_name=name,
-            )
+    if existing.scalar_one_or_none():
+        return False
+    session.add(
+        BlockedSeller(
+            user_id=user_id,
+            country=country,
+            seller_key=primary,
+            seller_name=name,
         )
-        added = True
-    if added:
-        await session.commit()
+    )
+    await session.commit()
+    return True

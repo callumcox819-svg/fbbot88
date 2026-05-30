@@ -58,3 +58,25 @@ async def init_db() -> None:
         await _sqlite_add_column_if_missing(
             conn, "blocked_sellers", "country", "country TEXT DEFAULT 'ch'"
         )
+        await conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS _app_meta "
+                "(key TEXT PRIMARY KEY, value TEXT)"
+            )
+        )
+        purged = await conn.execute(
+            text("SELECT value FROM _app_meta WHERE key = 'blocked_sellers_purge_v2'")
+        )
+        if purged.scalar() is None:
+            await conn.execute(text("DELETE FROM blocked_sellers"))
+            await conn.execute(
+                text(
+                    "INSERT INTO _app_meta (key, value) "
+                    "VALUES ('blocked_sellers_purge_v2', '1')"
+                )
+            )
+        if engine.dialect.name == "sqlite":
+            res = await conn.execute(text("PRAGMA user_version"))
+            ver = int(res.scalar() or 0)
+            if ver < 2:
+                await conn.execute(text("PRAGMA user_version = 2"))

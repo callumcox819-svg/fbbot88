@@ -42,6 +42,7 @@ from services.seller_blacklist import (
     is_seller_blocked,
     load_blocked_seller_keys,
     normalize_seller_identity,
+    seller_keys_for_item,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ async def _sleep_human(base_sec: float) -> None:
 
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "В вашем ЧС",
+    "дубль_продавца": "Уже в JSON (тот же продавец)",
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
@@ -409,7 +411,7 @@ async def _parse_impl(
         run_id = run.id
 
     collected: list = []
-    manual_blocked: set[str] = set()
+    session_seller_keys: set[str] = set()
     async with Session() as session:
         manual_blocked = await load_blocked_seller_keys(session, user_id, country)
     active_cats: list = list(categories)
@@ -525,6 +527,10 @@ async def _parse_impl(
                 if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False
+                sk = seller_keys_for_item(item)
+                if sk and sk & session_seller_keys:
+                    _record_reject(stats, "дубль_продавца")
+                    return False
                 reason = void_export_reject_reason(
                     item, country, max_age_hours=max_age_hours
                 )
@@ -533,6 +539,7 @@ async def _parse_impl(
                     return False
                 normalize_listing_for_export(item, country)
                 collected.append(item)
+                session_seller_keys.update(sk)
                 return True
 
             async def _process_listing(item) -> tuple[bool, bool]:
@@ -546,6 +553,10 @@ async def _parse_impl(
                     processed_in_cat.add(item.listing_id)
                 if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
+                    return False, True
+                sk = seller_keys_for_item(item)
+                if sk and sk & session_seller_keys:
+                    _record_reject(stats, "дубль_продавца")
                     return False, True
                 reason = export_reject_reason(
                     item, country, max_age_hours=max_age_hours
@@ -609,7 +620,7 @@ async def _parse_impl(
                     else:
                         page_skip += 1
                         last = stats.get("last_reject")
-                        if last == "повторный_продавец":
+                        if last in ("повторный_продавец", "дубль_продавца"):
                             page_skip_dup += 1
                         if last and last != "повторный_продавец":
                             current_step["detail"] = (

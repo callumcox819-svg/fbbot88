@@ -9,6 +9,7 @@ def settings_menu_kb_with_country(country: str | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Прокси", callback_data="set:proxies")],
+            [InlineKeyboardButton(text="🚫 Чёрный список продавцов", callback_data="set:chs")],
             [InlineKeyboardButton(text="📦 Кол-во объявлений (JSON)", callback_data="set:json_limit")],
             [
                 InlineKeyboardButton(text=country_btn_label("ch", ch_on), callback_data="set:country:ch"),
