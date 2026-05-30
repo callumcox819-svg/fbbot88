@@ -50,7 +50,8 @@ from services.seller_blacklist import (
 
 logger = logging.getLogger(__name__)
 
-_HARD_FEED_REJECT = frozenset({"чужая_страна", "старше_24ч", "нет_заголовка"})
+# В ленте «чужая страна» часто ложная (кривой location в HTML) — проверяем после карточки
+_HARD_FEED_REJECT = frozenset({"старше_24ч", "нет_заголовка"})
 
 
 async def _sleep_human(base_sec: float) -> None:
@@ -314,10 +315,22 @@ async def _finalize_parse_run(
         if token_dead:
             await _notify_token_dead(bot, telegram_id, on_status)
         elif on_status:
-            await on_status(
-                "⚠️ <b>В JSON: 0 объявлений</b>\n\n"
-                "Проверь токен, прокси страны (CH/FI) и 🇨🇭/🇫🇮 в настройках."
+            lines = [
+                "⚠️ <b>В JSON: 0 объявлений</b>",
+                "",
+                f"Найдено в ленте: <b>{stats.get('found', 0)}</b> · "
+                f"Отсеяно: <b>{stats.get('rejected', 0)}</b>",
+            ]
+            reasons = stats.get("reject_reasons") or {}
+            if reasons:
+                lines.append("<b>Почему не попали в JSON:</b>")
+                for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
+                    label = _REJECT_LABELS.get(key, key)
+                    lines.append(f"→ {label}: <b>{count}</b>")
+            lines.append(
+                "\n<i>Часто: нет ID продавца на карточке, ЧС, старше 24 ч, чужая страна после проверки.</i>"
             )
+            await on_status("\n".join(lines))
         return
 
     if token_dead:
@@ -511,11 +524,17 @@ async def _parse_impl(
                 ):
                     _record_reject(stats, "повторный_продавец")
                     return False
+                if not listing_has_known_seller(item):
+                    _record_reject(stats, "нет_продавца")
+                    return False
                 reason = export_reject_reason(
                     item, country, max_age_hours=max_age_hours
                 )
                 if reason:
                     _record_reject(stats, reason)
+                    return False
+                if country and listing_is_wrong_country(item, country):
+                    _record_reject(stats, "чужая_страна")
                     return False
                 for sk in seller_keys_for_item(item):
                     session_sellers.add(sk)
@@ -532,6 +551,7 @@ async def _parse_impl(
                 page_raw = len(page_items)
                 page_acc = 0
                 page_skip = 0
+                page_skip_dup = 0
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
@@ -543,6 +563,7 @@ async def _parse_impl(
                     if is_seller_blocked(item, blocked):
                         _record_reject(stats, "повторный_продавец")
                         page_skip += 1
+                        page_skip_dup += 1
                         continue
                     reason = export_reject_reason(
                         item, country, max_age_hours=max_age_hours
@@ -563,17 +584,6 @@ async def _parse_impl(
                             await _sleep_human(config.parse_item_delay_sec)
                         else:
                             page_skip += 1
-                        continue
-                    if not listing_has_known_seller(item):
-                        _record_reject(stats, "нет_продавца")
-                        page_skip += 1
-                        continue
-                    pre = export_reject_reason(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if pre and pre != "мало_полей":
-                        _record_reject(stats, pre)
-                        page_skip += 1
                         continue
                     if not stop.is_set():
                         try:
@@ -600,15 +610,15 @@ async def _parse_impl(
                     else:
                         page_skip += 1
 
-                if page_raw >= 5 and page_acc == 0:
-                    ratio = page_skip / page_raw
-                    if ratio >= config.feed_dup_stop_ratio:
-                        stop_cat_pages["value"] = True
-                        logger.info(
-                            "stop pages %s: %.0f%% skip (VOID-style)",
-                            cat.label,
-                            ratio * 100,
-                        )
+                if page_raw >= 8 and page_acc == 0 and page_skip_dup >= int(
+                    page_raw * config.feed_dup_stop_ratio
+                ):
+                    stop_cat_pages["value"] = True
+                    logger.info(
+                        "stop pages %s: %.0f%% dup sellers (VOID-style)",
+                        cat.label,
+                        100 * page_skip_dup / page_raw,
+                    )
 
             def should_stop() -> bool:
                 return stop.is_set() or len(collected) >= json_limit

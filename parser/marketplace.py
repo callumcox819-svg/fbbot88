@@ -423,20 +423,22 @@ def _location_matches_country(location: str, country: str) -> bool:
 
 
 def listing_is_wrong_country(item: MarketplaceListing, country: str | None) -> bool:
-    """UA/CH/FI: не та страна в локации или заголовке."""
+    """UA/CH/FI: режем явно чужую страну. Пустая локация в ленте — не режем по заголовку."""
     if not country:
         return False
     if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
         return True
-    title = (item.title or "").lower()
-    if country == "fi" and any(x in title for x in _FI_TITLE_REJECT):
-        return True
-    if country == "ch" and any(x in title for x in _CH_TITLE_REJECT):
-        return True
     loc = (item.location or "").strip()
-    if loc and not _location_matches_country(loc, country):
-        return True
-    return _location_explicitly_foreign(loc, country)
+    title = (item.title or "").lower()
+    if loc:
+        if country == "fi" and any(x in title for x in _FI_TITLE_REJECT):
+            return True
+        if country == "ch" and any(x in title for x in _CH_TITLE_REJECT):
+            return True
+        if not _location_matches_country(loc, country):
+            return True
+        return _location_explicitly_foreign(loc, country)
+    return False
 
 
 def listing_is_valid(item: MarketplaceListing) -> bool:
