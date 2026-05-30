@@ -40,7 +40,23 @@ _PRICE_RE = re.compile(
 _SELLER_RE = re.compile(
     r'"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"|'
     r'"marketplace_listing_seller"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
-    r'"seller"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"'
+    r'"seller"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"marketplace_listing_owner"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"listing_creator"\s*:\s*\{[^}]{0,400}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"owner"\s*:\s*\{[^}]{0,600}?"name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"short_name"\s*:\s*"((?:\\.|[^"\\])*)"|'
+    r'"display_name"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
+_SELLER_BLOB_KEYS = (
+    "marketplace_listing_seller",
+    "seller",
+    "marketplace_listing_owner",
+    "listing_creator",
+    "owner",
+    "actor",
+    "marketplace_user",
+    "profile",
+    "listing_seller",
 )
 _PHOTO_RE = re.compile(r'"uri"\s*:\s*"(https://[^"]*scontent[^"]*)"')
 _LOCATION_RE = re.compile(r'"city"\s*:\s*"([^"]+)"|"location_text"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"')
@@ -922,10 +938,15 @@ async def fetch_category_listings(
 
                 page_html = meta.get("raw_html")
                 if page_html:
+                    html_s = str(page_html)
                     for it in page_new:
-                        sp = _patch_seller_from_html(str(page_html), it.listing_id)
+                        sp = _patch_seller_from_html(html_s, it.listing_id)
                         if sp:
                             _merge_listing(it, sp)
+                        if not (it.seller_name or "").strip():
+                            nm = _seller_name_near_listing_in_html(html_s, it.listing_id)
+                            if nm:
+                                it.seller_name = nm
 
                 if on_page_found and page_new:
                     await on_page_found(len(page_new))
@@ -1056,28 +1077,39 @@ def _looks_like_login_wall(html: str) -> bool:
     return False
 
 
+def _seller_name_from_blob(blob: dict[str, Any]) -> str:
+    name = _dig_str(
+        blob,
+        "name",
+        "marketplace_listing_seller_name",
+        "short_name",
+        "display_name",
+    )
+    if not name or name.startswith("Listing "):
+        return ""
+    return name
+
+
+def _apply_seller_blob(blob: dict[str, Any], listing_id: str, out: dict[str, Any]) -> bool:
+    """Имя продавца достаточно; ID — бонус для person_link."""
+    name = _seller_name_from_blob(blob)
+    if name:
+        out["seller_name"] = name
+    sid = str(blob.get("id") or "").strip()
+    if sid.isdigit() and sid != listing_id:
+        out["seller_id"] = sid
+        out["person_link"] = f"https://www.facebook.com/marketplace/profile/{sid}/"
+    return bool(out.get("seller_name") or out.get("seller_id"))
+
+
 def _deep_seller_patch(obj: Any, listing_id: str, out: dict[str, Any]) -> bool:
     """Ищем seller в любом вложенном JSON (Comet/GraphQL)."""
     if isinstance(obj, dict):
         node_id = str(obj.get("id") or obj.get("listing_id") or "").strip()
         if node_id == listing_id:
-            for key in (
-                "marketplace_listing_seller",
-                "seller",
-                "owner",
-                "actor",
-                "marketplace_user",
-            ):
+            for key in _SELLER_BLOB_KEYS:
                 blob = obj.get(key)
-                if not isinstance(blob, dict):
-                    continue
-                sid = str(blob.get("id") or "").strip()
-                if sid.isdigit() and sid != listing_id:
-                    out["seller_id"] = sid
-                    out["seller_name"] = _dig_str(blob, "name") or out.get("seller_name", "")
-                    out["person_link"] = (
-                        f"https://www.facebook.com/marketplace/profile/{sid}/"
-                    )
+                if isinstance(blob, dict) and _apply_seller_blob(blob, listing_id, out):
                     return True
         for val in obj.values():
             if _deep_seller_patch(val, listing_id, out):
@@ -1087,6 +1119,33 @@ def _deep_seller_patch(obj: Any, listing_id: str, out: dict[str, Any]) -> bool:
             if _deep_seller_patch(val, listing_id, out):
                 return True
     return False
+
+
+def _seller_name_near_listing_in_html(html: str, listing_id: str) -> str:
+    """Имя из aria-label / JSON в окне вокруг ссылки на объявление."""
+    pos = html.find(f"/marketplace/item/{listing_id}")
+    if pos < 0:
+        return ""
+    chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
+    for pat in (
+        re.compile(
+            r'aria-label="(?:View|Näytä|Voir|Profil von|Profilo di)\s+([^"]{2,80})',
+            re.I,
+        ),
+        re.compile(
+            rf'"{listing_id}"[\s\S]{{0,12000}}?"marketplace_listing_seller_name"\s*:\s*"((?:\\.|[^"\\])*)"',
+            re.I,
+        ),
+        re.compile(
+            rf'"{listing_id}"[\s\S]{{0,12000}}?"name"\s*:\s*"((?:\\.|[^"\\])*)"',
+        ),
+    ):
+        m = pat.search(chunk)
+        if m:
+            name = _unescape(m.group(1)).strip()
+            if len(name) >= 2 and not name.startswith("Listing "):
+                return name
+    return ""
 
 
 def _patch_seller_from_html(html: str, listing_id: str) -> dict[str, Any]:
@@ -1126,19 +1185,15 @@ def _patch_seller_from_html(html: str, listing_id: str) -> dict[str, Any]:
     if pos >= 0:
         chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
         patch = _parse_chunk(chunk, listing_id)
-        if patch.get("seller_id") or patch.get("person_link"):
+        if patch.get("seller_id") or patch.get("person_link") or patch.get("seller_name"):
             return {
                 k: patch[k]
                 for k in ("seller_id", "person_link", "seller_name")
                 if patch.get(k)
             }
-    m = _SELLER_ID_ALT_RE.search(html)
-    if m:
-        sid = m.group(1)
-        return {
-            "seller_id": sid,
-            "person_link": f"https://www.facebook.com/marketplace/profile/{sid}/",
-        }
+    name = _seller_name_near_listing_in_html(html, listing_id)
+    if name:
+        return {"seller_name": name}
     return {}
 
 
@@ -1222,20 +1277,17 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
                 break
 
     location = _dig_str(fs, "marketplace_listing_location", "location")
-    seller = fs.get("marketplace_listing_seller") or fs.get("seller")
     seller_name = ""
     seller_id = ""
-    if isinstance(seller, dict):
-        seller_name = _dig_str(seller, "name", "marketplace_listing_seller_name")
-        seller_id = str(seller.get("id") or "").strip()
-    if not seller_id:
-        for key in ("owner", "actor", "marketplace_user", "profile"):
-            blob = fs.get(key) or node.get(key)
-            if isinstance(blob, dict):
-                seller_id = str(blob.get("id") or "").strip()
-                if seller_id:
-                    seller_name = seller_name or _dig_str(blob, "name")
-                    break
+    for key in _SELLER_BLOB_KEYS:
+        blob = fs.get(key) or node.get(key)
+        if not isinstance(blob, dict):
+            continue
+        seller_name = seller_name or _seller_name_from_blob(blob)
+        sid = str(blob.get("id") or "").strip()
+        if sid.isdigit() and sid != lid:
+            seller_id = sid
+            break
 
     photo = ""
     photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
@@ -1447,6 +1499,10 @@ async def enrich_listing(
         if _looks_like_login_wall(html):
             raise AccountTokenDeadError("login wall on item page")
         _merge_item_from_html(item, html)
+        if not (item.seller_name or "").strip():
+            nm = _seller_name_near_listing_in_html(html, lid)
+            if nm:
+                item.seller_name = nm
         if item.seller_id or item.person_link or (item.seller_name or "").strip():
             return item
     if not (item.seller_id or item.person_link or (item.seller_name or "").strip()):
@@ -1623,7 +1679,12 @@ async def _fetch_page(
     next_cursor, has_next = _extract_cursor_from_html(html)
     effective_doc = feed_doc or doc_from_html
     if not next_cursor and items:
-        has_next = len(items) >= 12 and bool(effective_doc)
+        has_next = len(items) >= 8 and bool(effective_doc)
+    if items and not has_next and not next_cursor and not doc_from_html:
+        logger.warning(
+            "feed %s items, no cursor/doc_id — only 1 HTML page; set FB_MARKETPLACE_DOC_ID",
+            len(items),
+        )
     return items, meta, next_cursor, has_next
 
 
@@ -1643,6 +1704,14 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
             continue
         chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
         patch = _parse_chunk(chunk, lid)
+        embedded = by_id.get(lid)
+        if embedded:
+            if not patch.get("seller_id") and embedded.seller_id:
+                patch["seller_id"] = embedded.seller_id
+            if not patch.get("seller_name") and embedded.seller_name:
+                patch["seller_name"] = embedded.seller_name
+            if not patch.get("person_link") and embedded.person_link:
+                patch["person_link"] = embedded.person_link
         if not patch.get("title"):
             patch["title"] = titles[idx] if idx < len(titles) else ""
         if not patch.get("price"):

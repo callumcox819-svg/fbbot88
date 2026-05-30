@@ -74,7 +74,7 @@ _REJECT_LABELS: dict[str, str] = {
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
     "нет_данных": "Нет продавца/описания",
-    "нет_продавца": "Нет ID продавца",
+    "нет_продавца": "Нет имени в HTML",
 }
 
 
@@ -177,6 +177,7 @@ async def start_parsing(
         task=task,
         stats={
             "pages": 0,
+            "feed_cards": 0,
             "found": 0,
             "checked": 0,
             "rejected": 0,
@@ -203,8 +204,10 @@ def _progress_text(
         f"Частичный JSON всегда. ⏹ Стоп — сразу файл.</i>",
     ]
     if stats:
+        feed_n = stats.get("feed_cards", stats.get("found", 0))
+        checked_n = stats.get("checked", 0)
         lines.append(
-            f"📊 Найдено: <b>{stats.get('found', 0)}</b> · "
+            f"📊 В ленте: <b>{feed_n}</b> · Проверено: <b>{checked_n}</b> · "
             f"Отсеяно: <b>{stats.get('rejected', 0)}</b> · "
             f"Страниц: <b>{stats.get('pages', 0)}</b>"
         )
@@ -240,6 +243,11 @@ async def _send_json_file(
         normalize_seller_identity(x)
         normalize_listing_for_export(x, country)
     if not export_items:
+        logger.warning(
+            "export empty: collected=%s after country/dedupe (country=%s)",
+            len(collected),
+            country,
+        )
         return 0
     payload = listings_to_json(export_items)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
@@ -318,7 +326,8 @@ async def _finalize_parse_run(
             lines = [
                 "⚠️ <b>В JSON: 0 объявлений</b>",
                 "",
-                f"Найдено в ленте: <b>{stats.get('found', 0)}</b> · "
+                f"В ленте: <b>{stats.get('feed_cards', stats.get('found', 0))}</b> · "
+                f"Проверено: <b>{stats.get('checked', 0)}</b> · "
                 f"Отсеяно: <b>{stats.get('rejected', 0)}</b>",
             ]
             reasons = stats.get("reject_reasons") or {}
@@ -328,7 +337,7 @@ async def _finalize_parse_run(
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
-                "\n<i>Часто: нет ID продавца на карточке, ЧС, старше 24 ч, чужая страна после проверки.</i>"
+                "\n<i>Часто: имя продавца не вытащилось из HTML, ЧС, старше 24 ч, чужая страна.</i>"
             )
             await on_status("\n".join(lines))
         return
@@ -351,6 +360,11 @@ async def _finalize_parse_run(
         caption=caption,
     )
     lines = [f"📦 Отправлен JSON: <b>{sent}</b> объявлений."]
+    if got > 0 and sent == 0:
+        lines.append(
+            "<i>В памяти были объявления, но в файл не попали "
+            "(чужая страна или дубль продавца при экспорте).</i>"
+        )
     if not full:
         lines.append(
             f"<i>Лимит в настройках {json_limit} — собрано {got}. "
@@ -509,12 +523,15 @@ async def _parse_impl(
 
             async def on_page_found(n: int) -> None:
                 stats["pages"] = stats.get("pages", 0) + 1
-                stats["found"] = stats.get("found", 0) + n
+                stats["feed_cards"] = stats.get("feed_cards", 0) + n
+                stats["found"] = stats["feed_cards"]
                 await status_progress()
 
             cat_added = 0
             page_raw = 0
             stop_cat_pages = {"value": False}
+            accept_lock = asyncio.Lock()
+            seen_lock = asyncio.Lock()
 
             async def _accept_item(item) -> bool:
                 normalize_seller_identity(item)
@@ -546,59 +563,74 @@ async def _parse_impl(
                 collected.append(item)
                 return True
 
+            async def _process_listing(item) -> tuple[bool, bool]:
+                """Возвращает (accepted, dup_skip)."""
+                if stop.is_set() or len(collected) >= json_limit:
+                    return False, False
+                async with seen_lock:
+                    if item.listing_id in seen_ids:
+                        return False, False
+                    stats["checked"] = stats.get("checked", 0) + 1
+                    seen_ids.add(item.listing_id)
+                blocked = blocked_sellers | session_sellers
+                if is_seller_blocked(item, blocked):
+                    _record_reject(stats, "повторный_продавец")
+                    return False, True
+                reason = export_reject_reason(
+                    item, country, max_age_hours=max_age_hours
+                )
+                if reason in _HARD_FEED_REJECT:
+                    _record_reject(stats, reason)
+                    return False, False
+                if _can_add_from_feed_only(item, country, max_age_hours=max_age_hours):
+                    async with accept_lock:
+                        ok = await _accept_item(item)
+                    if ok:
+                        await _sleep_human(config.parse_item_delay_sec)
+                    return ok, False
+                if not stop.is_set():
+                    try:
+                        await enrich_listing(
+                            token,
+                            item,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_used,
+                            timeout_sec=16.0,
+                            country=country,
+                        )
+                    except AccountTokenDeadError:
+                        token_dead_flag["value"] = True
+                        raise
+                async with accept_lock:
+                    ok = await _accept_item(item)
+                if ok:
+                    await _sleep_human(config.parse_item_delay_sec)
+                return ok, False
+
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, page_raw, accepted_seller_ids
                 page_raw = len(page_items)
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0
-                for item in page_items:
+                enrich_sem = asyncio.Semaphore(2)
+
+                async def _run_one(item) -> None:
+                    nonlocal cat_added, page_acc, page_skip, page_skip_dup
                     if stop.is_set() or len(collected) >= json_limit:
                         return
-                    if item.listing_id in seen_ids:
-                        continue
-                    stats["checked"] = stats.get("checked", 0) + 1
-                    seen_ids.add(item.listing_id)
-                    blocked = blocked_sellers | session_sellers
-                    if is_seller_blocked(item, blocked):
-                        _record_reject(stats, "повторный_продавец")
-                        page_skip += 1
-                        page_skip_dup += 1
-                        continue
-                    reason = export_reject_reason(
+                    needs_enrich = not _can_add_from_feed_only(
                         item, country, max_age_hours=max_age_hours
                     )
-                    if reason in _HARD_FEED_REJECT:
-                        _record_reject(stats, reason)
+                    if needs_enrich:
+                        async with enrich_sem:
+                            ok, dup = await _process_listing(item)
+                    else:
+                        ok, dup = await _process_listing(item)
+                    if dup:
                         page_skip += 1
-                        continue
-                    if _can_add_from_feed_only(item, country, max_age_hours=max_age_hours):
-                        if await _accept_item(item):
-                            cat_added += 1
-                            page_acc += 1
-                            current_step["detail"] = (
-                                f"+{cat_added} {cat.label} · "
-                                f"в JSON {len(collected)}/{json_limit}"
-                            )
-                            await status_progress()
-                            await _sleep_human(config.parse_item_delay_sec)
-                        else:
-                            page_skip += 1
-                        continue
-                    if not stop.is_set():
-                        try:
-                            await enrich_listing(
-                                token,
-                                item,
-                                user_agent=config.fb_user_agent,
-                                proxy_url=proxy_used,
-                                timeout_sec=16.0,
-                                country=country,
-                            )
-                        except AccountTokenDeadError:
-                            token_dead_flag["value"] = True
-                            raise
-                    if await _accept_item(item):
+                        page_skip_dup += 1
+                    elif ok:
                         cat_added += 1
                         page_acc += 1
                         current_step["detail"] = (
@@ -606,9 +638,20 @@ async def _parse_impl(
                             f"в JSON {len(collected)}/{json_limit}"
                         )
                         await status_progress()
-                        await _sleep_human(config.parse_item_delay_sec)
                     else:
                         page_skip += 1
+
+                await asyncio.gather(*[_run_one(it) for it in page_items])
+
+                logger.info(
+                    "page %s: feed=%s checked=%s accepted=%s skip=%s collected=%s",
+                    cat.label,
+                    page_raw,
+                    stats.get("checked"),
+                    page_acc,
+                    page_skip,
+                    len(collected),
+                )
 
                 if page_raw >= 8 and page_acc == 0 and page_skip_dup >= int(
                     page_raw * config.feed_dup_stop_ratio
