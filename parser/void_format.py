@@ -27,7 +27,7 @@ def void_export_item(listing: "MarketplaceListing") -> dict[str, Any]:
         "created_date": listing.created_date or "",
         "created_real_date": listing.created_real_date or "",
         "phone": listing.phone or "",
-        "item_desc": listing.item_desc or "",
+        "item_desc": (listing.item_desc or "").strip() or "N/A",
         "location": listing.location or "",
         "item_link": listing.link or "",
         "person_link": listing.person_link or "",

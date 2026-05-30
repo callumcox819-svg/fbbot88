@@ -49,7 +49,16 @@ _DESC_RE = re.compile(
     r'"redacted_description"\s*:\s*\{\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
 _SELLER_ID_RE = re.compile(r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"')
-_PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d+)")
+_PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d{8,})")
+_SELLER_ID_ALT_RE = re.compile(
+    r'"(?:marketplace_listing_seller|listing_seller|seller)"\s*:\s*\{[^}]{0,600}?"id"\s*:\s*"(\d{8,})"'
+)
+_SELLER_NEAR_LISTING_RE = re.compile(
+    r'"(?P<lid>\d{12,})"[\s\S]{0,18000}?/marketplace/profile/(?P<pid>\d{8,})'
+)
+_PROFILE_BEFORE_LISTING_RE = re.compile(
+    r'/marketplace/profile/(?P<pid>\d{8,})[\s\S]{0,18000}?"(?P<lid>\d{12,})"'
+)
 _REL_TIME_RE = re.compile(
     r'"(?:creation_time|listing_created_time|time_created)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
@@ -910,6 +919,13 @@ async def fetch_category_listings(
                     if len(out) >= limit:
                         break
 
+                page_html = meta.get("raw_html")
+                if page_html:
+                    for it in page_new:
+                        sp = _patch_seller_from_html(str(page_html), it.listing_id)
+                        if sp:
+                            _merge_listing(it, sp)
+
                 if on_page_found and page_new:
                     await on_page_found(len(page_new))
                 if on_page_items and page_new:
@@ -1039,8 +1055,45 @@ def _looks_like_login_wall(html: str) -> bool:
     return False
 
 
+def _patch_seller_from_html(html: str, listing_id: str) -> dict[str, Any]:
+    """ID продавца из JSON/HTML рядом с listing_id (как VOID person_link)."""
+    if not html or not listing_id:
+        return {}
+    for pat in (_SELLER_NEAR_LISTING_RE, _PROFILE_BEFORE_LISTING_RE):
+        for m in pat.finditer(html):
+            if m.group("lid") == listing_id:
+                pid = m.group("pid")
+                if pid != listing_id:
+                    return {
+                        "seller_id": pid,
+                        "person_link": (
+                            f"https://www.facebook.com/marketplace/profile/{pid}/"
+                        ),
+                    }
+    pos = html.find(f"/marketplace/item/{listing_id}")
+    if pos >= 0:
+        chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
+        patch = _parse_chunk(chunk, listing_id)
+        if patch.get("seller_id") or patch.get("person_link"):
+            return {
+                k: patch[k]
+                for k in ("seller_id", "person_link", "seller_name")
+                if patch.get(k)
+            }
+    m = _SELLER_ID_ALT_RE.search(html)
+    if m:
+        sid = m.group(1)
+        return {
+            "seller_id": sid,
+            "person_link": f"https://www.facebook.com/marketplace/profile/{sid}/",
+        }
+    return {}
+
+
 def _parse_chunk(chunk: str, lid: str) -> dict[str, Any]:
     seller_id = _first_match(_SELLER_ID_RE, chunk)
+    if not seller_id:
+        seller_id = _first_match(_SELLER_ID_ALT_RE, chunk)
     profile_m = _PROFILE_LINK_RE.search(chunk)
     person_link = ""
     if profile_m:
@@ -1123,6 +1176,14 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(seller, dict):
         seller_name = _dig_str(seller, "name", "marketplace_listing_seller_name")
         seller_id = str(seller.get("id") or "").strip()
+    if not seller_id:
+        for key in ("owner", "actor", "marketplace_user", "profile"):
+            blob = fs.get(key) or node.get(key)
+            if isinstance(blob, dict):
+                seller_id = str(blob.get("id") or "").strip()
+                if seller_id:
+                    seller_name = seller_name or _dig_str(blob, "name")
+                    break
 
     photo = ""
     photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
@@ -1307,22 +1368,30 @@ async def enrich_listing(
         if not best and parsed:
             best = parsed[0]
     if best:
-        _merge_listing(item, {
-            "title": best.title,
-            "price": best.price,
-            "seller_id": best.seller_id,
-            "seller_name": best.seller_name,
-            "photo": best.photo,
-            "location": best.location,
-            "item_desc": best.item_desc,
-            "person_link": best.person_link,
-            "created_date": best.created_date,
-            "created_timestamp": best.created_timestamp,
-            "person_reg_date": best.person_reg_date,
-            "gender": best.gender,
-            "ads_number": best.ads_number,
-            "rating": best.rating,
-        })
+        _merge_listing(
+            item,
+            {
+                "title": best.title,
+                "price": best.price,
+                "seller_id": best.seller_id,
+                "seller_name": best.seller_name,
+                "photo": best.photo,
+                "location": best.location,
+                "item_desc": best.item_desc,
+                "person_link": best.person_link,
+                "created_date": best.created_date,
+                "created_timestamp": best.created_timestamp,
+                "person_reg_date": best.person_reg_date,
+                "gender": best.gender,
+                "ads_number": best.ads_number,
+                "rating": best.rating,
+            },
+        )
+    seller_patch = _patch_seller_from_html(html, item.listing_id)
+    if seller_patch:
+        _merge_listing(item, seller_patch)
+    if not (item.seller_id or item.person_link):
+        logger.info("enrich %s: seller id not found in item HTML", item.listing_id)
     return item
 
 
@@ -1477,10 +1546,12 @@ async def _fetch_page(
             if "login" in str(resp.url).lower():
                 raise AccountTokenDeadError("redirect to login")
 
-    meta = {
+    meta: dict[str, Any] = {
         "html_len": len(html),
         "link_count": html.count("/marketplace/item/"),
     }
+    if len(html) < 3_000_000:
+        meta["raw_html"] = html
     if _looks_like_login_wall(html):
         raise AccountTokenDeadError("login wall in HTML")
 
@@ -1532,6 +1603,9 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
                 category=category_label,
             )
         _merge_listing(by_id[lid], patch)
+        seller_patch = _patch_seller_from_html(html, lid)
+        if seller_patch:
+            _merge_listing(by_id[lid], seller_patch)
         by_id[lid].category = category_label
 
     out: list[MarketplaceListing] = []
