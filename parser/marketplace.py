@@ -619,11 +619,10 @@ def export_reject_reason(
         return "нет_заголовка"
     if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
         return "старше_24ч"
-    loc = (item.location or "").strip()
-    price = (item.price or "").strip()
     if country and listing_is_wrong_country(item, country):
         return "чужая_страна"
 
+    price = (item.price or "").strip()
     photo = (item.photo or "").strip()
     seller = (item.seller_name or "").strip()
 
@@ -638,6 +637,40 @@ def export_reject_reason(
     if photo:
         return None
     return "мало_полей"
+
+
+def void_export_reject_reason(
+    item: MarketplaceListing,
+    country: str | None = None,
+    *,
+    max_age_hours: float | None = None,
+) -> str | None:
+    """
+    Как VOID: title + price + photo + person_link (profile/1000…).
+    Имя и gender/ads_number — с карточки объявления после enrich.
+    """
+    from services.seller_blacklist import _profile_id
+
+    base = export_reject_reason(item, country, max_age_hours=max_age_hours)
+    if base:
+        return base
+    if not _profile_id(item):
+        return "нет_продавца"
+    return None
+
+
+def void_complete_from_feed(
+    item: MarketplaceListing,
+    country: str | None,
+    *,
+    max_age_hours: float,
+) -> bool:
+    """Пропускаем enrich только если в ленте уже есть всё как в VOID JSON."""
+    from services.seller_blacklist import _profile_id
+
+    if not _profile_id(item):
+        return False
+    return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
@@ -1282,29 +1315,28 @@ def apply_feed_seller_index(item: MarketplaceListing, index: dict[str, dict[str,
         _merge_listing(item, patch)
 
 
-def ensure_listing_seller(
-    item: MarketplaceListing,
-    country: str | None = None,
-    *,
-    max_age_hours: float | None = None,
-) -> bool:
-    """
-    Последняя попытка: если есть цена+фото+заголовок — пускаем в JSON
-    (уникальный ключ по listing_id, чтобы не терять ленту целиком).
-    """
-    from services.seller_blacklist import canonical_seller_key, listing_has_known_seller
-
-    if listing_has_known_seller(item):
-        return True
-    if export_reject_reason(item, country, max_age_hours=max_age_hours) is not None:
-        return False
-    price = (item.price or "").strip()
-    photo = (item.photo or "").strip()
-    title = (item.title or "").strip()
-    if not (price and photo and title):
-        return False
-    item.seller_name = (item.seller_name or "").strip() or f"mp-{item.listing_id[-10:]}"
-    return bool(canonical_seller_key(item))
+def _patch_seller_from_item_page(html: str, listing_id: str) -> dict[str, Any]:
+    """Страница item: person_link и item_person_name как в VOID (первый profile/ в HTML)."""
+    if not html or f"/marketplace/item/{listing_id}" not in html:
+        return {}
+    patch = _patch_seller_from_html(html, listing_id)
+    if patch.get("seller_id") or patch.get("person_link"):
+        return patch
+    for m in _PROFILE_LINK_RE.finditer(html):
+        pid = m.group(1)
+        if pid == listing_id:
+            continue
+        out: dict[str, Any] = {
+            "seller_id": pid,
+            "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
+        }
+        name = _seller_name_for_profile_in_html(html, pid)
+        if not name:
+            name = _first_match(_SELLER_RE, html)
+        if name:
+            out["seller_name"] = name
+        return out
+    return patch
 
 
 def _seller_name_near_listing_in_html(html: str, listing_id: str) -> str:
@@ -1639,9 +1671,11 @@ def _merge_item_from_html(item: MarketplaceListing, html: str) -> None:
                 "rating": best.rating,
             },
         )
-    seller_patch = _patch_seller_from_html(html, item.listing_id)
+    seller_patch = _patch_seller_from_item_page(html, item.listing_id)
     if seller_patch:
         _merge_listing(item, seller_patch)
+    idx = build_feed_seller_index(html)
+    apply_feed_seller_index(item, idx)
 
 
 async def enrich_listing(
@@ -1685,17 +1719,21 @@ async def enrich_listing(
         if _looks_like_login_wall(html):
             raise AccountTokenDeadError("login wall on item page")
         _merge_item_from_html(item, html)
+        sp = _patch_seller_from_item_page(html, lid)
+        if sp:
+            _merge_listing(item, sp)
         if not (item.seller_name or "").strip():
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
                 item.seller_name = nm
-        idx = build_feed_seller_index(html)
-        apply_feed_seller_index(item, idx)
-        ensure_listing_seller(item, country)
-        if item.seller_id or item.person_link or (item.seller_name or "").strip():
+        from services.seller_blacklist import _profile_id
+
+        if _profile_id(item):
             return item
-    if not (item.seller_id or item.person_link or (item.seller_name or "").strip()):
-        logger.info("enrich %s: no seller data from item pages", lid)
+    from services.seller_blacklist import _profile_id
+
+    if not _profile_id(item):
+        logger.info("enrich %s: no person_link (VOID needs profile/ID)", lid)
     return item
 
 

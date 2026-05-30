@@ -27,13 +27,14 @@ from parser.account_token import (
 )
 from parser.marketplace import (
     enrich_listing,
-    ensure_listing_seller,
     export_reject_reason,
     normalize_listing_for_export,
     fetch_category_listings,
     is_connection_error,
     listing_is_wrong_country,
     listings_to_json,
+    void_complete_from_feed,
+    void_export_reject_reason,
 )
 from parser.marketplace_region import apply_marketplace_region
 from data.preset_categories import parse_categories_for_country
@@ -42,7 +43,6 @@ from services.seller_blacklist import (
     canonical_seller_key,
     dedupe_listings_by_seller,
     is_seller_blocked,
-    listing_has_known_seller,
     load_blocked_seller_keys,
     normalize_seller_identity,
     remember_seller,
@@ -60,14 +60,6 @@ async def _sleep_human(base_sec: float) -> None:
         await asyncio.sleep(base_sec * random.uniform(0.9, 1.12))
 
 
-def _can_add_from_feed_only(
-    item, country: str | None, *, max_age_hours: float
-) -> bool:
-    if not listing_has_known_seller(item):
-        return False
-    return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
-
-
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
     "чужая_страна": "Чужая страна",
@@ -75,7 +67,7 @@ _REJECT_LABELS: dict[str, str] = {
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
     "нет_данных": "Нет продавца/описания",
-    "нет_продавца": "Нет продавца (даже запасной)",
+    "нет_продавца": "Нет person_link (как VOID)",
 }
 
 
@@ -338,7 +330,8 @@ async def _finalize_parse_run(
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
-                "\n<i>Часто: имя продавца не вытащилось из HTML, ЧС, старше 24 ч, чужая страна.</i>"
+                "\n<i>Как VOID: нужен person_link с карточки /marketplace/item/… "
+                "(цена+фото+profile). ЧС, старше 24 ч.</i>"
             )
             await on_status("\n".join(lines))
         return
@@ -542,14 +535,7 @@ async def _parse_impl(
                 ):
                     _record_reject(stats, "повторный_продавец")
                     return False
-                if not listing_has_known_seller(item):
-                    ensure_listing_seller(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                if not listing_has_known_seller(item):
-                    _record_reject(stats, "нет_продавца")
-                    return False
-                reason = export_reject_reason(
+                reason = void_export_reject_reason(
                     item, country, max_age_hours=max_age_hours
                 )
                 if reason:
@@ -587,7 +573,9 @@ async def _parse_impl(
                 if reason in _HARD_FEED_REJECT:
                     _record_reject(stats, reason)
                     return False, False
-                if _can_add_from_feed_only(item, country, max_age_hours=max_age_hours):
+                if void_complete_from_feed(
+                    item, country, max_age_hours=max_age_hours
+                ):
                     async with accept_lock:
                         ok = await _accept_item(item)
                     if ok:
@@ -600,7 +588,7 @@ async def _parse_impl(
                             item,
                             user_agent=config.fb_user_agent,
                             proxy_url=proxy_used,
-                            timeout_sec=16.0,
+                            timeout_sec=24.0,
                             country=country,
                         )
                     except AccountTokenDeadError:
@@ -618,19 +606,13 @@ async def _parse_impl(
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0
-                enrich_sem = asyncio.Semaphore(2)
+                enrich_sem = asyncio.Semaphore(3)
 
                 async def _run_one(item) -> None:
                     nonlocal cat_added, page_acc, page_skip, page_skip_dup
                     if stop.is_set() or len(collected) >= json_limit:
                         return
-                    needs_enrich = not _can_add_from_feed_only(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if needs_enrich:
-                        async with enrich_sem:
-                            ok, dup = await _process_listing(item)
-                    else:
+                    async with enrich_sem:
                         ok, dup = await _process_listing(item)
                     if dup:
                         page_skip += 1
