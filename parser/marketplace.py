@@ -68,6 +68,14 @@ _DESC_RE = re.compile(
 )
 _SELLER_ID_RE = re.compile(r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"')
 _PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d{8,})")
+_PROFILE_PRODUCT_RE = re.compile(
+    r"/marketplace/profile/(\d{8,})[^\"'<>]{0,96}?product_id=(\d{8,})",
+    re.I,
+)
+_PROFILE_PRODUCT_REV_RE = re.compile(
+    r"product_id=(\d{8,})[^\"'<>]{0,96}?/marketplace/profile/(\d{8,})",
+    re.I,
+)
 _SELLER_ID_ALT_RE = re.compile(
     r'"(?:marketplace_listing_seller|listing_seller|seller)"\s*:\s*\{[^}]{0,600}?"id"\s*:\s*"(\d{8,})"'
 )
@@ -1286,6 +1294,11 @@ def _seller_name_for_profile_in_html(html: str, profile_id: str) -> str:
             re.I,
         ),
         re.compile(
+            rf"/marketplace/profile/{re.escape(profile_id)}"
+            rf'[^"\'<>]{{0,120}}?>([^<]{{2,80}})</span>',
+            re.I,
+        ),
+        re.compile(
             rf'aria-label="(?:View|Näytä|Voir|See)\s+([^"]{{2,80}})"'
             rf'[\s\S]{{0,3000}}?/marketplace/profile/{re.escape(profile_id)}',
             re.I,
@@ -1658,6 +1671,13 @@ def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
         return {}
     norm = _normalize_fb_html(html)
     out: dict[str, dict[str, str]] = {}
+    for m in _PROFILE_PRODUCT_RE.finditer(norm):
+        pid, prod = m.group(1), m.group(2)
+        if prod != pid:
+            out[prod] = {
+                "seller_id": pid,
+                "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
+            }
     for lid, ent in _chunk_sellers_for_all_listings(norm).items():
         out[lid] = dict(ent)
     for lid, ent in _proximity_listing_sellers(norm).items():
@@ -1699,28 +1719,92 @@ def apply_feed_seller_index(item: MarketplaceListing, index: dict[str, dict[str,
         _merge_listing(item, patch)
 
 
-def _patch_seller_from_item_page(html: str, listing_id: str) -> dict[str, Any]:
-    """Страница item: person_link и item_person_name как в VOID (первый profile/ в HTML)."""
-    if not html or f"/marketplace/item/{listing_id}" not in html:
+def _seller_patch_for_profile_id(html: str, profile_id: str) -> dict[str, Any]:
+    if not profile_id.isdigit():
         return {}
-    patch = _patch_seller_from_html(html, listing_id)
-    if patch.get("seller_id") or patch.get("person_link"):
-        return patch
-    for m in _PROFILE_LINK_RE.finditer(html):
+    out: dict[str, Any] = {
+        "seller_id": profile_id,
+        "person_link": f"https://www.facebook.com/marketplace/profile/{profile_id}/",
+    }
+    name = _seller_name_for_profile_in_html(html, profile_id)
+    if name:
+        out["seller_name"] = name
+    return out
+
+
+def _seller_patch_by_product_id(html: str, listing_id: str) -> dict[str, Any]:
+    """
+    Как в браузере: href="/marketplace/profile/1000…/?product_id={listing_id}".
+    """
+    h = _normalize_fb_html(html)
+    if not h or not listing_id:
+        return {}
+    for pat in (_PROFILE_PRODUCT_RE, _PROFILE_PRODUCT_REV_RE):
+        for m in pat.finditer(h):
+            if pat is _PROFILE_PRODUCT_RE:
+                pid, prod = m.group(1), m.group(2)
+            else:
+                prod, pid = m.group(1), m.group(2)
+            if prod == listing_id and pid != listing_id:
+                return _seller_patch_for_profile_id(h, pid)
+    return {}
+
+
+def _seller_from_item_page_dom(html: str, listing_id: str) -> dict[str, str]:
+    """DOM карточки: ссылка продавца с product_id или единственный profile на странице."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return {}
+    soup = BeautifulSoup(_normalize_fb_html(html), "html.parser")
+    fallback: dict[str, str] = {}
+    for a in soup.select('a[href*="/marketplace/profile/"]'):
+        href = (a.get("href") or "").strip()
+        m = _PROFILE_LINK_RE.search(href)
+        if not m:
+            continue
         pid = m.group(1)
         if pid == listing_id:
             continue
-        out: dict[str, Any] = {
+        name = (a.get_text(strip=True) or "")[:80]
+        ent = {
             "seller_id": pid,
             "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
         }
-        name = _seller_name_for_profile_in_html(html, pid)
-        if not name:
-            name = _first_match(_SELLER_RE, html)
-        if name:
-            out["seller_name"] = name
+        if name and len(name) >= 2:
+            ent["seller_name"] = name
+        if f"product_id={listing_id}" in href:
+            return ent
+        fallback = ent
+    return fallback
+
+
+def _patch_seller_from_item_page(html: str, listing_id: str) -> dict[str, Any]:
+    """Страница item: person_link как в VOID (profile + product_id или JSON)."""
+    h = _normalize_fb_html(html)
+    if not h:
+        return {}
+    patch = _seller_patch_by_product_id(h, listing_id)
+    if patch:
+        return patch
+    dom = _seller_from_item_page_dom(h, listing_id)
+    if dom:
+        return dom
+    if listing_id in h:
+        patch = _patch_seller_from_html(h, listing_id)
+        if patch.get("seller_id") or patch.get("person_link"):
+            return patch
+    for m in _PROFILE_LINK_RE.finditer(h):
+        pid = m.group(1)
+        if pid == listing_id:
+            continue
+        out = _seller_patch_for_profile_id(h, pid)
+        if not out.get("seller_name"):
+            nm = _first_match(_SELLER_RE, h)
+            if nm:
+                out["seller_name"] = nm
         return out
-    return patch
+    return {}
 
 
 def _seller_name_near_listing_in_html(html: str, listing_id: str) -> str:
@@ -1754,6 +1838,9 @@ def _patch_seller_from_html(html: str, listing_id: str) -> dict[str, Any]:
     """ID продавца из JSON/HTML рядом с listing_id (как VOID person_link)."""
     if not html or not listing_id:
         return {}
+    patch = _seller_patch_by_product_id(html, listing_id)
+    if patch:
+        return patch
     for raw in _SCRIPT_JSON_RE.findall(html):
         try:
             data = json.loads(raw)
@@ -2115,8 +2202,8 @@ async def enrich_listing(
     elif country == "ch":
         locale_q = "?locale=de_CH"
     urls = [
-        f"https://mbasic.facebook.com/marketplace/item/{lid}/",
         f"https://www.facebook.com/marketplace/item/{lid}{locale_q}",
+        f"https://mbasic.facebook.com/marketplace/item/{lid}/",
         f"https://m.facebook.com/marketplace/item/{lid}/",
     ]
     if item.link:
@@ -2130,9 +2217,12 @@ async def enrich_listing(
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": _accept_language(country),
         "Referer": referer,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     for url in urls:
@@ -2152,6 +2242,15 @@ async def enrich_listing(
         sp = _patch_seller_from_item_page(html, lid)
         if sp:
             _merge_listing(item, sp)
+            if _profile_id(item):
+                logger.info(
+                    "enrich %s seller ok via %s (html=%s profiles=%s)",
+                    lid,
+                    url[:40],
+                    len(html),
+                    _normalize_fb_html(html).count("/marketplace/profile/"),
+                )
+                return item
         if not (item.seller_name or "").strip():
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
@@ -2186,11 +2285,13 @@ async def enrich_listing(
                 return item
 
     if not _profile_id(item):
-        prof_n = feed_hint.count("/marketplace/profile/") if feed_hint else 0
+        hint = _normalize_fb_html(feed_hint) if feed_hint else ""
+        prod_links = len(_PROFILE_PRODUCT_RE.findall(hint)) if hint else 0
         logger.info(
-            "enrich %s: no person_link (feed profiles=%s, token_graphql=%s)",
+            "enrich %s: no person_link (feed_profiles=%s product_id_links=%s graphql=%s)",
             lid,
-            prof_n,
+            hint.count("/marketplace/profile/") if hint else 0,
+            prod_links,
             bool(token.access_token),
         )
     return item
