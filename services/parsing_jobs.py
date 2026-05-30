@@ -410,6 +410,9 @@ async def _parse_impl(
         run_id = run.id
 
     collected: list = []
+    seen_listing_ids: set[str] = set()
+    accepted_listing_ids: set[str] = set()
+    seen_lock = asyncio.Lock()
     async with Session() as session:
         manual_blocked = await load_blocked_seller_keys(session, user_id, country)
     active_cats: list = list(categories)
@@ -515,13 +518,14 @@ async def _parse_impl(
 
             cat_added = 0
             page_raw = 0
-            processed_in_cat: set[str] = set()
             stop_cat_pages = {"value": False}
             accept_lock = asyncio.Lock()
-            seen_lock = asyncio.Lock()
 
             async def _accept_item(item) -> bool:
                 normalize_seller_identity(item)
+                lid = (item.listing_id or "").strip()
+                if lid in accepted_listing_ids:
+                    return False
                 if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False
@@ -532,6 +536,8 @@ async def _parse_impl(
                     _record_reject(stats, reason)
                     return False
                 normalize_listing_for_export(item, country)
+                if lid:
+                    accepted_listing_ids.add(lid)
                 collected.append(item)
                 return True
 
@@ -540,10 +546,11 @@ async def _parse_impl(
                 if stop.is_set() or len(collected) >= json_limit:
                     return False, False
                 async with seen_lock:
-                    if item.listing_id in processed_in_cat:
+                    lid = (item.listing_id or "").strip()
+                    if not lid or lid in seen_listing_ids:
                         return False, False
+                    seen_listing_ids.add(lid)
                     stats["checked"] = stats.get("checked", 0) + 1
-                    processed_in_cat.add(item.listing_id)
                 if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False, True
