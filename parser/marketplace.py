@@ -949,7 +949,7 @@ async def fetch_category_listings(
     should_stop_pagination: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
-    global_seen: set[str] | None = None,
+    feed_seen: set[str] | None = None,
     seen_origin: dict[str, str] | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any]]:
     """Категория CH/FI: несколько страниц ленты (как VOID), без лишнего листания."""
@@ -1025,7 +1025,7 @@ async def fetch_category_listings(
                     if not listing_is_valid(item):
                         continue
                     lid = item.listing_id
-                    if global_seen is not None and lid in global_seen:
+                    if feed_seen is not None and lid in feed_seen:
                         feed_replay += 1
                         if seen_origin is not None:
                             prev = seen_origin.get(lid, "")
@@ -1035,8 +1035,8 @@ async def fetch_category_listings(
                     if lid in seen_ids:
                         continue
                     seen_ids.add(lid)
-                    if global_seen is not None:
-                        global_seen.add(lid)
+                    if feed_seen is not None:
+                        feed_seen.add(lid)
                     if seen_origin is not None:
                         seen_origin.setdefault(lid, category_label)
                     page_new.append(item)

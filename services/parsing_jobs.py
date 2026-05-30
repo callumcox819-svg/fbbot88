@@ -229,21 +229,14 @@ def _progress_text(
             lines.append(f"↳ <b>Другой отсев</b> (нет person_link, страна, …): <b>{other_reject}</b>")
         if feed_replay:
             lines.append(
-                f"↳ <b>Повтор ID в HTML ленты</b> (тот же listing_id снова): "
+                f"↳ <b>Пропущено при скачивании</b> (ID уже встречался в HTML раньше): "
                 f"<b>{feed_replay}</b>"
             )
             if feed_replay_cross:
                 lines.append(
-                    f"   · из них с <b>другой</b> рубрики FB: <b>{feed_replay_cross}</b>"
+                    f"   · в другом <b>разделе бота</b> (Электроника/Спорт…): "
+                    f"<b>{feed_replay_cross}</b> — часто дубли в JSON FB, не «кофта в мебели»"
                 )
-            lines.append(
-                "<i>Не всегда «одна карточка в двух категориях» — в HTML страницы "
-                "попадают все ссылки /marketplace/item/ (лента + блоки FB).</i>"
-            )
-        if skipped_seen:
-            lines.append(
-                f"↳ Повтор ID (запасной счётчик): <b>{skipped_seen}</b>"
-            )
         if feed_n > 0 and feed_new < feed_n // 2 and checked_n > 0:
             lines.append(
                 "<i>Мало новых ID без FB_MARKETPLACE_DOC_ID (глубокая лента).</i>"
@@ -485,6 +478,7 @@ async def _parse_impl(
 
     collected: list = []
     seen_ids: set[str] = set()
+    feed_seen: set[str] = set()
     seen_origin: dict[str, str] = {}
     session_sellers: set[str] = set()
     accepted_seller_ids: set[str] = set()
@@ -753,7 +747,7 @@ async def _parse_impl(
                         proxy_url=proxy_try,
                         limit=max(json_limit * 12, 500),
                         timeout_sec=22.0,
-                        global_seen=seen_ids,
+                        feed_seen=feed_seen,
                         seen_origin=seen_origin,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
