@@ -175,6 +175,7 @@ async def start_parsing(
             "found": 0,
             "checked": 0,
             "rejected": 0,
+            "skipped_seen": 0,
             "accepted": 0,
         },
     )
@@ -202,23 +203,42 @@ def _progress_text(
         feed_new = stats.get("feed_new", 0)
         checked_n = stats.get("checked", 0)
         in_json = stats.get("accepted", done)
+        reasons = stats.get("reject_reasons") or {}
+        dup_seller = int(reasons.get("повторный_продавец", 0))
+        other_reject = max(0, int(stats.get("rejected", 0)) - dup_seller)
+        skipped_seen = int(stats.get("skipped_seen", 0))
         lines.append(
             f"📊 Скачано из FB: <b>{feed_n}</b> "
-            f"(<b>новых</b> объявлений: {feed_new}) · "
-            f"Проверено: <b>{checked_n}</b> · "
-            f"В JSON: <b>{in_json}</b> · "
-            f"Отсеяно: <b>{stats.get('rejected', 0)}</b> · "
+            f"(новых объявлений: <b>{feed_new}</b>) · "
             f"Страниц: <b>{stats.get('pages', 0)}</b>"
         )
+        lines.append(
+            f"Проверено (уникальных): <b>{checked_n}</b> · "
+            f"В JSON: <b>{in_json}</b>"
+        )
+        if dup_seller:
+            lines.append(
+                f"↳ <b>Повторный продавец</b> (в JSON уже есть этот seller): "
+                f"<b>{dup_seller}</b>"
+            )
+        if other_reject:
+            lines.append(f"↳ <b>Другой отсев</b> (нет person_link, страна, …): <b>{other_reject}</b>")
+        if skipped_seen:
+            lines.append(
+                f"↳ <b>То же объявление</b> (уже смотрели в другой категории): "
+                f"<b>{skipped_seen}</b>"
+            )
         if feed_n > 0 and feed_new < feed_n // 2 and checked_n > 0:
             lines.append(
-                "<i>«Скачано» суммируется по всем категориям; "
-                "много повторов между категориями — смотрите «новых» и «В JSON».</i>"
+                "<i>«Скачано» — сумма по категориям; без глубокой ленты "
+                "много одних и тех же ID.</i>"
             )
-        reasons = stats.get("reject_reasons") or {}
-        if reasons:
-            lines.append("<b>Причины отсева:</b>")
-            for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
+        other_reasons = {
+            k: v for k, v in reasons.items() if k != "повторный_продавец" and v
+        }
+        if other_reasons:
+            lines.append("<b>Детали отсева (кроме повтор. продавца):</b>")
+            for key, count in sorted(other_reasons.items(), key=lambda x: -x[1])[:6]:
                 label = _REJECT_LABELS.get(key, key)
                 lines.append(f"→ {label}: <b>{count}</b>")
     if step:
@@ -327,19 +347,27 @@ async def _finalize_parse_run(
         if token_dead:
             await _notify_token_dead(bot, telegram_id, on_status)
         elif on_status:
+            reasons = stats.get("reject_reasons") or {}
+            dup_seller = int(reasons.get("повторный_продавец", 0))
             lines = [
                 "⚠️ <b>В JSON: 0 объявлений</b>",
                 "",
-                f"Скачано: <b>{stats.get('feed_cards', 0)}</b> "
-                f"(новых: {stats.get('feed_new', 0)}) · "
-                f"В JSON: <b>{got}</b> · "
                 f"Проверено: <b>{stats.get('checked', 0)}</b> · "
-                f"Отсеяно: <b>{stats.get('rejected', 0)}</b>",
+                f"Скачано (новых): <b>{stats.get('feed_new', 0)}</b>",
             ]
-            reasons = stats.get("reject_reasons") or {}
-            if reasons:
+            if dup_seller:
+                lines.append(f"Повторный продавец: <b>{dup_seller}</b>")
+            if stats.get("skipped_seen"):
+                lines.append(
+                    f"То же объявление (другая категория): "
+                    f"<b>{stats.get('skipped_seen')}</b>"
+                )
+            other_reasons = {
+                k: v for k, v in reasons.items() if k != "повторный_продавец" and v
+            }
+            if other_reasons:
                 lines.append("<b>Почему не попали в JSON:</b>")
-                for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
+                for key, count in sorted(other_reasons.items(), key=lambda x: -x[1])[:6]:
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
@@ -580,6 +608,7 @@ async def _parse_impl(
                     return False, False
                 async with seen_lock:
                     if item.listing_id in seen_ids:
+                        stats["skipped_seen"] = stats.get("skipped_seen", 0) + 1
                         return False, False
                     stats["checked"] = stats.get("checked", 0) + 1
                     seen_ids.add(item.listing_id)
@@ -651,6 +680,15 @@ async def _parse_impl(
                         await status_progress()
                     else:
                         page_skip += 1
+                        last = stats.get("last_reject")
+                        if last == "повторный_продавец":
+                            page_skip_dup += 1
+                        if last and last != "повторный_продавец":
+                            current_step["detail"] = (
+                                f"отсев: {_REJECT_LABELS.get(last, last)} · "
+                                f"JSON {len(collected)}/{json_limit}"
+                            )
+                            await status_progress()
 
                 await asyncio.gather(*[_run_one(it) for it in page_items])
 
