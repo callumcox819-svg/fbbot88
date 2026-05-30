@@ -31,12 +31,12 @@ from parser.marketplace import (
     normalize_listing_for_export,
     fetch_category_listings,
     is_connection_error,
-    listing_is_wrong_country,
     listings_to_json,
+    text_has_ua_markers,
     void_complete_from_feed,
     void_export_reject_reason,
 )
-from parser.marketplace_region import apply_marketplace_region
+from parser.marketplace_region import apply_marketplace_region, prime_category_feed_region
 from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
 from services.seller_blacklist import (
@@ -229,7 +229,7 @@ async def _send_json_file(
     export_items = [
         x
         for x in collected
-        if not country or not listing_is_wrong_country(x, country, void_mode=True)
+        if not text_has_ua_markers(x.location) and not text_has_ua_markers(x.title)
     ]
     export_items = dedupe_listings_by_seller(export_items)[:json_limit]
     for x in export_items:
@@ -509,6 +509,17 @@ async def _parse_impl(
 
             async with Session() as session:
                 proxy_url = await pick_random_proxy_url(session, user_id)
+
+            try:
+                await prime_category_feed_region(
+                    token,
+                    country,
+                    cat.url_path,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url,
+                )
+            except AccountTokenDeadError:
+                raise
 
             async def on_url(i: int, n: int, short: str) -> None:
                 current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"

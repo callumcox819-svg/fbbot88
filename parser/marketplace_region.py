@@ -174,10 +174,21 @@ async def apply_marketplace_region(
     urls: list[str] = []
     slugs = cfg.get("marketplace_slugs") or []
     hubs = cfg.get("region_hubs") or []
-    if slugs:
-        urls.append(_url_with_geo(urljoin(_FB, f"{slugs[0]}/"), country))
-    if hubs:
-        urls.append(_url_with_geo(urljoin(_FB, f"{hubs[0]}/"), country))
+    loc_id = str(cfg.get("filter_location_id") or "")
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        u = _url_with_geo(urljoin(_FB, path if path.endswith("/") else f"{path}/"), country)
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    for slug in slugs:
+        add(f"{slug}/")
+    if loc_id and loc_id not in slugs:
+        add(f"{loc_id}/")
+    for hub in hubs[:2]:
+        add(f"{hub}/")
 
     logger.info("region switch start country=%s urls=%s proxy=%s", country, len(urls), bool(proxy_url))
     async with _session_for_proxy(proxy_url) as session:
@@ -202,6 +213,51 @@ async def apply_marketplace_region(
         timeout_sec=min(timeout_sec, 12.0),
     )
     logger.info("marketplace region applied: %s", label)
+
+
+def _category_prime_paths(country: str, url_path: str) -> list[str]:
+    """VOID: лента через filter_location_id, не только finland/ в path."""
+    cfg = COUNTRY_LOCATIONS.get(country) or {}
+    norm = url_path.strip("/").replace("\\", "/")
+    parts = norm.split("/")
+    cat_slug = ""
+    if "category" in parts:
+        idx = parts.index("category")
+        if idx + 1 < len(parts):
+            cat_slug = parts[idx + 1]
+    loc_id = str(cfg.get("filter_location_id") or "")
+    paths: list[str] = []
+    if cat_slug and loc_id:
+        paths.append(f"{loc_id}/category/{cat_slug}/")
+    paths.append(f"{norm}/" if not norm.endswith("/") else norm)
+    return paths
+
+
+async def prime_category_feed_region(
+    token: AccountToken,
+    country: str,
+    url_path: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 18.0,
+) -> None:
+    """Открыть ленту категории с geo до парсинга (loc_id + finland)."""
+    if country not in COUNTRY_LOCATIONS:
+        return
+    headers = _fb_headers(
+        token, user_agent, "https://www.facebook.com/marketplace/", country=country
+    )
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    async with _session_for_proxy(proxy_url) as session:
+        for path in _category_prime_paths(country, url_path)[:2]:
+            url = _url_with_geo(urljoin(_FB, path), country)
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    await resp.text(errors="ignore")
+                    logger.info("category prime GET %s", path[:56])
+            except Exception as e:
+                logger.debug("category prime %s: %s", path[:40], e)
 
 
 def append_geo_to_marketplace_url(url: str, country: str) -> str:

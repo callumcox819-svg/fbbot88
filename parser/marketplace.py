@@ -389,7 +389,15 @@ def _accept_language(country: str | None) -> str:
     return "en-US,en;q=0.9"
 
 
+def text_has_ua_markers(text: str) -> bool:
+    return _text_has_ua_markers_impl(text)
+
+
 def _text_has_ua_markers(text: str) -> bool:
+    return _text_has_ua_markers_impl(text)
+
+
+def _text_has_ua_markers_impl(text: str) -> bool:
     t = (text or "").lower()
     if not t.strip():
         return False
@@ -661,7 +669,7 @@ def void_export_reject_reason(
     base = export_reject_reason(item, country, max_age_hours=max_age_hours)
     if base:
         return base
-    if country and listing_is_wrong_country(item, country, void_mode=True):
+    if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
         return "чужая_страна"
     if not _profile_id(item):
         return "нет_продавца"
@@ -858,13 +866,15 @@ def urls_for_country_category(
         add(build_category_url(norm))
         return urls
 
-    embed_root, _ = _split_marketplace_path(norm)
+    embed_root, cat_slug = _split_marketplace_path(norm)
     country_slugs = set(str(x) for x in (cfg.get("marketplace_slugs") or []))
     country_hubs = set(cfg.get("region_hubs") or [])
     loc_id = str(cfg.get("filter_location_id") or "")
     if loc_id:
         country_slugs.add(loc_id)
     if embed_root and (embed_root in country_slugs or embed_root in country_hubs):
+        if cat_slug and loc_id:
+            add(build_category_url(f"{loc_id}/category/{cat_slug}"))
         add(build_category_url(norm))
         return urls
 
@@ -916,6 +926,12 @@ async def fetch_category_listings(
     out: list[MarketplaceListing] = []
     total_urls = len(urls)
     feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    if urls:
+        logger.info(
+            "feed country=%s primary=%s (VOID loc_id, не только finland/)",
+            country or "?",
+            urls[0].replace(_FB_BASE, "")[:64],
+        )
     max_pages = _pages_per_category()
     pages_fetched = 0
     has_next_at_end = False
@@ -1769,6 +1785,7 @@ async def _fetch_graphql_category(
     doc_id: str,
     limit: int,
     cursor: str | None = None,
+    country: str | None = None,
 ) -> tuple[list[MarketplaceListing], str | None, bool] | None:
     if not token.access_token:
         return None
@@ -1779,13 +1796,22 @@ async def _fetch_graphql_category(
         "scale": 2,
         "seoURL": seo_path,
     }
+    if country and country in COUNTRY_LOCATIONS:
+        lid = COUNTRY_LOCATIONS[country].get("filter_location_id")
+        if lid:
+            variables["filterLocationID"] = str(lid)
+            variables["filter_location_id"] = str(lid)
+    referer = f"https://www.facebook.com/marketplace/{seo_path}/"
+    if country:
+        referer = with_country_geo(referer, country)
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "*/*",
+        "Accept-Language": _accept_language(country),
         "Origin": "https://www.facebook.com",
-        "Referer": f"https://www.facebook.com/marketplace/{seo_path}/",
+        "Referer": referer,
     }
     body = {
         "doc_id": doc_id,
@@ -1853,6 +1879,7 @@ async def _fetch_page(
             doc_id=feed_doc,
             limit=_FEED_PAGE_SIZE,
             cursor=cursor,
+            country=country,
         )
         if gql:
             items, next_cursor, has_next = gql
@@ -1875,6 +1902,7 @@ async def _fetch_page(
             doc_id=feed_doc,
             limit=_FEED_PAGE_SIZE,
             cursor=None,
+            country=country,
         )
         if gql and gql[0]:
             items, next_cursor, has_next = gql
@@ -1884,14 +1912,24 @@ async def _fetch_page(
                 "parsed": len(items),
                 "source": "graphql",
             }, next_cursor, has_next
-        logger.info("graphql empty for %s — fallback HTML", seo[:48])
+        logger.info(
+            "graphql empty for %s — fallback HTML (норма без FB_MARKETPLACE_DOC_ID)",
+            seo[:48],
+        )
 
+    referer = "https://www.facebook.com/marketplace/"
+    if country and country in COUNTRY_LOCATIONS:
+        slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
+        root = str(slugs[0]) if slugs else ""
+        if root:
+            referer = with_country_geo(urljoin(_FB_BASE, f"{root}/"), country)
+        referer = with_country_geo(urljoin(_FB_BASE, f"{seo}/"), country)
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": _accept_language(country),
-        "Referer": "https://www.facebook.com/marketplace/",
+        "Referer": referer,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
