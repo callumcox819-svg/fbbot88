@@ -176,6 +176,8 @@ async def start_parsing(
             "checked": 0,
             "rejected": 0,
             "skipped_seen": 0,
+            "feed_replay": 0,
+            "feed_replay_cross_cat": 0,
             "accepted": 0,
         },
     )
@@ -206,6 +208,8 @@ def _progress_text(
         reasons = stats.get("reject_reasons") or {}
         dup_seller = int(reasons.get("повторный_продавец", 0))
         other_reject = max(0, int(stats.get("rejected", 0)) - dup_seller)
+        feed_replay = int(stats.get("feed_replay", 0))
+        feed_replay_cross = int(stats.get("feed_replay_cross_cat", 0))
         skipped_seen = int(stats.get("skipped_seen", 0))
         lines.append(
             f"📊 Скачано из FB: <b>{feed_n}</b> "
@@ -223,15 +227,26 @@ def _progress_text(
             )
         if other_reject:
             lines.append(f"↳ <b>Другой отсев</b> (нет person_link, страна, …): <b>{other_reject}</b>")
+        if feed_replay:
+            lines.append(
+                f"↳ <b>Повтор ID в HTML ленты</b> (тот же listing_id снова): "
+                f"<b>{feed_replay}</b>"
+            )
+            if feed_replay_cross:
+                lines.append(
+                    f"   · из них с <b>другой</b> рубрики FB: <b>{feed_replay_cross}</b>"
+                )
+            lines.append(
+                "<i>Не всегда «одна карточка в двух категориях» — в HTML страницы "
+                "попадают все ссылки /marketplace/item/ (лента + блоки FB).</i>"
+            )
         if skipped_seen:
             lines.append(
-                f"↳ <b>То же объявление</b> (уже смотрели в другой категории): "
-                f"<b>{skipped_seen}</b>"
+                f"↳ Повтор ID (запасной счётчик): <b>{skipped_seen}</b>"
             )
         if feed_n > 0 and feed_new < feed_n // 2 and checked_n > 0:
             lines.append(
-                "<i>«Скачано» — сумма по категориям; без глубокой ленты "
-                "много одних и тех же ID.</i>"
+                "<i>Мало новых ID без FB_MARKETPLACE_DOC_ID (глубокая лента).</i>"
             )
         other_reasons = {
             k: v for k, v in reasons.items() if k != "повторный_продавец" and v
@@ -357,11 +372,14 @@ async def _finalize_parse_run(
             ]
             if dup_seller:
                 lines.append(f"Повторный продавец: <b>{dup_seller}</b>")
-            if stats.get("skipped_seen"):
+            if stats.get("feed_replay"):
                 lines.append(
-                    f"То же объявление (другая категория): "
-                    f"<b>{stats.get('skipped_seen')}</b>"
+                    f"Повтор ID в HTML: <b>{stats.get('feed_replay')}</b>"
                 )
+                if stats.get("feed_replay_cross_cat"):
+                    lines.append(
+                        f"(другая рубрика FB: <b>{stats.get('feed_replay_cross_cat')}</b>)"
+                    )
             other_reasons = {
                 k: v for k, v in reasons.items() if k != "повторный_продавец" and v
             }
@@ -467,6 +485,7 @@ async def _parse_impl(
 
     collected: list = []
     seen_ids: set[str] = set()
+    seen_origin: dict[str, str] = {}
     session_sellers: set[str] = set()
     accepted_seller_ids: set[str] = set()
     async with Session() as session:
@@ -612,6 +631,7 @@ async def _parse_impl(
                         return False, False
                     stats["checked"] = stats.get("checked", 0) + 1
                     seen_ids.add(item.listing_id)
+                    seen_origin.setdefault(item.listing_id, cat.label)
                 blocked = blocked_sellers | session_sellers
                 if is_seller_blocked(item, blocked):
                     _record_reject(stats, "повторный_продавец")
@@ -653,9 +673,7 @@ async def _parse_impl(
                 nonlocal cat_added, page_raw, accepted_seller_ids
                 page_raw = len(page_items)
                 stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
-                stats["feed_new"] = stats.get("feed_new", 0) + sum(
-                    1 for it in page_items if it.listing_id not in seen_ids
-                )
+                stats["feed_new"] = stats.get("feed_new", 0) + page_raw
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0
@@ -735,6 +753,8 @@ async def _parse_impl(
                         proxy_url=proxy_try,
                         limit=max(json_limit * 12, 500),
                         timeout_sec=22.0,
+                        global_seen=seen_ids,
+                        seen_origin=seen_origin,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
@@ -773,6 +793,13 @@ async def _parse_impl(
                         raise RuntimeError("Нет связи с Facebook") from err
                 active_cats = active_cats[1:] + [cat]
                 continue
+
+            stats["feed_replay"] = stats.get("feed_replay", 0) + int(
+                fetch_meta.get("feed_replay", 0)
+            )
+            stats["feed_replay_cross_cat"] = stats.get(
+                "feed_replay_cross_cat", 0
+            ) + int(fetch_meta.get("feed_replay_cross_cat", 0))
 
             if fetch_meta.get("stopped_dup_page"):
                 logger.info("category dup-page stop: %s", cat.label)
