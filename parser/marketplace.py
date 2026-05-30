@@ -700,7 +700,10 @@ def void_export_reject_reason(
     base = export_reject_reason(item, country, max_age_hours=max_age_hours)
     if base:
         return base
-    if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
+    loc = (item.location or "").strip()
+    if loc and _text_has_ua_markers(loc):
+        return "чужая_страна"
+    if not loc and _text_has_ua_markers(item.title):
         return "чужая_страна"
     from services.seller_blacklist import normalize_seller_identity
 
@@ -949,8 +952,6 @@ async def fetch_category_listings(
     should_stop_pagination: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
-    feed_seen: set[str] | None = None,
-    seen_origin: dict[str, str] | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any]]:
     """Категория CH/FI: несколько страниц ленты (как VOID), без лишнего листания."""
     if country and country in COUNTRY_LOCATIONS:
@@ -973,9 +974,6 @@ async def fetch_category_listings(
     has_next_at_end = False
     stopped_early = False
     stopped_dup_page = False
-    feed_replay = 0
-    feed_replay_cross_cat = 0
-
     for i, url in enumerate(urls, start=1):
         if should_stop and should_stop():
             break
@@ -1025,20 +1023,9 @@ async def fetch_category_listings(
                     if not listing_is_valid(item):
                         continue
                     lid = item.listing_id
-                    if feed_seen is not None and lid in feed_seen:
-                        feed_replay += 1
-                        if seen_origin is not None:
-                            prev = seen_origin.get(lid, "")
-                            if prev and prev != category_label:
-                                feed_replay_cross_cat += 1
-                        continue
                     if lid in seen_ids:
                         continue
                     seen_ids.add(lid)
-                    if feed_seen is not None:
-                        feed_seen.add(lid)
-                    if seen_origin is not None:
-                        seen_origin.setdefault(lid, category_label)
                     page_new.append(item)
                     out.append(item)
                     if len(out) >= limit:
@@ -1114,17 +1101,7 @@ async def fetch_category_listings(
         "exhausted": exhausted,
         "stopped_dup_page": stopped_dup_page,
         "urls_tried": len(urls),
-        "feed_replay": feed_replay,
-        "feed_replay_cross_cat": feed_replay_cross_cat,
     }
-    if feed_replay:
-        logger.info(
-            "category %s: %s listing IDs already in run (cross-cat ~%s) — "
-            "FB/HTML повторяет те же /marketplace/item/",
-            category_label,
-            feed_replay,
-            feed_replay_cross_cat,
-        )
     logger.info(
         "category %s country=%s urls=%s pages=%s seen=%s collected=%s exhausted=%s",
         category_label,

@@ -171,13 +171,9 @@ async def start_parsing(
         stats={
             "pages": 0,
             "feed_cards": 0,
-            "feed_new": 0,
             "found": 0,
             "checked": 0,
             "rejected": 0,
-            "skipped_seen": 0,
-            "feed_replay": 0,
-            "feed_replay_cross_cat": 0,
             "accepted": 0,
         },
     )
@@ -201,52 +197,16 @@ def _progress_text(
         f"Частичный JSON всегда. ⏹ Стоп — сразу файл.</i>",
     ]
     if stats:
-        feed_n = stats.get("feed_cards", stats.get("found", 0))
-        feed_new = stats.get("feed_new", 0)
         checked_n = stats.get("checked", 0)
         in_json = stats.get("accepted", done)
         reasons = stats.get("reject_reasons") or {}
-        dup_seller = int(reasons.get("повторный_продавец", 0))
-        other_reject = max(0, int(stats.get("rejected", 0)) - dup_seller)
-        feed_replay = int(stats.get("feed_replay", 0))
-        feed_replay_cross = int(stats.get("feed_replay_cross_cat", 0))
-        skipped_seen = int(stats.get("skipped_seen", 0))
         lines.append(
-            f"📊 Скачано из FB: <b>{feed_n}</b> "
-            f"(новых объявлений: <b>{feed_new}</b>) · "
+            f"📊 Проверено: <b>{checked_n}</b> · В JSON: <b>{in_json}</b> · "
             f"Страниц: <b>{stats.get('pages', 0)}</b>"
         )
-        lines.append(
-            f"Проверено (уникальных): <b>{checked_n}</b> · "
-            f"В JSON: <b>{in_json}</b>"
-        )
-        if dup_seller:
-            lines.append(
-                f"↳ <b>Повторный продавец</b> (в JSON уже есть этот seller): "
-                f"<b>{dup_seller}</b>"
-            )
-        if other_reject:
-            lines.append(f"↳ <b>Другой отсев</b> (нет person_link, страна, …): <b>{other_reject}</b>")
-        if feed_replay:
-            lines.append(
-                f"↳ <b>Пропущено при скачивании</b> (ID уже встречался в HTML раньше): "
-                f"<b>{feed_replay}</b>"
-            )
-            if feed_replay_cross:
-                lines.append(
-                    f"   · в другом <b>разделе бота</b> (Электроника/Спорт…): "
-                    f"<b>{feed_replay_cross}</b> — часто дубли в JSON FB, не «кофта в мебели»"
-                )
-        if feed_n > 0 and feed_new < feed_n // 2 and checked_n > 0:
-            lines.append(
-                "<i>Мало новых ID без FB_MARKETPLACE_DOC_ID (глубокая лента).</i>"
-            )
-        other_reasons = {
-            k: v for k, v in reasons.items() if k != "повторный_продавец" and v
-        }
-        if other_reasons:
-            lines.append("<b>Детали отсева (кроме повтор. продавца):</b>")
-            for key, count in sorted(other_reasons.items(), key=lambda x: -x[1])[:6]:
+        if reasons:
+            lines.append("<b>Отсев:</b>")
+            for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
                 label = _REJECT_LABELS.get(key, key)
                 lines.append(f"→ {label}: <b>{count}</b>")
     if step:
@@ -268,7 +228,8 @@ async def _send_json_file(
     export_items = [
         x
         for x in collected
-        if not text_has_ua_markers(x.location) and not text_has_ua_markers(x.title)
+        if not (x.location or "").strip()
+        or not text_has_ua_markers(x.location)
     ]
     export_items = dedupe_listings_by_seller(export_items)[:json_limit]
     for x in export_items:
@@ -356,29 +317,13 @@ async def _finalize_parse_run(
             await _notify_token_dead(bot, telegram_id, on_status)
         elif on_status:
             reasons = stats.get("reject_reasons") or {}
-            dup_seller = int(reasons.get("повторный_продавец", 0))
             lines = [
                 "⚠️ <b>В JSON: 0 объявлений</b>",
                 "",
-                f"Проверено: <b>{stats.get('checked', 0)}</b> · "
-                f"Скачано (новых): <b>{stats.get('feed_new', 0)}</b>",
+                f"Проверено: <b>{stats.get('checked', 0)}</b>",
             ]
-            if dup_seller:
-                lines.append(f"Повторный продавец: <b>{dup_seller}</b>")
-            if stats.get("feed_replay"):
-                lines.append(
-                    f"Повтор ID в HTML: <b>{stats.get('feed_replay')}</b>"
-                )
-                if stats.get("feed_replay_cross_cat"):
-                    lines.append(
-                        f"(другая рубрика FB: <b>{stats.get('feed_replay_cross_cat')}</b>)"
-                    )
-            other_reasons = {
-                k: v for k, v in reasons.items() if k != "повторный_продавец" and v
-            }
-            if other_reasons:
-                lines.append("<b>Почему не попали в JSON:</b>")
-                for key, count in sorted(other_reasons.items(), key=lambda x: -x[1])[:6]:
+            if reasons:
+                for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
@@ -477,9 +422,6 @@ async def _parse_impl(
         run_id = run.id
 
     collected: list = []
-    seen_ids: set[str] = set()
-    feed_seen: set[str] = set()
-    seen_origin: dict[str, str] = {}
     session_sellers: set[str] = set()
     accepted_seller_ids: set[str] = set()
     async with Session() as session:
@@ -587,6 +529,7 @@ async def _parse_impl(
 
             cat_added = 0
             page_raw = 0
+            processed_in_cat: set[str] = set()
             stop_cat_pages = {"value": False}
             accept_lock = asyncio.Lock()
             seen_lock = asyncio.Lock()
@@ -620,12 +563,10 @@ async def _parse_impl(
                 if stop.is_set() or len(collected) >= json_limit:
                     return False, False
                 async with seen_lock:
-                    if item.listing_id in seen_ids:
-                        stats["skipped_seen"] = stats.get("skipped_seen", 0) + 1
+                    if item.listing_id in processed_in_cat:
                         return False, False
                     stats["checked"] = stats.get("checked", 0) + 1
-                    seen_ids.add(item.listing_id)
-                    seen_origin.setdefault(item.listing_id, cat.label)
+                    processed_in_cat.add(item.listing_id)
                 blocked = blocked_sellers | session_sellers
                 if is_seller_blocked(item, blocked):
                     _record_reject(stats, "повторный_продавец")
@@ -667,11 +608,10 @@ async def _parse_impl(
                 nonlocal cat_added, page_raw, accepted_seller_ids
                 page_raw = len(page_items)
                 stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
-                stats["feed_new"] = stats.get("feed_new", 0) + page_raw
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0
-                enrich_sem = asyncio.Semaphore(3)
+                enrich_sem = asyncio.Semaphore(5)
 
                 async def _run_one(item) -> None:
                     nonlocal cat_added, page_acc, page_skip, page_skip_dup
@@ -747,8 +687,6 @@ async def _parse_impl(
                         proxy_url=proxy_try,
                         limit=max(json_limit * 12, 500),
                         timeout_sec=22.0,
-                        feed_seen=feed_seen,
-                        seen_origin=seen_origin,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
@@ -787,13 +725,6 @@ async def _parse_impl(
                         raise RuntimeError("Нет связи с Facebook") from err
                 active_cats = active_cats[1:] + [cat]
                 continue
-
-            stats["feed_replay"] = stats.get("feed_replay", 0) + int(
-                fetch_meta.get("feed_replay", 0)
-            )
-            stats["feed_replay_cross_cat"] = stats.get(
-                "feed_replay_cross_cat", 0
-            ) + int(fetch_meta.get("feed_replay_cross_cat", 0))
 
             if fetch_meta.get("stopped_dup_page"):
                 logger.info("category dup-page stop: %s", cat.label)
