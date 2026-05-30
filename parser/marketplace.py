@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urlencode, urljoin, urlparse
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -694,6 +694,9 @@ def void_export_reject_reason(
         return base
     if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
         return "чужая_страна"
+    from services.seller_blacklist import normalize_seller_identity
+
+    normalize_seller_identity(item)
     if not _profile_id(item):
         return "нет_продавца"
     return None
@@ -1023,15 +1026,18 @@ async def fetch_category_listings(
                     _category_feed_html.set(html_s)
                     seller_index = build_feed_seller_index(html_s)
                     n_prof = len(seller_index)
-                    if n_prof:
-                        logger.info(
-                            "feed sellers indexed: %s / %s from %s",
-                            n_prof,
-                            len(page_new),
-                            short,
-                        )
+                    logger.info(
+                        "feed sellers indexed: %s / %s (profile_urls=%s) %s",
+                        n_prof,
+                        len(page_new),
+                        _normalize_fb_html(html_s).count("/marketplace/profile/"),
+                        short,
+                    )
                     for it in page_new:
                         apply_feed_seller_index(it, seller_index)
+                        extra = _seller_from_listing_chunk(html_s, it.listing_id)
+                        if extra:
+                            _merge_listing(it, extra)
                         sp = _patch_seller_from_html(html_s, it.listing_id)
                         if sp:
                             _merge_listing(it, sp)
@@ -1334,11 +1340,107 @@ def _index_sellers_from_dom(html: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _normalize_fb_html(html: str) -> str:
+    if not html:
+        return ""
+    return (
+        html.replace("\\/", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u002F", "/")
+    )
+
+
+def _extract_fb_tokens(html: str) -> tuple[str | None, str | None]:
+    lsd = dtsg = None
+    for pat in (
+        r'"LSD",\[\],\{"token":"([^"]+)"',
+        r'"lsd":"([^"]+)"',
+        r'name="lsd" value="([^"]+)"',
+    ):
+        m = re.search(pat, html)
+        if m:
+            lsd = m.group(1)
+            break
+    for pat in (
+        r'"DTSGInitData",\[\],\{"token":"([^"]+)"',
+        r'"dtsg":\{"token":"([^"]+)"',
+        r'name="fb_dtsg" value="([^"]+)"',
+    ):
+        m = re.search(pat, html)
+        if m:
+            dtsg = m.group(1)
+            break
+    return lsd, dtsg
+
+
+def _seller_from_listing_chunk(html: str, listing_id: str) -> dict[str, str]:
+    """Seller id из JSON-куска ленты вокруг listing_id (без /marketplace/profile/ в HTML)."""
+    h = _normalize_fb_html(html)
+    if not h or listing_id not in h:
+        return {}
+    pos = -1
+    for needle in (
+        f"/marketplace/item/{listing_id}",
+        f'"id":"{listing_id}"',
+        f'"id": "{listing_id}"',
+        listing_id,
+    ):
+        pos = h.find(needle)
+        if pos >= 0:
+            break
+    if pos < 0:
+        return {}
+    chunk = h[max(0, pos - 800) : pos + 90_000]
+    patterns = (
+        rf'"{listing_id}"[\s\S]{{0,8000}}?"marketplace_listing_seller"[\s\S]{{0,1200}}?"id"\s*:\s*"(\d{{8,}})"',
+        rf'"{listing_id}"[\s\S]{{0,8000}}?"seller"[\s\S]{{0,800}}?"id"\s*:\s*"(\d{{8,}})"',
+        r'marketplace_listing_seller(?:_id)?"\s*:\s*"(\d{8,})"',
+        r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"',
+    )
+    for pat in patterns:
+        m = re.search(pat, chunk, re.I)
+        if m:
+            pid = m.group(1)
+            if pid != listing_id:
+                return {
+                    "seller_id": pid,
+                    "person_link": (
+                        f"https://www.facebook.com/marketplace/profile/{pid}/"
+                    ),
+                }
+    for m in _PROFILE_LINK_RE.finditer(chunk):
+        pid = m.group(1)
+        if pid != listing_id:
+            return {
+                "seller_id": pid,
+                "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
+            }
+    for m in _PROFILE_PHP_RE.finditer(chunk):
+        pid = m.group(1)
+        if pid != listing_id:
+            return {
+                "seller_id": pid,
+                "person_link": f"https://www.facebook.com/profile.php?id={pid}",
+            }
+    return {}
+
+
+def _chunk_sellers_for_all_listings(html: str) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    h = _normalize_fb_html(html)
+    for lid in _collect_listing_ids(h):
+        patch = _seller_from_listing_chunk(h, lid)
+        if patch:
+            out[lid] = patch
+    return out
+
+
 def _proximity_listing_sellers(html: str) -> dict[str, dict[str, str]]:
     """
     VOID: в ленте listing и profile часто в разных JSON-блоках.
     Связываем ближайший profile/ID к каждому /marketplace/item/ID.
     """
+    html = _normalize_fb_html(html)
     if not html:
         return {}
     listings: list[tuple[int, str]] = []
@@ -1420,6 +1522,72 @@ def _seller_patch_from_graphql_payload(
     return found
 
 
+async def _enrich_via_comet_cookies(
+    token: AccountToken,
+    listing_id: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    country: str | None,
+    hint_html: str,
+) -> dict[str, Any]:
+    """GraphQL карточки через cookies + fb_dtsg (как браузер), без access_token."""
+    doc_id = _extract_item_doc_id(hint_html)
+    lsd, dtsg = _extract_fb_tokens(hint_html)
+    if not doc_id or not dtsg or not token.c_user:
+        return {}
+    referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
+    if country:
+        referer = with_country_geo(referer, country)
+    variables = json.dumps({"listingID": listing_id, "scale": 2})
+    body = urlencode(
+        {
+            "__a": "1",
+            "__user": token.c_user,
+            "fb_dtsg": dtsg,
+            "lsd": lsd or dtsg[:12],
+            "doc_id": doc_id,
+            "variables": variables,
+            "server_timestamps": "1",
+        }
+    )
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Accept-Language": _accept_language(country),
+        "Origin": "https://www.facebook.com",
+        "Referer": referer,
+        "X-FB-LSD": lsd or "",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with _session_for_proxy(proxy_url) as session:
+            async with session.post(
+                "https://www.facebook.com/api/graphql/",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            ) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400:
+                    return {}
+                data = json.loads(raw)
+    except Exception as e:
+        logger.debug("comet item graphql %s: %s", listing_id, e)
+        return {}
+    patch = _seller_patch_from_graphql_payload(data, listing_id)
+    if patch.get("seller_id") or patch.get("person_link"):
+        logger.info(
+            "comet item graphql ok %s profile=%s",
+            listing_id,
+            str(patch.get("seller_id", ""))[:12],
+        )
+    return patch
+
+
 async def _enrich_via_graphql_item(
     token: AccountToken,
     listing_id: str,
@@ -1488,16 +1656,20 @@ def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
     """Сводная карта listing_id → seller с целой страницы ленты."""
     if not html:
         return {}
+    norm = _normalize_fb_html(html)
     out: dict[str, dict[str, str]] = {}
-    for lid, ent in _proximity_listing_sellers(html).items():
+    for lid, ent in _chunk_sellers_for_all_listings(norm).items():
         out[lid] = dict(ent)
-    for raw in _SCRIPT_JSON_RE.findall(html):
+    for lid, ent in _proximity_listing_sellers(norm).items():
+        prev = out.setdefault(lid, {})
+        prev.update({k: v for k, v in ent.items() if v})
+    for raw in _SCRIPT_JSON_RE.findall(norm):
         try:
             _index_sellers_from_relay_json(json.loads(raw), out)
         except json.JSONDecodeError:
             continue
     for pat in _ITEM_NEAR_PROFILE_RE:
-        for m in pat.finditer(html):
+        for m in pat.finditer(norm):
             lid, pid = m.group("lid"), m.group("pid")
             if pid == lid:
                 continue
@@ -1510,10 +1682,10 @@ def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
     for lid, ent in list(out.items()):
         pid = ent.get("seller_id", "")
         if pid and not ent.get("seller_name"):
-            nm = _seller_name_for_profile_in_html(html, pid)
+            nm = _seller_name_for_profile_in_html(norm, pid)
             if nm:
                 ent["seller_name"] = nm
-    for lid, ent in _index_sellers_from_dom(html).items():
+    for lid, ent in _index_sellers_from_dom(norm).items():
         prev = out.setdefault(lid, {})
         for k, v in ent.items():
             if v and not prev.get(k):
@@ -1908,6 +2080,21 @@ async def enrich_listing(
     if _profile_id(item):
         return item
 
+    if feed_hint:
+        comet = await _enrich_via_comet_cookies(
+            token,
+            lid,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            country=country,
+            hint_html=feed_hint,
+        )
+        if comet:
+            _merge_listing(item, comet)
+            if _profile_id(item):
+                return item
+
     gql_patch = await _enrich_via_graphql_item(
         token,
         lid,
@@ -1971,6 +2158,19 @@ async def enrich_listing(
                 item.seller_name = nm
         if _profile_id(item):
             return item
+        comet = await _enrich_via_comet_cookies(
+            token,
+            lid,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            country=country,
+            hint_html=html,
+        )
+        if comet:
+            _merge_listing(item, comet)
+            if _profile_id(item):
+                return item
         gql_patch = await _enrich_via_graphql_item(
             token,
             lid,

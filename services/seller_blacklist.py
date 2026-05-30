@@ -77,6 +77,13 @@ def is_seller_blocked(item, blocked: set[str]) -> bool:
 
 def normalize_seller_identity(item) -> None:
     """Единый person_link для софта (VOID и др. матчат по профилю)."""
+    sid = (getattr(item, "seller_id", None) or "").strip()
+    if sid.isdigit() and len(sid) >= 8:
+        link = f"https://www.facebook.com/marketplace/profile/{sid}/"
+        item.seller_id = sid
+        if hasattr(item, "person_link"):
+            item.person_link = link
+        return
     pid = _profile_id(item)
     if not pid:
         return
