@@ -32,7 +32,6 @@ from parser.marketplace import (
     fetch_category_listings,
     is_connection_error,
     listings_to_json,
-    text_has_ua_markers,
     void_complete_from_feed,
     void_export_reject_reason,
 )
@@ -51,7 +50,6 @@ from services.seller_blacklist import (
 
 logger = logging.getLogger(__name__)
 
-# В ленте «чужая страна» часто ложная (кривой location в HTML) — проверяем после карточки
 _HARD_FEED_REJECT = frozenset({"старше_24ч", "нет_заголовка"})
 
 
@@ -225,13 +223,7 @@ async def _send_json_file(
 ) -> int:
     if not collected:
         return 0
-    export_items = [
-        x
-        for x in collected
-        if not (x.location or "").strip()
-        or not text_has_ua_markers(x.location)
-    ]
-    export_items = dedupe_listings_by_seller(export_items)[:json_limit]
+    export_items = dedupe_listings_by_seller(collected)[:json_limit]
     for x in export_items:
         normalize_seller_identity(x)
         normalize_listing_for_export(x, country)
@@ -354,7 +346,7 @@ async def _finalize_parse_run(
     if got > 0 and sent == 0:
         lines.append(
             "<i>В памяти были объявления, но в файл не попали "
-            "(чужая страна или дубль продавца при экспорте).</i>"
+            "(дубль продавца при экспорте).</i>"
         )
     if not full:
         lines.append(

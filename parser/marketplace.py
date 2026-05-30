@@ -700,11 +700,7 @@ def void_export_reject_reason(
     base = export_reject_reason(item, country, max_age_hours=max_age_hours)
     if base:
         return base
-    loc = (item.location or "").strip()
-    if loc and _text_has_ua_markers(loc):
-        return "чужая_страна"
-    if not loc and _text_has_ua_markers(item.title):
-        return "чужая_страна"
+    # FI/CH: регион уже в URL и токене (finland/, loc_id). VOID не режет по UA в JSON.
     from services.seller_blacklist import normalize_seller_identity
 
     normalize_seller_identity(item)
