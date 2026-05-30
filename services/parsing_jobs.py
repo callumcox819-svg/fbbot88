@@ -171,6 +171,7 @@ async def start_parsing(
         stats={
             "pages": 0,
             "feed_cards": 0,
+            "feed_new": 0,
             "found": 0,
             "checked": 0,
             "rejected": 0,
@@ -198,12 +199,22 @@ def _progress_text(
     ]
     if stats:
         feed_n = stats.get("feed_cards", stats.get("found", 0))
+        feed_new = stats.get("feed_new", 0)
         checked_n = stats.get("checked", 0)
+        in_json = stats.get("accepted", done)
         lines.append(
-            f"📊 В ленте: <b>{feed_n}</b> · Проверено: <b>{checked_n}</b> · "
+            f"📊 Скачано из FB: <b>{feed_n}</b> "
+            f"(<b>новых</b> объявлений: {feed_new}) · "
+            f"Проверено: <b>{checked_n}</b> · "
+            f"В JSON: <b>{in_json}</b> · "
             f"Отсеяно: <b>{stats.get('rejected', 0)}</b> · "
             f"Страниц: <b>{stats.get('pages', 0)}</b>"
         )
+        if feed_n > 0 and feed_new < feed_n // 2 and checked_n > 0:
+            lines.append(
+                "<i>«Скачано» суммируется по всем категориям; "
+                "много повторов между категориями — смотрите «новых» и «В JSON».</i>"
+            )
         reasons = stats.get("reject_reasons") or {}
         if reasons:
             lines.append("<b>Причины отсева:</b>")
@@ -319,7 +330,9 @@ async def _finalize_parse_run(
             lines = [
                 "⚠️ <b>В JSON: 0 объявлений</b>",
                 "",
-                f"В ленте: <b>{stats.get('feed_cards', stats.get('found', 0))}</b> · "
+                f"Скачано: <b>{stats.get('feed_cards', 0)}</b> "
+                f"(новых: {stats.get('feed_new', 0)}) · "
+                f"В JSON: <b>{got}</b> · "
                 f"Проверено: <b>{stats.get('checked', 0)}</b> · "
                 f"Отсеяно: <b>{stats.get('rejected', 0)}</b>",
             ]
@@ -528,8 +541,7 @@ async def _parse_impl(
 
             async def on_page_found(n: int) -> None:
                 stats["pages"] = stats.get("pages", 0) + 1
-                stats["feed_cards"] = stats.get("feed_cards", 0) + n
-                stats["found"] = stats["feed_cards"]
+                stats["found"] = stats.get("feed_cards", 0)
                 await status_progress()
 
             cat_added = 0
@@ -611,6 +623,10 @@ async def _parse_impl(
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, page_raw, accepted_seller_ids
                 page_raw = len(page_items)
+                stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
+                stats["feed_new"] = stats.get("feed_new", 0) + sum(
+                    1 for it in page_items if it.listing_id not in seen_ids
+                )
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0
