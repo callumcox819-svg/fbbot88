@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import BlockedSeller
 
 _PROFILE_RE = re.compile(r"/marketplace/profile/(\d+)")
-_FB_ID_RE = re.compile(r"(?:[?&]id=|/profile/)(\d{8,})")
+_FB_ID_RE = re.compile(
+    r"(?:[?&]id=|/profile\.php\?id=|/profile/|/user/)(\d{8,})"
+)
 
 
 def _profile_id(item) -> str:
@@ -29,10 +31,13 @@ def _profile_id(item) -> str:
 
 
 def canonical_seller_key(item) -> str:
-    """Стабильный ключ — только ID профиля FB (для JSON и ЧС)."""
+    """Ключ продавца: ID профиля или имя (как раньше, если ID нет в ленте)."""
     pid = _profile_id(item)
     if pid:
         return f"id:{pid}"
+    name = (getattr(item, "seller_name", None) or "").strip().lower()
+    if len(name) >= 2:
+        return f"name:{name}"
     return ""
 
 
@@ -54,6 +59,14 @@ def seller_key_from_item(item) -> str:
 
 def listing_has_known_seller(item) -> bool:
     return bool(canonical_seller_key(item))
+
+
+def primary_seller_key(item) -> str:
+    """Для дедупа JSON: id приоритетнее имени."""
+    pid = _profile_id(item)
+    if pid:
+        return f"id:{pid}"
+    return canonical_seller_key(item)
 
 
 def is_seller_blocked(item, blocked: set[str]) -> bool:
@@ -79,7 +92,7 @@ def dedupe_listings_by_seller(items: list) -> list:
     seen: set[str] = set()
     out: list = []
     for item in items:
-        ck = canonical_seller_key(item)
+        ck = primary_seller_key(item)
         if not ck or ck in seen:
             continue
         seen.add(ck)

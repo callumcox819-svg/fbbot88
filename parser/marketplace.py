@@ -54,11 +54,12 @@ _SELLER_ID_ALT_RE = re.compile(
     r'"(?:marketplace_listing_seller|listing_seller|seller)"\s*:\s*\{[^}]{0,600}?"id"\s*:\s*"(\d{8,})"'
 )
 _SELLER_NEAR_LISTING_RE = re.compile(
-    r'"(?P<lid>\d{12,})"[\s\S]{0,18000}?/marketplace/profile/(?P<pid>\d{8,})'
+    r'"(?P<lid>\d{10,})"[\s\S]{0,25000}?/marketplace/profile/(?P<pid>\d{8,})'
 )
 _PROFILE_BEFORE_LISTING_RE = re.compile(
-    r'/marketplace/profile/(?P<pid>\d{8,})[\s\S]{0,18000}?"(?P<lid>\d{12,})"'
+    r'/marketplace/profile/(?P<pid>\d{8,})[\s\S]{0,25000}?"(?P<lid>\d{10,})"'
 )
+_PROFILE_PHP_RE = re.compile(r'profile\.php\?id=(\d{8,})')
 _REL_TIME_RE = re.compile(
     r'"(?:creation_time|listing_created_time|time_created)"\s*:\s*\{[^}]{0,400}?"text"\s*:\s*"([^"]+)"'
 )
@@ -1055,10 +1056,61 @@ def _looks_like_login_wall(html: str) -> bool:
     return False
 
 
+def _deep_seller_patch(obj: Any, listing_id: str, out: dict[str, Any]) -> bool:
+    """Ищем seller в любом вложенном JSON (Comet/GraphQL)."""
+    if isinstance(obj, dict):
+        node_id = str(obj.get("id") or obj.get("listing_id") or "").strip()
+        if node_id == listing_id:
+            for key in (
+                "marketplace_listing_seller",
+                "seller",
+                "owner",
+                "actor",
+                "marketplace_user",
+            ):
+                blob = obj.get(key)
+                if not isinstance(blob, dict):
+                    continue
+                sid = str(blob.get("id") or "").strip()
+                if sid.isdigit() and sid != listing_id:
+                    out["seller_id"] = sid
+                    out["seller_name"] = _dig_str(blob, "name") or out.get("seller_name", "")
+                    out["person_link"] = (
+                        f"https://www.facebook.com/marketplace/profile/{sid}/"
+                    )
+                    return True
+        for val in obj.values():
+            if _deep_seller_patch(val, listing_id, out):
+                return True
+    elif isinstance(obj, list):
+        for val in obj:
+            if _deep_seller_patch(val, listing_id, out):
+                return True
+    return False
+
+
 def _patch_seller_from_html(html: str, listing_id: str) -> dict[str, Any]:
     """ID продавца из JSON/HTML рядом с listing_id (как VOID person_link)."""
     if not html or not listing_id:
         return {}
+    for raw in _SCRIPT_JSON_RE.findall(html):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        found: dict[str, Any] = {}
+        if _deep_seller_patch(data, listing_id, found):
+            return found
+    pos = html.find(f"/marketplace/item/{listing_id}")
+    if pos >= 0:
+        chunk = html[max(0, pos - _WINDOW_BEFORE) : pos + _WINDOW_AFTER]
+        for m in _PROFILE_PHP_RE.finditer(chunk):
+            sid = m.group(1)
+            if sid != listing_id:
+                return {
+                    "seller_id": sid,
+                    "person_link": f"https://www.facebook.com/profile.php?id={sid}",
+                }
     for pat in (_SELLER_NEAR_LISTING_RE, _PROFILE_BEFORE_LISTING_RE):
         for m in pat.finditer(html):
             if m.group("lid") == listing_id:
@@ -1320,43 +1372,7 @@ def _collect_listing_ids(html: str) -> list[str]:
     return seen
 
 
-async def enrich_listing(
-    token: AccountToken,
-    item: MarketplaceListing,
-    *,
-    user_agent: str,
-    proxy_url: str | None,
-    timeout_sec: float = 20.0,
-    country: str | None = None,
-) -> MarketplaceListing:
-    """Догружает цену, описание, продавца с карточки объявления."""
-    url = item.link or f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
-    referer = "https://www.facebook.com/marketplace/"
-    if country and country in COUNTRY_LOCATIONS:
-        slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
-        if slugs:
-            referer = f"https://www.facebook.com/marketplace/{str(slugs[0]).strip('/')}/"
-    headers = {
-        "User-Agent": user_agent,
-        "Cookie": cookies_header(token.cookies),
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": _accept_language(country),
-        "Referer": referer,
-    }
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    try:
-        async with _session_for_proxy(proxy_url) as session:
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                if resp.status >= 400:
-                    return item
-                html = await resp.text(errors="ignore")
-    except Exception as e:
-        logger.debug("enrich %s failed: %s", item.listing_id, e)
-        return item
-
-    if _looks_like_login_wall(html):
-        raise AccountTokenDeadError("login wall on item page")
-
+def _merge_item_from_html(item: MarketplaceListing, html: str) -> None:
     embedded = _parse_embedded_scripts(html)
     best = embedded.get(item.listing_id)
     if not best:
@@ -1365,8 +1381,6 @@ async def enrich_listing(
             if p.listing_id == item.listing_id:
                 best = p
                 break
-        if not best and parsed:
-            best = parsed[0]
     if best:
         _merge_listing(
             item,
@@ -1390,8 +1404,53 @@ async def enrich_listing(
     seller_patch = _patch_seller_from_html(html, item.listing_id)
     if seller_patch:
         _merge_listing(item, seller_patch)
-    if not (item.seller_id or item.person_link):
-        logger.info("enrich %s: seller id not found in item HTML", item.listing_id)
+
+
+async def enrich_listing(
+    token: AccountToken,
+    item: MarketplaceListing,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 20.0,
+    country: str | None = None,
+) -> MarketplaceListing:
+    """Догружает цену, описание, продавца с карточки объявления."""
+    lid = item.listing_id
+    urls = [
+        item.link or f"https://www.facebook.com/marketplace/item/{lid}/",
+        f"https://m.facebook.com/marketplace/item/{lid}/",
+    ]
+    referer = "https://www.facebook.com/marketplace/"
+    if country and country in COUNTRY_LOCATIONS:
+        slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
+        if slugs:
+            referer = f"https://www.facebook.com/marketplace/{str(slugs[0]).strip('/')}/"
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": _accept_language(country),
+        "Referer": referer,
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    for url in urls:
+        try:
+            async with _session_for_proxy(proxy_url) as session:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    if resp.status >= 400:
+                        continue
+                    html = await resp.text(errors="ignore")
+        except Exception as e:
+            logger.debug("enrich %s %s failed: %s", lid, url[:40], e)
+            continue
+        if _looks_like_login_wall(html):
+            raise AccountTokenDeadError("login wall on item page")
+        _merge_item_from_html(item, html)
+        if item.seller_id or item.person_link or (item.seller_name or "").strip():
+            return item
+    if not (item.seller_id or item.person_link or (item.seller_name or "").strip()):
+        logger.info("enrich %s: no seller data from item pages", lid)
     return item
 
 
