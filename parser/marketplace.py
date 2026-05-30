@@ -448,23 +448,33 @@ def _location_matches_country(location: str, country: str) -> bool:
     return True
 
 
-def listing_is_wrong_country(item: MarketplaceListing, country: str | None) -> bool:
-    """UA/CH/FI: режем явно чужую страну. Пустая локация в ленте — не режем по заголовку."""
+def listing_is_wrong_country(
+    item: MarketplaceListing,
+    country: str | None,
+    *,
+    void_mode: bool = False,
+) -> bool:
+    """
+    VOID в JSON почти всегда с пустым location — не режем по заголовку/городу.
+    void_mode: только UA и явное «Germany/Sweden/…» в location (после finland/ в URL).
+    """
     if not country:
         return False
     if _text_has_ua_markers(item.location) or _text_has_ua_markers(item.title):
         return True
     loc = (item.location or "").strip()
-    title = (item.title or "").lower()
-    if loc:
-        if country == "fi" and any(x in title for x in _FI_TITLE_REJECT):
-            return True
-        if country == "ch" and any(x in title for x in _CH_TITLE_REJECT):
-            return True
-        if not _location_matches_country(loc, country):
-            return True
+    if not loc:
+        return False
+    if void_mode:
         return _location_explicitly_foreign(loc, country)
-    return False
+    title = (item.title or "").lower()
+    if country == "fi" and any(x in title for x in _FI_TITLE_REJECT):
+        return True
+    if country == "ch" and any(x in title for x in _CH_TITLE_REJECT):
+        return True
+    if not _location_matches_country(loc, country):
+        return True
+    return _location_explicitly_foreign(loc, country)
 
 
 def listing_is_valid(item: MarketplaceListing) -> bool:
@@ -619,9 +629,6 @@ def export_reject_reason(
         return "нет_заголовка"
     if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
         return "старше_24ч"
-    if country and listing_is_wrong_country(item, country):
-        return "чужая_страна"
-
     price = (item.price or "").strip()
     photo = (item.photo or "").strip()
     seller = (item.seller_name or "").strip()
@@ -654,6 +661,8 @@ def void_export_reject_reason(
     base = export_reject_reason(item, country, max_age_hours=max_age_hours)
     if base:
         return base
+    if country and listing_is_wrong_country(item, country, void_mode=True):
+        return "чужая_страна"
     if not _profile_id(item):
         return "нет_продавца"
     return None
@@ -1689,10 +1698,18 @@ async def enrich_listing(
 ) -> MarketplaceListing:
     """Догружает цену, описание, продавца с карточки объявления."""
     lid = item.listing_id
+    locale_q = ""
+    if country == "fi":
+        locale_q = "?locale=fi_FI"
+    elif country == "ch":
+        locale_q = "?locale=de_CH"
     urls = [
-        item.link or f"https://www.facebook.com/marketplace/item/{lid}/",
+        f"https://www.facebook.com/marketplace/item/{lid}{locale_q}",
         f"https://m.facebook.com/marketplace/item/{lid}/",
     ]
+    if item.link:
+        clean = item.link.split("?")[0].rstrip("/")
+        urls.insert(0, f"{clean}{locale_q}")
     referer = "https://www.facebook.com/marketplace/"
     if country and country in COUNTRY_LOCATIONS:
         slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []

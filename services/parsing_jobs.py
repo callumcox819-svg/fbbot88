@@ -229,7 +229,7 @@ async def _send_json_file(
     export_items = [
         x
         for x in collected
-        if not country or not listing_is_wrong_country(x, country)
+        if not country or not listing_is_wrong_country(x, country, void_mode=True)
     ]
     export_items = dedupe_listings_by_seller(export_items)[:json_limit]
     for x in export_items:
@@ -540,9 +540,6 @@ async def _parse_impl(
                 )
                 if reason:
                     _record_reject(stats, reason)
-                    return False
-                if country and listing_is_wrong_country(item, country):
-                    _record_reject(stats, "чужая_страна")
                     return False
                 for sk in seller_keys_for_item(item):
                     session_sellers.add(sk)
