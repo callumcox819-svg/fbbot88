@@ -1,4 +1,4 @@
-"""Личный ЧС: у каждого user_id свой список в БД (ручное добавление / очистка)."""
+"""Личный ЧС продавцов: у каждого user_id свой список в БД (как VOID «повторные продавцы»)."""
 
 from __future__ import annotations
 
@@ -90,6 +90,19 @@ def normalize_seller_identity(item) -> None:
         item.person_link = link
 
 
+def dedupe_listings_by_seller(items: list) -> list:
+    """1 продавец = 1 строка в JSON (последняя линия перед экспортом)."""
+    seen: set[str] = set()
+    out: list = []
+    for item in items:
+        ck = primary_seller_key(item)
+        if not ck or ck in seen:
+            continue
+        seen.add(ck)
+        out.append(item)
+    return out
+
+
 async def count_blocked_sellers(session: AsyncSession, user_id: int) -> int:
     res = await session.execute(
         select(func.count(BlockedSeller.id)).where(BlockedSeller.user_id == user_id)
@@ -111,7 +124,7 @@ async def clear_blocked_sellers(
 async def load_blocked_seller_keys(
     session: AsyncSession, user_id: int, country: str | None = None
 ) -> set[str]:
-    """Все ключи ЧС пользователя (личный список, не зависит от текущей страны парса)."""
+    """Все ключи ЧС пользователя (с прошлых парсингов; country не режет список)."""
     res = await session.execute(
         select(BlockedSeller.seller_key, BlockedSeller.seller_name).where(
             BlockedSeller.user_id == user_id,
@@ -157,3 +170,10 @@ async def add_blocked_seller(
     )
     await session.commit()
     return True
+
+
+async def remember_seller(
+    session: AsyncSession, user_id: int, country: str, item
+) -> None:
+    """После accept в JSON — продавец в личный ЧС (persist в БД для этого user_id)."""
+    await add_blocked_seller(session, user_id, country, item)

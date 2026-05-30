@@ -40,9 +40,13 @@ from parser.marketplace_region import apply_marketplace_region, prime_category_f
 from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
 from services.seller_blacklist import (
+    canonical_seller_key,
+    dedupe_listings_by_seller,
     is_seller_blocked,
     load_blocked_seller_keys,
     normalize_seller_identity,
+    remember_seller,
+    seller_keys_for_item,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +60,7 @@ async def _sleep_human(base_sec: float) -> None:
 
 
 _REJECT_LABELS: dict[str, str] = {
-    "повторный_продавец": "В вашем ЧС",
+    "повторный_продавец": "Повторные продавцы",
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
@@ -220,7 +224,7 @@ async def _send_json_file(
 ) -> int:
     if not collected:
         return 0
-    export_items = collected[:json_limit]
+    export_items = dedupe_listings_by_seller(collected)[:json_limit]
     for x in export_items:
         normalize_seller_identity(x)
         normalize_listing_for_export(x, country)
@@ -366,7 +370,8 @@ async def _finalize_parse_run(
         dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)
         if dup:
             lines.append(
-                f"<i>В ЧС (ручной список): {dup}. Очистка — в настройках бота.</i>"
+                f"<i>Отсев «повторные продавцы»: {dup}. "
+                f"Очистка ЧС — ⚙️ Настройки → 🚫 Чёрный список.</i>"
             )
     if on_status:
         await on_status("\n".join(lines))
@@ -412,9 +417,11 @@ async def _parse_impl(
     collected: list = []
     seen_listing_ids: set[str] = set()
     accepted_listing_ids: set[str] = set()
+    session_sellers: set[str] = set()
+    accepted_seller_ids: set[str] = set()
     seen_lock = asyncio.Lock()
     async with Session() as session:
-        manual_blocked = await load_blocked_seller_keys(session, user_id, country)
+        blocked_sellers = await load_blocked_seller_keys(session, user_id, country)
     active_cats: list = list(categories)
     cat_count = len(categories)
     connect_fails = 0
@@ -526,7 +533,10 @@ async def _parse_impl(
                 lid = (item.listing_id or "").strip()
                 if lid in accepted_listing_ids:
                     return False
-                if is_seller_blocked(item, manual_blocked):
+                ck = canonical_seller_key(item)
+                if ck in accepted_seller_ids or is_seller_blocked(
+                    item, blocked_sellers | session_sellers
+                ):
                     _record_reject(stats, "повторный_продавец")
                     return False
                 reason = void_export_reject_reason(
@@ -535,6 +545,13 @@ async def _parse_impl(
                 if reason:
                     _record_reject(stats, reason)
                     return False
+                for sk in seller_keys_for_item(item):
+                    session_sellers.add(sk)
+                    blocked_sellers.add(sk)
+                if ck:
+                    accepted_seller_ids.add(ck)
+                async with Session() as session:
+                    await remember_seller(session, user_id, country, item)
                 normalize_listing_for_export(item, country)
                 if lid:
                     accepted_listing_ids.add(lid)
@@ -551,7 +568,8 @@ async def _parse_impl(
                         return False, False
                     seen_listing_ids.add(lid)
                     stats["checked"] = stats.get("checked", 0) + 1
-                if is_seller_blocked(item, manual_blocked):
+                blocked = blocked_sellers | session_sellers
+                if is_seller_blocked(item, blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False, True
                 wrong_country = country_export_reject_reason(item, country)
