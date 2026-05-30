@@ -39,13 +39,9 @@ from parser.marketplace_region import apply_marketplace_region, prime_category_f
 from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
 from services.seller_blacklist import (
-    canonical_seller_key,
-    dedupe_listings_by_seller,
     is_seller_blocked,
     load_blocked_seller_keys,
     normalize_seller_identity,
-    remember_seller,
-    seller_keys_for_item,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +55,7 @@ async def _sleep_human(base_sec: float) -> None:
 
 
 _REJECT_LABELS: dict[str, str] = {
-    "повторный_продавец": "Повторные продавцы",
+    "повторный_продавец": "В вашем ЧС",
     "чужая_страна": "Чужая страна",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
@@ -223,7 +219,7 @@ async def _send_json_file(
 ) -> int:
     if not collected:
         return 0
-    export_items = dedupe_listings_by_seller(collected)[:json_limit]
+    export_items = collected[:json_limit]
     for x in export_items:
         normalize_seller_identity(x)
         normalize_listing_for_export(x, country)
@@ -369,8 +365,7 @@ async def _finalize_parse_run(
         dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)
         if dup:
             lines.append(
-                f"<i>Отсев «повторный продавец»: {dup}. "
-                f"Очистка ЧС — в настройках.</i>"
+                f"<i>В ЧС (ручной список): {dup}. Очистка — в настройках бота.</i>"
             )
     if on_status:
         await on_status("\n".join(lines))
@@ -414,10 +409,9 @@ async def _parse_impl(
         run_id = run.id
 
     collected: list = []
-    session_sellers: set[str] = set()
-    accepted_seller_ids: set[str] = set()
+    manual_blocked: set[str] = set()
     async with Session() as session:
-        blocked_sellers = await load_blocked_seller_keys(session, user_id, country)
+        manual_blocked = await load_blocked_seller_keys(session, user_id, country)
     active_cats: list = list(categories)
     cat_count = len(categories)
     connect_fails = 0
@@ -528,10 +522,7 @@ async def _parse_impl(
 
             async def _accept_item(item) -> bool:
                 normalize_seller_identity(item)
-                ck = canonical_seller_key(item)
-                if ck in accepted_seller_ids or is_seller_blocked(
-                    item, blocked_sellers | session_sellers
-                ):
+                if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False
                 reason = void_export_reject_reason(
@@ -540,12 +531,6 @@ async def _parse_impl(
                 if reason:
                     _record_reject(stats, reason)
                     return False
-                for sk in seller_keys_for_item(item):
-                    session_sellers.add(sk)
-                    blocked_sellers.add(sk)
-                accepted_seller_ids.add(ck)
-                async with Session() as session:
-                    await remember_seller(session, user_id, country, item)
                 normalize_listing_for_export(item, country)
                 collected.append(item)
                 return True
@@ -559,8 +544,7 @@ async def _parse_impl(
                         return False, False
                     stats["checked"] = stats.get("checked", 0) + 1
                     processed_in_cat.add(item.listing_id)
-                blocked = blocked_sellers | session_sellers
-                if is_seller_blocked(item, blocked):
+                if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False, True
                 reason = export_reject_reason(
@@ -597,7 +581,7 @@ async def _parse_impl(
                 return ok, False
 
             async def on_page_items(page_items: list) -> None:
-                nonlocal cat_added, page_raw, accepted_seller_ids
+                nonlocal cat_added, page_raw
                 page_raw = len(page_items)
                 stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
                 page_acc = 0
