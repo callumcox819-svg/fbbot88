@@ -832,10 +832,11 @@ async def fetch_category_listings(
     on_page_found: Callable[[int], Awaitable[None]] | None = None,
     on_page_items: Callable[[list[MarketplaceListing]], Awaitable[None]] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    should_stop_pagination: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any]]:
-    """Категория CH/FI: листаем до конца ленты или лимита (как VOID)."""
+    """Категория CH/FI: несколько страниц ленты (как VOID), без лишнего листания."""
     if country and country in COUNTRY_LOCATIONS:
         urls = urls_for_country_category(country, url_path, hub_round=hub_round)
     else:
@@ -849,6 +850,7 @@ async def fetch_category_listings(
     pages_fetched = 0
     has_next_at_end = False
     stopped_early = False
+    stopped_dup_page = False
 
     for i, url in enumerate(urls, start=1):
         if should_stop and should_stop():
@@ -910,6 +912,10 @@ async def fetch_category_listings(
                     await on_page_found(len(page_new))
                 if on_page_items and page_new:
                     await on_page_items(page_new)
+                if should_stop_pagination and should_stop_pagination():
+                    stopped_dup_page = True
+                    has_next_at_end = False
+                    break
                 if len(out) >= limit:
                     stopped_early = True
                     break
@@ -919,7 +925,8 @@ async def fetch_category_listings(
                 if not has_next or not cursor:
                     has_next_at_end = False
                     break
-                await asyncio.sleep(0.6)
+                if config.parse_page_delay_sec > 0:
+                    await asyncio.sleep(config.parse_page_delay_sec)
             except RuntimeError as e:
                 if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                     logger.info("skip url %s: %s", url, e)
@@ -943,6 +950,7 @@ async def fetch_category_listings(
         "pages_fetched": pages_fetched,
         "listings_seen": len(seen_ids),
         "exhausted": exhausted,
+        "stopped_dup_page": stopped_dup_page,
         "urls_tried": len(urls),
     }
     logger.info(

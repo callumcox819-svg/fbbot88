@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -48,6 +49,22 @@ from services.seller_blacklist import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HARD_FEED_REJECT = frozenset({"чужая_страна", "старше_24ч", "нет_заголовка"})
+
+
+async def _sleep_human(base_sec: float) -> None:
+    if base_sec > 0:
+        await asyncio.sleep(base_sec * random.uniform(0.9, 1.12))
+
+
+def _can_add_from_feed_only(
+    item, country: str | None, *, max_age_hours: float
+) -> bool:
+    if not listing_has_known_seller(item):
+        return False
+    return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
+
 
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
@@ -180,8 +197,9 @@ def _progress_text(
         age_hint = f" · до {int(max_age_hours)} ч"
     lines = [
         f"🔎 <b>Показано: {done}/{total}</b>",
-        f"<i>Как VOID: листаем до лимита или конца ленты{age_hint}. "
-        f"Не набрали лимит — всё равно пришлём JSON. ⏹ Стоп — JSON сразу.</i>",
+        f"<i>Режим VOID: ~{int(config.parse_item_delay_sec)} с/карточка, "
+        f"{config.marketplace_pages_per_category} стр./категория{age_hint}. "
+        f"Частичный JSON всегда. ⏹ Стоп — сразу файл.</i>",
     ]
     if stats:
         lines.append(
@@ -483,27 +501,79 @@ async def _parse_impl(
 
             cat_added = 0
             page_raw = 0
+            stop_cat_pages = {"value": False}
+
+            async def _accept_item(item) -> bool:
+                normalize_seller_identity(item)
+                ck = canonical_seller_key(item)
+                if ck in accepted_seller_ids or is_seller_blocked(
+                    item, blocked_sellers | session_sellers
+                ):
+                    _record_reject(stats, "повторный_продавец")
+                    return False
+                reason = export_reject_reason(
+                    item, country, max_age_hours=max_age_hours
+                )
+                if reason:
+                    _record_reject(stats, reason)
+                    return False
+                for sk in seller_keys_for_item(item):
+                    session_sellers.add(sk)
+                    blocked_sellers.add(sk)
+                accepted_seller_ids.add(ck)
+                async with Session() as session:
+                    await remember_seller(session, user_id, country, item)
+                normalize_listing_for_export(item, country)
+                collected.append(item)
+                return True
 
             async def on_page_items(page_items: list) -> None:
                 nonlocal cat_added, page_raw, accepted_seller_ids
                 page_raw = len(page_items)
+                page_acc = 0
+                page_skip = 0
                 for item in page_items:
                     if stop.is_set() or len(collected) >= json_limit:
                         return
                     if item.listing_id in seen_ids:
                         continue
                     stats["checked"] = stats.get("checked", 0) + 1
+                    seen_ids.add(item.listing_id)
                     blocked = blocked_sellers | session_sellers
                     if is_seller_blocked(item, blocked):
                         _record_reject(stats, "повторный_продавец")
-                        seen_ids.add(item.listing_id)
+                        page_skip += 1
                         continue
                     reason = export_reject_reason(
                         item, country, max_age_hours=max_age_hours
                     )
-                    if reason in ("чужая_страна", "старше_24ч", "нет_заголовка"):
+                    if reason in _HARD_FEED_REJECT:
                         _record_reject(stats, reason)
-                        seen_ids.add(item.listing_id)
+                        page_skip += 1
+                        continue
+                    if _can_add_from_feed_only(item, country, max_age_hours=max_age_hours):
+                        if await _accept_item(item):
+                            cat_added += 1
+                            page_acc += 1
+                            current_step["detail"] = (
+                                f"+{cat_added} {cat.label} · "
+                                f"в JSON {len(collected)}/{json_limit}"
+                            )
+                            await status_progress()
+                            await _sleep_human(config.parse_item_delay_sec)
+                        else:
+                            page_skip += 1
+                        continue
+                    if not listing_has_known_seller(item):
+                        _record_reject(stats, "нет_продавца")
+                        page_skip += 1
+                        continue
+                    pre = export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
+                    if pre and pre != "мало_полей":
+                        _record_reject(stats, pre)
+                        page_skip += 1
                         continue
                     if not stop.is_set():
                         try:
@@ -518,47 +588,33 @@ async def _parse_impl(
                         except AccountTokenDeadError:
                             token_dead_flag["value"] = True
                             raise
-                    normalize_seller_identity(item)
-                    if not listing_has_known_seller(item):
-                        _record_reject(stats, "нет_продавца")
-                        seen_ids.add(item.listing_id)
-                        continue
-                    ck = canonical_seller_key(item)
-                    if ck in accepted_seller_ids:
-                        _record_reject(stats, "повторный_продавец")
-                        seen_ids.add(item.listing_id)
-                        continue
-                    blocked = blocked_sellers | session_sellers
-                    if is_seller_blocked(item, blocked):
-                        _record_reject(stats, "повторный_продавец")
-                        seen_ids.add(item.listing_id)
-                        continue
-                    reason = export_reject_reason(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if reason:
-                        _record_reject(stats, reason)
-                        seen_ids.add(item.listing_id)
-                        continue
-                    seen_ids.add(item.listing_id)
-                    for sk in seller_keys_for_item(item):
-                        session_sellers.add(sk)
-                        blocked_sellers.add(sk)
-                    accepted_seller_ids.add(ck)
-                    async with Session() as session:
-                        await remember_seller(session, user_id, country, item)
-                    normalize_listing_for_export(item, country)
-                    collected.append(item)
-                    cat_added += 1
-                    current_step["detail"] = (
-                        f"+{cat_added} {cat.label} · в JSON {len(collected)}/{json_limit}"
-                    )
-                    await status_progress()
-                    if config.parse_item_delay_sec > 0:
-                        await asyncio.sleep(config.parse_item_delay_sec)
+                    if await _accept_item(item):
+                        cat_added += 1
+                        page_acc += 1
+                        current_step["detail"] = (
+                            f"+{cat_added} {cat.label} · "
+                            f"в JSON {len(collected)}/{json_limit}"
+                        )
+                        await status_progress()
+                        await _sleep_human(config.parse_item_delay_sec)
+                    else:
+                        page_skip += 1
+
+                if page_raw >= 5 and page_acc == 0:
+                    ratio = page_skip / page_raw
+                    if ratio >= config.feed_dup_stop_ratio:
+                        stop_cat_pages["value"] = True
+                        logger.info(
+                            "stop pages %s: %.0f%% skip (VOID-style)",
+                            cat.label,
+                            ratio * 100,
+                        )
 
             def should_stop() -> bool:
                 return stop.is_set() or len(collected) >= json_limit
+
+            def should_stop_pagination() -> bool:
+                return stop_cat_pages["value"]
 
             fetch_meta: dict = {}
             last_err: Exception | None = None
@@ -575,12 +631,13 @@ async def _parse_impl(
                         user_agent=config.fb_user_agent,
                         country=country,
                         proxy_url=proxy_try,
-                        limit=50_000,
+                        limit=max(json_limit * 12, 500),
                         timeout_sec=22.0,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
                         should_stop=should_stop,
+                        should_stop_pagination=should_stop_pagination,
                         hub_round=None,
                         graphql_doc_id=gql_doc,
                     )
@@ -615,7 +672,14 @@ async def _parse_impl(
                 active_cats = active_cats[1:] + [cat]
                 continue
 
-            if fetch_meta.get("exhausted"):
+            if fetch_meta.get("stopped_dup_page"):
+                logger.info("category dup-page stop: %s", cat.label)
+                current_step["text"] = (
+                    f"↪ {cat.label}: в основном старые/повторы · "
+                    f"Показано {len(collected)}/{json_limit}"
+                )
+                active_cats = active_cats[1:] + [cat]
+            elif fetch_meta.get("exhausted"):
                 logger.info("category exhausted: %s", cat.label)
                 current_step["text"] = (
                     f"❌ {cat.label}: лента закончилась · "
