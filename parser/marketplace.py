@@ -709,6 +709,18 @@ def void_export_reject_reason(
     return None
 
 
+def listing_enrich_complete(item: MarketplaceListing) -> bool:
+    """Метаданные с карточки item (имя, дата, описание) — не только person_link из ленты."""
+    if not (item.seller_name or "").strip():
+        return False
+    if not (item.created_date or "").strip() and not item.created_timestamp:
+        return False
+    desc = (item.item_desc or "").strip()
+    if not desc or desc.upper() == "N/A":
+        return False
+    return True
+
+
 def void_complete_from_feed(
     item: MarketplaceListing,
     country: str | None,
@@ -719,6 +731,8 @@ def void_complete_from_feed(
     from services.seller_blacklist import _profile_id
 
     if not _profile_id(item):
+        return False
+    if not listing_enrich_complete(item):
         return False
     return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
 
@@ -2163,7 +2177,7 @@ async def enrich_listing(
     lid = item.listing_id
     feed_hint = _category_feed_html.get() or ""
     apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
-    if _profile_id(item):
+    if listing_enrich_complete(item):
         return item
 
     if feed_hint:
@@ -2178,7 +2192,7 @@ async def enrich_listing(
         )
         if comet:
             _merge_listing(item, comet)
-            if _profile_id(item):
+            if listing_enrich_complete(item):
                 return item
 
     gql_patch = await _enrich_via_graphql_item(
@@ -2192,7 +2206,7 @@ async def enrich_listing(
     )
     if gql_patch:
         _merge_listing(item, gql_patch)
-        if _profile_id(item):
+        if listing_enrich_complete(item):
             return item
 
     locale_q = ""
@@ -2241,7 +2255,7 @@ async def enrich_listing(
         sp = _patch_seller_from_item_page(html, lid)
         if sp:
             _merge_listing(item, sp)
-            if _profile_id(item):
+            if listing_enrich_complete(item):
                 logger.info(
                     "enrich %s seller ok via %s (html=%s profiles=%s)",
                     lid,
@@ -2254,7 +2268,7 @@ async def enrich_listing(
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
                 item.seller_name = nm
-        if _profile_id(item):
+        if listing_enrich_complete(item):
             return item
         comet = await _enrich_via_comet_cookies(
             token,
@@ -2267,7 +2281,7 @@ async def enrich_listing(
         )
         if comet:
             _merge_listing(item, comet)
-            if _profile_id(item):
+            if listing_enrich_complete(item):
                 return item
         gql_patch = await _enrich_via_graphql_item(
             token,
@@ -2280,7 +2294,7 @@ async def enrich_listing(
         )
         if gql_patch:
             _merge_listing(item, gql_patch)
-            if _profile_id(item):
+            if listing_enrich_complete(item):
                 return item
 
     if not _profile_id(item):
