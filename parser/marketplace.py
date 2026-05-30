@@ -487,6 +487,34 @@ def _location_matches_country(location: str, country: str) -> bool:
     return True
 
 
+def _price_indicates_wrong_country(price: str, country: str | None) -> bool:
+    """UAH/₴ в FI и CH — почти всегда объявление не из целевой страны."""
+    if not country:
+        return False
+    p = (price or "").strip()
+    if not p:
+        return False
+    low = p.lower()
+    if "uah" in low or "грн" in low or "₴" in p:
+        return True
+    if country == "fi" and ("chf" in low or "sfr" in low) and "€" not in p and "eur" not in low:
+        return True
+    return False
+
+
+def country_export_reject_reason(
+    item: MarketplaceListing,
+    country: str | None,
+) -> str | None:
+    if not country:
+        return None
+    if listing_is_wrong_country(item, country, void_mode=True):
+        return "чужая_страна"
+    if _price_indicates_wrong_country(item.price or "", country):
+        return "чужая_страна"
+    return None
+
+
 def listing_is_wrong_country(
     item: MarketplaceListing,
     country: str | None,
@@ -706,6 +734,9 @@ def void_export_reject_reason(
     normalize_seller_identity(item)
     if not _profile_id(item):
         return "нет_продавца"
+    wrong = country_export_reject_reason(item, country)
+    if wrong:
+        return wrong
     return None
 
 

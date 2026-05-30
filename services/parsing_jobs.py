@@ -27,6 +27,7 @@ from parser.account_token import (
 )
 from parser.marketplace import (
     enrich_listing,
+    country_export_reject_reason,
     export_reject_reason,
     normalize_listing_for_export,
     fetch_category_listings,
@@ -46,7 +47,7 @@ from services.seller_blacklist import (
 
 logger = logging.getLogger(__name__)
 
-_HARD_FEED_REJECT = frozenset({"старше_24ч", "нет_заголовка"})
+_HARD_FEED_REJECT = frozenset({"старше_24ч", "нет_заголовка", "чужая_страна"})
 
 
 async def _sleep_human(base_sec: float) -> None:
@@ -546,6 +547,10 @@ async def _parse_impl(
                 if is_seller_blocked(item, manual_blocked):
                     _record_reject(stats, "повторный_продавец")
                     return False, True
+                wrong_country = country_export_reject_reason(item, country)
+                if wrong_country:
+                    _record_reject(stats, wrong_country)
+                    return False, False
                 reason = export_reject_reason(
                     item, country, max_age_hours=max_age_hours
                 )
