@@ -61,7 +61,7 @@ async def _sleep_human(base_sec: float) -> None:
 
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
-    "чужая_страна": "Не FI/CH (UA и др.)",
+    "чужая_страна": "Отсечено: не FI/CH",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
@@ -210,10 +210,15 @@ def _progress_text(
                 "Railway → Variables → doc_id из DevTools (graphql).</i>"
             )
         if reasons:
-            lines.append("<b>Отсев:</b>")
+            lines.append("<b>Отсев (в JSON не попадают):</b>")
             for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
                 label = _REJECT_LABELS.get(key, key)
                 lines.append(f"→ {label}: <b>{count}</b>")
+            if reasons.get("чужая_страна"):
+                lines.append(
+                    "<i>UA в ленте FB иногда есть при любом токене — бот их режет, "
+                    "не сохраняет.</i>"
+                )
     if step:
         lines.append(f"📍 {step}")
     return "\n".join(lines)

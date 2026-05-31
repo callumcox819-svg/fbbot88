@@ -38,13 +38,21 @@ def _geo_params(country: str) -> dict[str, str]:
     lat = cfg.get("latitude")
     lon = cfg.get("longitude")
     r = cfg.get("radius_km", 65)
+    params: dict[str, str] = {}
+    if country == "fi":
+        params["locale"] = "fi_FI"
+    elif country == "ch":
+        params["locale"] = "de_CH"
     if lat is None or lon is None:
-        return {}
-    return {
-        "radiusKM": str(int(r)),
-        "latitude": str(lat),
-        "longitude": str(lon),
-    }
+        return params
+    params.update(
+        {
+            "radiusKM": str(int(r)),
+            "latitude": str(lat),
+            "longitude": str(lon),
+        }
+    )
+    return params
 
 
 def _url_with_geo(base: str, country: str) -> str:

@@ -2498,8 +2498,9 @@ async def _fetch_page(
                 "parsed": len(items),
                 "source": "graphql",
             }, next_cursor, has_next
-        logger.info(
-            "graphql empty for %s — fallback HTML (норма без FB_MARKETPLACE_DOC_ID)",
+        logger.warning(
+            "graphql empty for %s — doc_id не подходит к URL категории "
+            "(нужен запрос со скролла finland/category/…, не helsinki/search). HTML fallback.",
             seo[:48],
         )
 
