@@ -101,9 +101,10 @@ def _pages_per_category() -> int:
 
 
 def _graphql_doc_for_feed(explicit: str | None) -> str | None:
+    """doc_id категории (2+ страница). BROWSE_DOC — только смена региона, не лента."""
     if explicit:
         return explicit
-    return config.fb_marketplace_browse_doc_id
+    return config.fb_marketplace_doc_id
 
 
 _FEED_DOC_PATTERNS = (

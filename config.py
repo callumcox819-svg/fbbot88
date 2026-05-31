@@ -54,7 +54,7 @@ def load_config() -> Config:
         parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "6"),
         parse_category_delay_sec=float(os.getenv("PARSE_CATEGORY_DELAY_SEC") or "10"),
         parse_page_delay_sec=float(os.getenv("PARSE_PAGE_DELAY_SEC") or "3"),
-        marketplace_pages_per_category=int(os.getenv("MARKETPLACE_PAGES_PER_CATEGORY") or "3"),
+        marketplace_pages_per_category=int(os.getenv("MARKETPLACE_PAGES_PER_CATEGORY") or "12"),
         feed_dup_stop_ratio=float(os.getenv("FEED_DUP_STOP_RATIO") or "0.85"),
     )
 

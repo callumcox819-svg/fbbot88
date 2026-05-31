@@ -364,7 +364,9 @@ async def _finalize_parse_run(
     elif stop_reason == "категории_исчерпаны":
         lines.append(
             f"<i>Все категории пройдены ({got}/{json_limit}). "
-            f"Если мало — в Railway задай FB_MARKETPLACE_DOC_ID для глубокой ленты.</i>"
+            f"VOID листает тысячи карточек (~20 мин). Если мало: Railway → "
+            f"<code>FB_MARKETPLACE_DOC_ID</code> (graphql doc_id категории из DevTools), "
+            f"прокси FI, лимит категорий 5–7.</i>"
         )
     else:
         dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)
@@ -426,6 +428,7 @@ async def _parse_impl(
     cat_count = len(categories)
     connect_fails = 0
     stop_reason = ""
+    hub_round_counter = 0
 
     t_start = time.monotonic()
     current_step = {"text": "Старт…"}
@@ -659,14 +662,19 @@ async def _parse_impl(
                     len(collected),
                 )
 
-                if page_raw >= 8 and page_acc == 0 and page_skip_dup >= int(
-                    page_raw * config.feed_dup_stop_ratio
+                min_before_dup_stop = min(json_limit, max(40, json_limit // 2))
+                if (
+                    len(collected) >= min_before_dup_stop
+                    and page_raw >= 8
+                    and page_acc == 0
+                    and page_skip_dup >= int(page_raw * config.feed_dup_stop_ratio)
                 ):
                     stop_cat_pages["value"] = True
                     logger.info(
-                        "stop pages %s: %.0f%% dup sellers (VOID-style)",
+                        "stop pages %s: %.0f%% repeat sellers (collected=%s)",
                         cat.label,
                         100 * page_skip_dup / page_raw,
+                        len(collected),
                     )
 
             def should_stop() -> bool:
@@ -678,6 +686,7 @@ async def _parse_impl(
             fetch_meta: dict = {}
             last_err: Exception | None = None
             proxy_used: str | None = None
+            nonlocal hub_round_counter
             for proxy_try in (proxy_url, None):
                 if proxy_try is None and proxy_url is None:
                     break
@@ -697,9 +706,10 @@ async def _parse_impl(
                         on_page_items=on_page_items,
                         should_stop=should_stop,
                         should_stop_pagination=should_stop_pagination,
-                        hub_round=None,
+                        hub_round=hub_round_counter,
                         graphql_doc_id=gql_doc,
                     )
+                    hub_round_counter += 1
                     connect_fails = 0
                     break
                 except AccountTokenDeadError:
