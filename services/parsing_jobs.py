@@ -686,7 +686,6 @@ async def _parse_impl(
             fetch_meta: dict = {}
             last_err: Exception | None = None
             proxy_used: str | None = None
-            nonlocal hub_round_counter
             for proxy_try in (proxy_url, None):
                 if proxy_try is None and proxy_url is None:
                     break
