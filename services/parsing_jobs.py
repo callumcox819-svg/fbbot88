@@ -61,7 +61,7 @@ async def _sleep_human(base_sec: float) -> None:
 
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
-    "чужая_страна": "Чужая страна",
+    "чужая_страна": "Не FI/CH (UA и др.)",
     "мало_полей": "Мало полей",
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
@@ -199,10 +199,16 @@ def _progress_text(
         checked_n = stats.get("checked", 0)
         in_json = stats.get("accepted", done)
         reasons = stats.get("reject_reasons") or {}
+        feed_new = stats.get("feed_new", 0)
         lines.append(
-            f"📊 Проверено: <b>{checked_n}</b> · В JSON: <b>{in_json}</b> · "
-            f"Страниц: <b>{stats.get('pages', 0)}</b>"
+            f"📊 Проверено: <b>{checked_n}</b> · Новых с ленты: <b>{feed_new}</b> · "
+            f"В JSON: <b>{in_json}</b> · Страниц: <b>{stats.get('pages', 0)}</b>"
         )
+        if not (config.fb_marketplace_doc_id or "").strip() and in_json < total // 4:
+            lines.append(
+                "<i>⚠️ Нет FB_MARKETPLACE_DOC_ID — лента без 2-й страницы. "
+                "Railway → Variables → doc_id из DevTools (graphql).</i>"
+            )
         if reasons:
             lines.append("<b>Отсев:</b>")
             for key, count in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
@@ -616,6 +622,7 @@ async def _parse_impl(
                 nonlocal cat_added, page_raw
                 page_raw = len(page_items)
                 stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
+                stats["feed_new"] = stats.get("feed_new", 0) + page_raw
                 page_acc = 0
                 page_skip = 0
                 page_skip_dup = 0

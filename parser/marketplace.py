@@ -1027,6 +1027,7 @@ async def fetch_category_listings(
         fetch_url = with_country_geo(url, country)
         cursor: str | None = None
         discovered_doc: str | None = None
+        stale_feed_pages = 0
         for page_idx in range(max_pages):
             if should_stop and should_stop():
                 break
@@ -1103,6 +1104,19 @@ async def fetch_category_listings(
                     await on_page_found(len(page_new))
                 if on_page_items and page_new:
                     await on_page_items(page_new)
+                if not page_new:
+                    stale_feed_pages += 1
+                    logger.info(
+                        "feed %s p%s: 0 new ids (seen=%s) — stop pagination",
+                        short,
+                        page_idx + 1,
+                        len(seen_ids),
+                    )
+                    if stale_feed_pages >= 1:
+                        has_next_at_end = False
+                        break
+                else:
+                    stale_feed_pages = 0
                 if should_stop_pagination and should_stop_pagination():
                     stopped_dup_page = True
                     has_next_at_end = False
@@ -2531,9 +2545,10 @@ async def _fetch_page(
     if doc_from_html:
         meta["discovered_doc_id"] = doc_from_html
     next_cursor, has_next = _extract_cursor_from_html(html)
-    effective_doc = feed_doc or doc_from_html
-    if not next_cursor and items:
-        has_next = len(items) >= 8 and bool(effective_doc)
+    if not next_cursor:
+        has_next = False
+    elif not feed_doc and not doc_from_html:
+        has_next = False
     if items and not has_next and not next_cursor and not doc_from_html:
         logger.warning(
             "feed %s items, no cursor/doc_id — only 1 HTML page; set FB_MARKETPLACE_DOC_ID",
