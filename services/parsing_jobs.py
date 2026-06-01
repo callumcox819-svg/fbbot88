@@ -236,6 +236,12 @@ async def _send_json_file(
     if not collected:
         return 0
     export_items = dedupe_listings_by_seller(collected)[:json_limit]
+    if len(collected) > len(export_items):
+        logger.info(
+            "export: %s listings -> %s unique sellers (VOID: 1 продавец = 1 строка)",
+            len(collected),
+            len(export_items),
+        )
     for x in export_items:
         normalize_seller_identity(x)
         normalize_listing_for_export(x, country)
@@ -375,9 +381,10 @@ async def _finalize_parse_run(
     elif stop_reason == "категории_исчерпаны":
         lines.append(
             f"<i>Все категории пройдены ({got}/{json_limit}). "
-            f"VOID листает тысячи карточек (~20 мин). Если мало: Railway → "
-            f"<code>FB_MARKETPLACE_DOC_ID</code> (graphql doc_id категории из DevTools), "
-            f"прокси FI, лимит категорий 5–7.</i>"
+            f"В ленте могло быть больше карточек, в JSON — уникальные продавцы. "
+            f"Если мало: <code>FB_MARKETPLACE_DOC_ID</code> со скролла "
+            f"<code>switzerland/category/…</code> или <code>finland/category/…</code> "
+            f"(не Search), прокси страны, 5–7 категорий.</i>"
         )
     else:
         dup = stats.get("reject_reasons", {}).get("повторный_продавец", 0)

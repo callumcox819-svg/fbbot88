@@ -109,15 +109,23 @@ def _graphql_doc_for_feed(explicit: str | None) -> str | None:
 
 _FEED_DOC_PATTERNS = (
     re.compile(
-        r"MarketplaceCategoryFeedPaginationQuery[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        r"MarketplaceCategoryFeedPaginationQuery[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
         re.I | re.DOTALL,
     ),
     re.compile(
-        r"CometMarketplaceCategoryFeed[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        r"CometMarketplaceCategoryFeedPaginationQuery[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
         re.I | re.DOTALL,
     ),
     re.compile(
-        r"marketplace[^\"]{0,40}pagination[^}]{0,800}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        r"CometMarketplaceCategoryFeed[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"MarketplaceCategory[^}]{0,80}Pagination[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"marketplace[^\"]{0,60}pagination[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
         re.I | re.DOTALL,
     ),
 )
@@ -1004,7 +1012,8 @@ async def fetch_category_listings(
     seen_ids: set[str] = set()
     out: list[MarketplaceListing] = []
     total_urls = len(urls)
-    feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    env_feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    skip_env_doc = False
     if urls:
         logger.info(
             "feed country=%s primary=%s (VOID loc_id, не только finland/)",
@@ -1033,8 +1042,15 @@ async def fetch_category_listings(
                 break
             if len(out) >= limit:
                 break
-            page_doc = feed_doc or discovered_doc
-            logger.info("GET %s page=%s doc=%s", fetch_url, page_idx + 1, bool(page_doc))
+            page_doc = discovered_doc or (env_feed_doc if not skip_env_doc else None)
+            logger.info(
+                "GET %s page=%s doc=%s env=%s disc=%s",
+                fetch_url,
+                page_idx + 1,
+                bool(page_doc),
+                bool(env_feed_doc and not skip_env_doc),
+                bool(discovered_doc),
+            )
             try:
                 batch, meta, cursor, has_next = await _fetch_page(
                     token,
@@ -1050,6 +1066,18 @@ async def fetch_category_listings(
                 if meta.get("discovered_doc_id") and not discovered_doc:
                     discovered_doc = str(meta["discovered_doc_id"])
                     logger.info("discovered feed doc_id %s for %s", discovered_doc, short)
+                if (
+                    env_feed_doc
+                    and not skip_env_doc
+                    and meta.get("graphql_miss")
+                    and not discovered_doc
+                ):
+                    skip_env_doc = True
+                    logger.warning(
+                        "FB_MARKETPLACE_DOC_ID не подходит к %s — дальше только HTML "
+                        "или doc_id из этой страницы (finland|switzerland/category/…)",
+                        short,
+                    )
                 pages_fetched += 1
                 has_next_at_end = bool(has_next and cursor)
                 logger.info(
@@ -2454,6 +2482,7 @@ async def _fetch_page(
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
     feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    gql_miss = False
     if feed_doc and cursor:
         gql = await _fetch_graphql_category(
             token,
@@ -2475,7 +2504,18 @@ async def _fetch_page(
                 "parsed": len(items),
                 "source": "graphql",
             }, next_cursor, has_next
-        return [], {"html_len": 0, "link_count": 0, "parsed": 0, "source": "graphql"}, None, False
+        return (
+            [],
+            {
+                "html_len": 0,
+                "link_count": 0,
+                "parsed": 0,
+                "source": "graphql",
+                "graphql_miss": True,
+            },
+            None,
+            False,
+        )
 
     if feed_doc and not cursor:
         gql = await _fetch_graphql_category(
@@ -2498,6 +2538,7 @@ async def _fetch_page(
                 "parsed": len(items),
                 "source": "graphql",
             }, next_cursor, has_next
+        gql_miss = bool(feed_doc)
         logger.warning(
             "graphql empty for %s — doc_id не подходит к URL категории "
             "(нужен запрос со скролла finland/category/…, не helsinki/search). HTML fallback.",
@@ -2533,6 +2574,7 @@ async def _fetch_page(
     meta: dict[str, Any] = {
         "html_len": len(html),
         "link_count": html.count("/marketplace/item/"),
+        "graphql_miss": gql_miss,
     }
     if len(html) < 3_000_000:
         meta["raw_html"] = html
