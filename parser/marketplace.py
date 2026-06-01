@@ -2679,9 +2679,9 @@ async def _fetch_page(
     next_cursor, has_next = _extract_cursor_from_html(html)
     if not next_cursor:
         has_next = False
-    elif not feed_doc and not doc_from_html:
+    elif not feed_doc and not doc_candidates:
         has_next = False
-    if items and not has_next and not next_cursor and not doc_from_html:
+    if items and not has_next and not next_cursor and not doc_candidates:
         logger.warning(
             "feed %s items, no cursor/doc_id — only 1 HTML page; set FB_MARKETPLACE_DOC_ID",
             len(items),
