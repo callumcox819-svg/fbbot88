@@ -131,19 +131,65 @@ _FEED_DOC_PATTERNS = (
 )
 
 
-def _extract_feed_doc_id_from_html(html: str) -> str | None:
-    """doc_id ленты категории из HTML — для 2+ страницы без ручного FB_MARKETPLACE_DOC_ID."""
+_CATEGORY_FEED_QUERY_MARKERS = (
+    "marketplacecategoryfeedpagination",
+    "cometmarketplacecategoryfeedpagination",
+    "marketplacecategoryfeed",
+    "categoryfeedpagination",
+    "marketplacehomefeedpagination",
+)
+
+
+def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
+    """Все doc_id ленты категории из HTML — пробуем без Variables в Railway."""
+    if not html:
+        return []
+    scored: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def add(score: int, doc: str) -> None:
+        if doc not in seen and len(doc) >= 15:
+            seen.add(doc)
+            scored.append((score, doc))
+
     for pat in _FEED_DOC_PATTERNS:
-        m = pat.search(html)
-        if m:
-            return m.group(1)
+        for m in pat.finditer(html):
+            add(10, m.group(1))
+
+    for m in re.finditer(
+        r"([A-Za-z0-9_]*[Mm]arketplace[A-Za-z0-9_]*(?:Feed|Category)[A-Za-z0-9_]*)"
+        r"[\s\S]{0,2500}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        html,
+    ):
+        qname, doc = m.group(1), m.group(2)
+        score = 30
+        ql = qname.lower()
+        if any(x in ql for x in _CATEGORY_FEED_QUERY_MARKERS):
+            score = 5
+        if "search" in ql and "pagination" in ql:
+            score = 80
+        add(score, doc)
+
     for raw in _SCRIPT_JSON_RE.findall(html):
-        if "marketplace" not in raw.lower() or "doc_id" not in raw:
+        low = raw.lower()
+        if "doc_id" not in low or "marketplace" not in low:
             continue
         for m in re.finditer(r"\"doc_id\"\s*:\s*\"(\d{15,20})\"", raw):
-            if "Marketplace" in raw or "marketplace" in raw:
-                return m.group(1)
-    return None
+            doc = m.group(1)
+            score = 40
+            if any(x in low for x in _CATEGORY_FEED_QUERY_MARKERS):
+                score = 15
+            if "searchcontentpagination" in low:
+                score = 90
+            add(score, doc)
+
+    scored.sort(key=lambda x: x[0])
+    return [doc for _, doc in scored]
+
+
+def _extract_feed_doc_id_from_html(html: str) -> str | None:
+    ids = _discover_feed_doc_ids_from_html(html)
+    return ids[0] if ids else None
 
 
 _JOIN_TIME_RE = re.compile(
@@ -767,14 +813,18 @@ def void_complete_from_feed(
     *,
     max_age_hours: float,
 ) -> bool:
-    """Пропускаем enrich только если в ленте уже есть всё как в VOID JSON."""
+    """Пропускаем enrich если в ленте уже есть person_link + цена/фото (+ опционально имя)."""
     from services.seller_blacklist import _profile_id
 
     if not _profile_id(item):
         return False
-    if not listing_enrich_complete(item):
+    if void_export_reject_reason(item, country, max_age_hours=max_age_hours) is not None:
         return False
-    return export_reject_reason(item, country, max_age_hours=max_age_hours) is None
+    if listing_enrich_complete(item):
+        return True
+    price = (item.price or "").strip()
+    photo = (item.photo or "").strip()
+    return bool(price or photo)
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
@@ -1014,6 +1064,7 @@ async def fetch_category_listings(
     total_urls = len(urls)
     env_feed_doc = _graphql_doc_for_feed(graphql_doc_id)
     skip_env_doc = False
+    auto_feed_doc: str | None = None
     if urls:
         logger.info(
             "feed country=%s primary=%s (VOID loc_id, не только finland/)",
@@ -1063,7 +1114,43 @@ async def fetch_category_listings(
                     cursor=cursor,
                     country=country,
                 )
-                if meta.get("discovered_doc_id") and not discovered_doc:
+                if page_idx == 0 and not discovered_doc:
+                    candidates = meta.get("discovered_doc_ids") or []
+                    if not candidates and meta.get("discovered_doc_id"):
+                        candidates = [str(meta["discovered_doc_id"])]
+                    if cursor and candidates:
+                        seo = _seo_path_from_url(fetch_url)
+                        for cand in candidates[:8]:
+                            gql_try = await _fetch_graphql_category(
+                                token,
+                                seo_path=seo,
+                                user_agent=user_agent,
+                                proxy_url=proxy_url,
+                                timeout_sec=timeout_sec,
+                                category_label=category_label,
+                                doc_id=cand,
+                                limit=_FEED_PAGE_SIZE,
+                                cursor=cursor,
+                                country=country,
+                            )
+                            if gql_try and gql_try[0]:
+                                discovered_doc = cand
+                                auto_feed_doc = cand
+                                logger.info(
+                                    "auto feed doc_id %s ok for %s (%s items)",
+                                    cand,
+                                    short,
+                                    len(gql_try[0]),
+                                )
+                                break
+                    if not discovered_doc and candidates:
+                        discovered_doc = str(candidates[0])
+                        logger.info(
+                            "feed doc_id candidate %s for %s (graphql not verified)",
+                            discovered_doc,
+                            short,
+                        )
+                elif meta.get("discovered_doc_id") and not discovered_doc:
                     discovered_doc = str(meta["discovered_doc_id"])
                     logger.info("discovered feed doc_id %s for %s", discovered_doc, short)
                 if (
@@ -1185,6 +1272,7 @@ async def fetch_category_listings(
         "exhausted": exhausted,
         "stopped_dup_page": stopped_dup_page,
         "urls_tried": len(urls),
+        "feed_doc_auto": auto_feed_doc if not env_feed_doc else None,
     }
     logger.info(
         "category %s country=%s urls=%s pages=%s seen=%s collected=%s exhausted=%s",
@@ -2584,9 +2672,10 @@ async def _fetch_page(
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)
     meta["source"] = "html"
-    doc_from_html = _extract_feed_doc_id_from_html(html)
-    if doc_from_html:
-        meta["discovered_doc_id"] = doc_from_html
+    doc_candidates = _discover_feed_doc_ids_from_html(html)
+    if doc_candidates:
+        meta["discovered_doc_id"] = doc_candidates[0]
+        meta["discovered_doc_ids"] = doc_candidates
     next_cursor, has_next = _extract_cursor_from_html(html)
     if not next_cursor:
         has_next = False

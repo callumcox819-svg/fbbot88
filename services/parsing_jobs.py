@@ -204,10 +204,14 @@ def _progress_text(
             f"📊 Проверено: <b>{checked_n}</b> · Новых с ленты: <b>{feed_new}</b> · "
             f"В JSON: <b>{in_json}</b> · Страниц: <b>{stats.get('pages', 0)}</b>"
         )
-        if not (config.fb_marketplace_doc_id or "").strip() and in_json < total // 4:
+        if stats.get("feed_doc_auto"):
             lines.append(
-                "<i>⚠️ Нет FB_MARKETPLACE_DOC_ID — лента без 2-й страницы. "
-                "Railway → Variables → doc_id из DevTools (graphql).</i>"
+                f"<i>doc_id ленты подобран из HTML: <code>{stats['feed_doc_auto'][:12]}…</code></i>"
+            )
+        elif not (config.fb_marketplace_doc_id or "").strip() and in_json < total // 4:
+            lines.append(
+                "<i>⚠️ doc_id ленты не найден — только 1-я порция HTML (~20 карточек). "
+                "Можно задать FB_MARKETPLACE_DOC_ID со скролла category/…</i>"
             )
         if reasons:
             lines.append("<b>Отсев (в JSON не попадают):</b>")
@@ -728,6 +732,9 @@ async def _parse_impl(
                         graphql_doc_id=gql_doc,
                     )
                     hub_round_counter += 1
+                    auto_doc = fetch_meta.get("feed_doc_auto")
+                    if auto_doc:
+                        stats["feed_doc_auto"] = str(auto_doc)
                     connect_fails = 0
                     break
                 except AccountTokenDeadError:
