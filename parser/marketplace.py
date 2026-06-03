@@ -175,6 +175,69 @@ def _html_for_discovery(html: str) -> str:
     )
 
 
+def _fallback_feed_doc_ids(hint_html: str) -> list[str]:
+    """doc_id для GraphQL ленты, если discover ничего не нашёл."""
+    ids = list(_discover_feed_doc_ids_from_html(hint_html))
+    norm = _html_for_discovery(hint_html)
+    for d in re.findall(r'"doc_id"\s*:\s*"(\d{15,20})"', norm):
+        if d not in ids:
+            ids.append(d)
+    for d in re.findall(r"doc_id=(\d{15,20})", norm):
+        if d not in ids:
+            ids.append(d)
+    browse = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    env = (os.getenv("FB_MARKETPLACE_DOC_ID") or "").strip()
+    for d in (env, browse):
+        if d and d not in ids:
+            ids.insert(0, d)
+    return ids[:40]
+
+
+def iter_fb_graphql_roots(raw: str) -> list[Any]:
+    """Один или несколько JSON в ответе GraphQL."""
+    from parser.marketplace_region import loads_fb_api_response
+
+    roots: list[Any] = []
+    text = (raw or "").strip()
+    if not text:
+        return roots
+    try:
+        roots.append(loads_fb_api_response(text))
+    except json.JSONDecodeError:
+        pass
+    for line in text.splitlines():
+        chunk = line.strip()
+        if not chunk or chunk[0] not in "{[":
+            continue
+        if chunk.startswith("for (;;);"):
+            chunk = chunk[9:].strip()
+        if chunk.startswith(")]}'"):
+            chunk = chunk[4:].strip()
+        try:
+            roots.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            continue
+    return roots
+
+
+def listings_from_graphql_raw(
+    raw: str, *, category_label: str = ""
+) -> list[MarketplaceListing]:
+    by_id: dict[str, MarketplaceListing] = {}
+    for root in iter_fb_graphql_roots(raw):
+        _walk_marketplace_json(root, by_id)
+    out: list[MarketplaceListing] = []
+    for lid, it in by_id.items():
+        if not listing_is_valid(it):
+            continue
+        if category_label:
+            it.category = category_label
+        if not it.link:
+            it.link = f"https://www.facebook.com/marketplace/item/{lid}/"
+        out.append(it)
+    return out
+
+
 def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
     """Все doc_id ленты категории из HTML — пробуем без Variables в Railway."""
     html = _html_for_discovery(html)
@@ -862,6 +925,15 @@ def void_export_reject_reason(
     from services.seller_blacklist import normalize_seller_identity
 
     normalize_seller_identity(item)
+    plink = (item.person_link or "").strip()
+    if plink and "/marketplace/item/" in plink:
+        item.person_link = ""
+        item.seller_id = ""
+    lid = (item.listing_id or "").strip()
+    sid = (item.seller_id or "").strip()
+    if lid and sid and lid == sid:
+        item.seller_id = ""
+        item.person_link = ""
     if not _profile_id(item):
         return "нет_продавца"
     wrong = country_export_reject_reason(item, country)
@@ -2278,11 +2350,17 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
         fs = node
 
     lid = str(fs.get("id") or node.get("id") or "").strip()
-    title = _dig_str(fs, "marketplace_listing_title", "group_commerce_item_title", "title")
-    if not title:
-        return None
+    title = _dig_str(
+        fs,
+        "marketplace_listing_title",
+        "group_commerce_item_title",
+        "title",
+        "name",
+    )
     if not lid or not lid.isdigit() or len(lid) < _MIN_LISTING_ID_LEN:
         return None
+    if not title:
+        title = _dig_str(node, "marketplace_listing_title", "title", "name")
 
     price = _dig_str(fs, "formatted_price", "formatted_amount", "listing_price")
     if not price:
@@ -2292,6 +2370,18 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
                 price = _dig_str(price_obj, "text", "amount")
             if price:
                 break
+
+    photo = ""
+    photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
+    if isinstance(photo_obj, dict):
+        img = photo_obj.get("image") or photo_obj
+        if isinstance(img, dict):
+            photo = str(img.get("uri") or "").strip()
+
+    if not title and not price and not photo:
+        return None
+    if not title:
+        title = f"Item {lid}"
 
     location = _dig_str(fs, "marketplace_listing_location", "location")
     seller_name = ""
@@ -2345,13 +2435,6 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
                     break
             elif isinstance(cur, list):
                 stack.extend(cur)
-
-    photo = ""
-    photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
-    if isinstance(photo_obj, dict):
-        img = photo_obj.get("image") or photo_obj
-        if isinstance(img, dict):
-            photo = str(img.get("uri") or "").strip()
 
     person_link = ""
     if seller_id:
@@ -2653,9 +2736,9 @@ async def enrich_listing(
     elif country == "ch":
         locale_q = "?locale=de_CH"
     urls = [
+        f"https://m.facebook.com/marketplace/item/{lid}/",
         f"https://www.facebook.com/marketplace/item/{lid}{locale_q}",
         f"https://mbasic.facebook.com/marketplace/item/{lid}/",
-        f"https://m.facebook.com/marketplace/item/{lid}/",
     ]
     if item.link:
         clean = item.link.split("?")[0].rstrip("/")
@@ -2822,19 +2905,20 @@ async def _fetch_graphql_category_comet(
                 raw = await resp.text(errors="ignore")
                 if resp.status >= 400:
                     return None
-                data = json.loads(raw)
     except Exception as e:
         logger.info("graphql comet miss %s doc=%s: %s", seo_path[:32], doc_id[:8], e)
         return None
 
-    by_id: dict[str, MarketplaceListing] = {}
-    _walk_marketplace_json(data, by_id)
-    for lid, item in by_id.items():
-        item.category = category_label
-        if not item.link:
-            item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
-    items = [x for x in by_id.values() if listing_is_valid(x)]
+    items = listings_from_graphql_raw(raw, category_label=category_label)
+    patch_listings_sellers_from_raw(raw, items)
+    roots = iter_fb_graphql_roots(raw)
+    data = roots[0] if roots else {}
     next_cursor, has_next = _extract_feed_cursor(data)
+    for extra in roots[1:]:
+        c2, n2 = _extract_feed_cursor(extra)
+        if c2:
+            next_cursor = c2
+            has_next = has_next or n2
     if items:
         logger.info(
             "graphql comet %s doc=%s: %s items cursor=%s next=%s",
@@ -3014,21 +3098,13 @@ async def _fetch_page(
     if not doc_ids and region_hint_html:
         doc_ids = _discover_feed_doc_ids_from_html(region_hint_html)[:24]
     if not doc_ids and region_hint_html:
-        brute = list(
-            dict.fromkeys(
-                re.findall(
-                    r'"doc_id"\s*:\s*"(\d{15,20})"',
-                    _html_for_discovery(region_hint_html),
-                )
-            )
-        )[:32]
-        for d in brute:
-            if d not in doc_ids:
-                doc_ids.append(d)
+        doc_ids = _fallback_feed_doc_ids(region_hint_html)
+        if doc_ids:
+            logger.info("feed fallback doc_ids: %s", len(doc_ids))
     if not doc_ids and region_hint_html:
         _, dtsg = _extract_fb_tokens(_html_for_discovery(region_hint_html))
         logger.warning(
-            "feed doc_ids=0 hub=%s bytes dtsg=%s — только HTML категории",
+            "feed doc_ids=0 hub=%s bytes dtsg=%s — GraphQL/ HTML",
             len(region_hint_html),
             bool(dtsg),
         )

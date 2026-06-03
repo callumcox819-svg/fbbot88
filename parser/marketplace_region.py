@@ -31,6 +31,8 @@ def loads_fb_api_response(raw: str) -> Any:
     if text.startswith(")]}'"):
         text = text[4:].strip()
     return json.loads(text)
+
+
 def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
     if not proxy_url:
         return aiohttp.ClientSession()
@@ -232,7 +234,6 @@ async def fetch_browse_marketplace_listings(
                 raw = await resp.text(errors="ignore")
                 if resp.status >= 400 or "login" in raw.lower()[:400]:
                     return [], ""
-                data = loads_fb_api_response(raw)
     except json.JSONDecodeError as e:
         logger.info(
             "browse feed bad json country=%s (len=%s): %s",
@@ -245,22 +246,14 @@ async def fetch_browse_marketplace_listings(
         logger.info("browse feed failed country=%s: %s", country, e)
         return [], raw
 
-    from parser.marketplace import MarketplaceListing, _walk_marketplace_json, listing_is_valid
+    from parser.marketplace import (
+        listings_from_graphql_raw,
+        patch_listings_sellers_from_raw,
+    )
 
-    from parser.marketplace import patch_listings_sellers_from_raw
-
-    by_id: dict[str, MarketplaceListing] = {}
-    _walk_marketplace_json(data, by_id)
-    out: list = []
-    for lid, item in by_id.items():
-        if not listing_is_valid(item):
-            continue
-        item.category = category_label
-        if not item.link:
-            item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
-        out.append(item)
-        if len(out) >= limit:
-            break
+    out = listings_from_graphql_raw(raw, category_label=category_label)
+    if len(out) > limit:
+        out = out[:limit]
     n_prof = patch_listings_sellers_from_raw(raw, out)
     if out:
         logger.info(
@@ -360,7 +353,6 @@ async def fetch_browse_marketplace_comet(
                     return [], ""
                 if "login" in raw.lower()[:500]:
                     return [], ""
-                data = loads_fb_api_response(raw)
     except json.JSONDecodeError as e:
         logger.info(
             "browse comet bad json country=%s (len=%s): %s",
@@ -373,18 +365,14 @@ async def fetch_browse_marketplace_comet(
         logger.info("browse comet failed: %s", e)
         return [], ""
 
-    from parser.marketplace import patch_listings_sellers_from_raw
+    from parser.marketplace import (
+        listings_from_graphql_raw,
+        patch_listings_sellers_from_raw,
+    )
 
-    by_id: dict[str, MarketplaceListing] = {}
-    _walk_marketplace_json(data, by_id)
-    out: list = []
-    for lid, item in by_id.items():
-        if not listing_is_valid(item):
-            continue
-        item.category = category_label
-        out.append(item)
-        if len(out) >= limit:
-            break
+    out = listings_from_graphql_raw(raw, category_label=category_label)
+    if len(out) > limit:
+        out = out[:limit]
     n_prof = patch_listings_sellers_from_raw(raw, out)
     if out:
         logger.info(
@@ -394,7 +382,11 @@ async def fetch_browse_marketplace_comet(
             n_prof,
         )
     else:
-        logger.info("browse comet country=%s: 0 items (keys in json=%s)", country, len(by_id))
+        logger.info(
+            "browse comet country=%s: 0 items (raw_len=%s)",
+            country,
+            len(raw),
+        )
     return out, raw
 
 
