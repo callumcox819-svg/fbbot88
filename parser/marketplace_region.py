@@ -158,6 +158,17 @@ async def _graphql_browse_prime(
     return False
 
 
+async def _read_response_body(resp: aiohttp.ClientResponse, max_bytes: int = 8_000_000) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= max_bytes:
+            break
+    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+
 async def apply_marketplace_region(
     token: AccountToken,
     country: str,
@@ -165,19 +176,26 @@ async def apply_marketplace_region(
     user_agent: str,
     proxy_url: str | None,
     timeout_sec: float = 25.0,
-) -> None:
+) -> tuple[list[str], str]:
     """
     Перед парсингом: открыть CH/FI marketplace + координаты, чтобы FB не отдавал ленту UA аккаунта.
+    Возвращает (doc_id кандидаты из hub HTML, самый полный hub HTML для GraphQL как в браузере).
     """
     if country not in COUNTRY_LOCATIONS:
-        return
+        return [], ""
 
     cfg = COUNTRY_LOCATIONS[country]
     label = cfg.get("label", country)
     headers_base = _fb_headers(
         token, user_agent, "https://www.facebook.com/marketplace/", country=country
     )
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_sec,
+        connect=min(20.0, timeout_sec),
+        sock_read=max(15.0, timeout_sec - 5.0),
+    )
+    doc_ids: list[str] = []
+    hub_html = ""
 
     urls: list[str] = []
     slugs = cfg.get("marketplace_slugs") or []
@@ -204,10 +222,17 @@ async def apply_marketplace_region(
             try:
                 logger.info("region GET %s", url.replace(_FB, "")[:56])
                 async with session.get(url, headers=headers_base, timeout=timeout) as resp:
-                    html = await resp.text(errors="ignore")
+                    html = await _read_response_body(resp)
                     if "login" in str(resp.url).lower() or _looks_like_login_wall(html):
                         raise AccountTokenDeadError("login during region switch")
                     logger.info("marketplace region GET %s", url.replace(_FB, "")[:56])
+                    if len(html) > len(hub_html):
+                        hub_html = html
+                    from parser.marketplace import _discover_feed_doc_ids_from_html
+
+                    for did in _discover_feed_doc_ids_from_html(html):
+                        if did not in doc_ids:
+                            doc_ids.append(did)
             except AccountTokenDeadError:
                 raise
             except Exception as e:
@@ -220,7 +245,13 @@ async def apply_marketplace_region(
         proxy_url=proxy_url,
         timeout_sec=min(timeout_sec, 12.0),
     )
-    logger.info("marketplace region applied: %s", label)
+    logger.info(
+        "marketplace region applied: %s (hub_html=%s, feed_doc_ids=%s)",
+        label,
+        len(hub_html),
+        len(doc_ids),
+    )
+    return doc_ids, hub_html
 
 
 def _category_prime_paths(country: str, url_path: str) -> list[str]:
@@ -256,16 +287,20 @@ async def prime_category_feed_region(
     headers = _fb_headers(
         token, user_agent, "https://www.facebook.com/marketplace/", country=country
     )
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_sec,
+        connect=min(18.0, timeout_sec),
+        sock_read=max(12.0, timeout_sec - 4.0),
+    )
     async with _session_for_proxy(proxy_url) as session:
         for path in _category_prime_paths(country, url_path)[:2]:
             url = _url_with_geo(urljoin(_FB, path), country)
             try:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    await resp.text(errors="ignore")
+                    await _read_response_body(resp, max_bytes=4_000_000)
                     logger.info("category prime GET %s", path[:56])
             except Exception as e:
-                logger.debug("category prime %s: %s", path[:40], e)
+                logger.warning("category prime %s: %s", path[:40], e)
 
 
 def append_geo_to_marketplace_url(url: str, country: str) -> str:

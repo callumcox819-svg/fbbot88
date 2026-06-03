@@ -107,6 +107,30 @@ def _graphql_doc_for_feed(explicit: str | None) -> str | None:
     return config.fb_marketplace_doc_id
 
 
+def _feed_doc_candidates(
+    explicit: str | None, seed_doc_ids: list[str] | None
+) -> list[str]:
+    out: list[str] = []
+    for d in (explicit, *(seed_doc_ids or [])):
+        s = (d or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+async def _read_http_body(
+    resp: aiohttp.ClientResponse, max_bytes: int = 8_000_000
+) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= max_bytes:
+            break
+    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+
 _FEED_DOC_PATTERNS = (
     re.compile(
         r"MarketplaceCategoryFeedPaginationQuery[^}]{0,1200}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
@@ -1052,6 +1076,8 @@ async def fetch_category_listings(
     should_stop_pagination: Callable[[], bool] | None = None,
     hub_round: int | None = None,
     graphql_doc_id: str | None = None,
+    region_hint_html: str = "",
+    seed_doc_ids: list[str] | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any]]:
     """Категория CH/FI: несколько страниц ленты (как VOID), без лишнего листания."""
     if country and country in COUNTRY_LOCATIONS:
@@ -1113,6 +1139,8 @@ async def fetch_category_listings(
                     graphql_doc_id=page_doc,
                     cursor=cursor,
                     country=country,
+                    region_hint_html=region_hint_html,
+                    seed_doc_ids=seed_doc_ids,
                 )
                 if page_idx == 0 and not discovered_doc:
                     candidates = meta.get("discovered_doc_ids") or []
@@ -2484,6 +2512,162 @@ def _seo_path_from_url(url: str) -> str:
     return url.replace("https://www.facebook.com/marketplace/", "").strip("/")
 
 
+async def _fetch_graphql_category_comet(
+    token: AccountToken,
+    *,
+    seo_path: str,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    category_label: str,
+    doc_id: str,
+    limit: int,
+    cursor: str | None,
+    country: str | None,
+    hint_html: str,
+) -> tuple[list[MarketplaceListing], str | None, bool] | None:
+    """Лента категории через cookies + fb_dtsg (как VOID в браузере), без access_token."""
+    lsd, dtsg = _extract_fb_tokens(hint_html)
+    if not dtsg or not token.c_user:
+        return None
+    variables: dict[str, Any] = {
+        "count": min(limit, _FEED_PAGE_SIZE),
+        "cursor": cursor,
+        "scale": 2,
+        "seoURL": seo_path,
+    }
+    if country and country in COUNTRY_LOCATIONS:
+        lid = COUNTRY_LOCATIONS[country].get("filter_location_id")
+        if lid:
+            variables["filterLocationID"] = str(lid)
+            variables["filter_location_id"] = str(lid)
+    referer = f"https://www.facebook.com/marketplace/{seo_path}/"
+    if country:
+        referer = with_country_geo(referer, country)
+    body = urlencode(
+        {
+            "__a": "1",
+            "__user": token.c_user,
+            "fb_dtsg": dtsg,
+            "lsd": lsd or dtsg[:12],
+            "doc_id": doc_id,
+            "variables": json.dumps(variables),
+            "server_timestamps": "1",
+        }
+    )
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Accept-Language": _accept_language(country),
+        "Origin": "https://www.facebook.com",
+        "Referer": referer,
+        "X-FB-LSD": lsd or "",
+    }
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_sec,
+        connect=min(20.0, timeout_sec),
+        sock_read=max(12.0, timeout_sec - 4.0),
+    )
+    try:
+        async with _session_for_proxy(proxy_url) as session:
+            async with session.post(
+                "https://www.facebook.com/api/graphql/",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            ) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400:
+                    return None
+                data = json.loads(raw)
+    except Exception as e:
+        logger.debug("graphql comet category %s doc=%s: %s", seo_path, doc_id[:8], e)
+        return None
+
+    by_id: dict[str, MarketplaceListing] = {}
+    _walk_marketplace_json(data, by_id)
+    for lid, item in by_id.items():
+        item.category = category_label
+        if not item.link:
+            item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
+    items = [x for x in by_id.values() if listing_is_valid(x)]
+    next_cursor, has_next = _extract_feed_cursor(data)
+    if items:
+        logger.info(
+            "graphql comet %s doc=%s: %s items cursor=%s next=%s",
+            seo_path,
+            doc_id[:12],
+            len(items),
+            bool(next_cursor),
+            has_next,
+        )
+    return items, next_cursor, has_next
+
+
+async def _try_graphql_category_feed(
+    token: AccountToken,
+    *,
+    seo_path: str,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    category_label: str,
+    doc_ids: list[str],
+    cursor: str | None,
+    country: str | None,
+    hint_html: str,
+) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool] | None:
+    for doc_id in doc_ids[:16]:
+        if hint_html:
+            gql = await _fetch_graphql_category_comet(
+                token,
+                seo_path=seo_path,
+                user_agent=user_agent,
+                proxy_url=proxy_url,
+                timeout_sec=timeout_sec,
+                category_label=category_label,
+                doc_id=doc_id,
+                limit=_FEED_PAGE_SIZE,
+                cursor=cursor,
+                country=country,
+                hint_html=hint_html,
+            )
+            if gql and gql[0]:
+                items, next_cursor, has_next = gql
+                return items, {
+                    "html_len": 0,
+                    "link_count": len(items),
+                    "parsed": len(items),
+                    "source": "graphql_comet",
+                    "feed_doc_auto": doc_id,
+                }, next_cursor, has_next
+        if token.access_token:
+            gql = await _fetch_graphql_category(
+                token,
+                seo_path=seo_path,
+                user_agent=user_agent,
+                proxy_url=proxy_url,
+                timeout_sec=timeout_sec,
+                category_label=category_label,
+                doc_id=doc_id,
+                limit=_FEED_PAGE_SIZE,
+                cursor=cursor,
+                country=country,
+            )
+            if gql and gql[0]:
+                items, next_cursor, has_next = gql
+                return items, {
+                    "html_len": 0,
+                    "link_count": len(items),
+                    "parsed": len(items),
+                    "source": "graphql",
+                    "feed_doc_auto": doc_id,
+                }, next_cursor, has_next
+    return None
+
+
 async def _fetch_graphql_category(
     token: AccountToken,
     *,
@@ -2575,10 +2759,30 @@ async def _fetch_page(
     graphql_doc_id: str | None = None,
     cursor: str | None = None,
     country: str | None = None,
+    region_hint_html: str = "",
+    seed_doc_ids: list[str] | None = None,
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
     feed_doc = _graphql_doc_for_feed(graphql_doc_id)
+    doc_ids = _feed_doc_candidates(feed_doc, seed_doc_ids)
     gql_miss = False
+
+    if doc_ids:
+        gql_first = await _try_graphql_category_feed(
+            token,
+            seo_path=seo,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            category_label=category_label,
+            doc_ids=doc_ids,
+            cursor=cursor,
+            country=country,
+            hint_html=region_hint_html,
+        )
+        if gql_first:
+            return gql_first
+
     if feed_doc and cursor:
         gql = await _fetch_graphql_category(
             token,
@@ -2658,29 +2862,49 @@ async def _fetch_page(
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_sec, connect=min(25.0, timeout_sec))
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_sec,
+        connect=min(22.0, timeout_sec),
+        sock_read=max(18.0, timeout_sec - 6.0),
+    )
+    fetch_urls = [url]
+    if "www.facebook.com" in url:
+        fetch_urls.append(url.replace("www.facebook.com", "m.facebook.com", 1))
     last_exc: Exception | None = None
     html = ""
-    for attempt in range(3):
-        try:
-            async with _session_for_proxy(proxy_url) as session:
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    html = await resp.text(errors="ignore")
-                    if resp.status >= 400:
-                        raise RuntimeError(f"Facebook HTTP {resp.status}")
-                    if "login" in str(resp.url).lower():
-                        raise AccountTokenDeadError("redirect to login")
-            last_exc = None
+    for fetch_url in fetch_urls:
+        for attempt in range(3):
+            try:
+                async with _session_for_proxy(proxy_url) as session:
+                    async with session.get(
+                        fetch_url, headers=headers, timeout=timeout
+                    ) as resp:
+                        html = await _read_http_body(resp)
+                        if resp.status >= 400:
+                            raise RuntimeError(f"Facebook HTTP {resp.status}")
+                        if "login" in str(resp.url).lower():
+                            raise AccountTokenDeadError("redirect to login")
+                last_exc = None
+                break
+            except (AccountTokenDeadError, RuntimeError):
+                raise
+            except Exception as e:
+                last_exc = e
+                if attempt < 2 and is_connection_error(e):
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        if last_exc is None and html:
+            if fetch_url != url:
+                logger.info("category HTML ok via %s", fetch_url[:48])
             break
-        except (AccountTokenDeadError, RuntimeError):
-            raise
-        except Exception as e:
-            last_exc = e
-            if attempt < 2 and is_connection_error(e):
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            raise
     if last_exc is not None:
+        logger.warning(
+            "category HTML failed %s: %s: %s",
+            seo[:40],
+            type(last_exc).__name__,
+            last_exc,
+        )
         raise last_exc
 
     meta: dict[str, Any] = {

@@ -214,6 +214,11 @@ def _progress_text(
                 "<i>Парсинг остановлен: Facebook не отдаёт ленту (прокси/блок). "
                 "Смени прокси и перезапусти.</i>"
             )
+        elif stats.get("pages", 0) == 0 and checked_n == 0:
+            lines.append(
+                "<i>⚠️ Лента не открылась (прокси/сеть). Проверь SOCKS5 CH/FI в ⚙️ → 🌐 Прокси. "
+                "Токен тот же — VOID у тебя на ПК, бот ходит с Railway.</i>"
+            )
         elif not (config.fb_marketplace_doc_id or "").strip() and in_json < total // 4:
             lines.append(
                 "<i>⚠️ doc_id ленты не найден — только 1-я порция HTML (~20 карточек). "
@@ -504,16 +509,21 @@ async def _parse_impl(
 
     async with Session() as session:
         proxy_url_boot = await pick_random_proxy_url(session, user_id)
+    region_doc_ids: list[str] = []
+    region_hub_html = ""
     try:
         current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
         await status_progress()
-        await apply_marketplace_region(
+        region_doc_ids, region_hub_html = await apply_marketplace_region(
             token,
             country,
             user_agent=config.fb_user_agent,
             proxy_url=proxy_url_boot,
-            timeout_sec=18.0,
+            timeout_sec=22.0,
         )
+        if region_doc_ids:
+            stats["feed_doc_auto"] = region_doc_ids[0]
+            logger.info("region feed doc_ids: %s", len(region_doc_ids))
     except AccountTokenDeadError:
         token_dead_flag["value"] = True
 
@@ -717,9 +727,12 @@ async def _parse_impl(
             fetch_meta: dict = {}
             last_err: Exception | None = None
             proxy_used: str | None = None
-            for proxy_try in (proxy_url, None):
-                if proxy_try is None and proxy_url is None:
-                    break
+            proxy_attempts: tuple[str | None, ...]
+            if proxy_url:
+                proxy_attempts = (proxy_url,)
+            else:
+                proxy_attempts = (None,)
+            for proxy_try in proxy_attempts:
                 try:
                     proxy_used = proxy_try
                     _, fetch_meta = await fetch_category_listings(
@@ -738,6 +751,8 @@ async def _parse_impl(
                         should_stop_pagination=should_stop_pagination,
                         hub_round=hub_round_counter,
                         graphql_doc_id=gql_doc,
+                        region_hint_html=region_hub_html,
+                        seed_doc_ids=region_doc_ids,
                     )
                     hub_round_counter += 1
                     auto_doc = fetch_meta.get("feed_doc_auto")
