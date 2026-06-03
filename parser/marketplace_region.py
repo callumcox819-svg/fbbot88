@@ -19,6 +19,18 @@ from parser.account_token import AccountToken, AccountTokenDeadError, cookies_he
 logger = logging.getLogger(__name__)
 
 _FB = "https://www.facebook.com/marketplace/"
+
+
+def loads_fb_api_response(raw: str) -> Any:
+    """JSON ответ FB GraphQL/comet (иногда с префиксом for (;;);)."""
+    text = (raw or "").strip()
+    if not text:
+        raise json.JSONDecodeError("empty response", raw or "", 0)
+    if text.startswith("for (;;);"):
+        text = text[9:].strip()
+    if text.startswith(")]}'"):
+        text = text[4:].strip()
+    return json.loads(text)
 def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
     if not proxy_url:
         return aiohttp.ClientSession()
@@ -208,6 +220,7 @@ async def fetch_browse_marketplace_listings(
         "access_token": token.access_token,
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    raw = ""
     try:
         async with reuse_http_session(http_session, proxy_url) as session:
             async with session.post(
@@ -218,11 +231,19 @@ async def fetch_browse_marketplace_listings(
             ) as resp:
                 raw = await resp.text(errors="ignore")
                 if resp.status >= 400 or "login" in raw.lower()[:400]:
-                    return []
-                data = json.loads(raw)
+                    return [], ""
+                data = loads_fb_api_response(raw)
+    except json.JSONDecodeError as e:
+        logger.info(
+            "browse feed bad json country=%s (len=%s): %s",
+            country,
+            len(raw),
+            e,
+        )
+        return [], raw
     except Exception as e:
         logger.info("browse feed failed country=%s: %s", country, e)
-        return [], ""
+        return [], raw
 
     from parser.marketplace import MarketplaceListing, _walk_marketplace_json, listing_is_valid
 
@@ -324,6 +345,7 @@ async def fetch_browse_marketplace_comet(
         "X-FB-LSD": lsd or "",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    raw = ""
     try:
         async with reuse_http_session(http_session, proxy_url) as session:
             async with session.post(
@@ -338,7 +360,15 @@ async def fetch_browse_marketplace_comet(
                     return [], ""
                 if "login" in raw.lower()[:500]:
                     return [], ""
-                data = json.loads(raw)
+                data = loads_fb_api_response(raw)
+    except json.JSONDecodeError as e:
+        logger.info(
+            "browse comet bad json country=%s (len=%s): %s",
+            country,
+            len(raw) if raw else 0,
+            e,
+        )
+        return [], raw if raw else ""
     except Exception as e:
         logger.info("browse comet failed: %s", e)
         return [], ""
@@ -390,7 +420,7 @@ async def fetch_any_browse_feed(
         )
         if items:
             return items, raw
-    return await fetch_browse_marketplace_listings(
+    items, raw = await fetch_browse_marketplace_listings(
         token,
         country,
         user_agent=user_agent,
@@ -398,6 +428,7 @@ async def fetch_any_browse_feed(
         http_session=http_session,
         limit=limit,
     )
+    return items, raw
 
 
 async def _read_response_body(resp: aiohttp.ClientResponse, max_bytes: int = 8_000_000) -> str:

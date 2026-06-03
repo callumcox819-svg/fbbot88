@@ -666,14 +666,18 @@ async def _parse_impl(
             _extract_item_doc_id(region_hub_html)
             browse_raw = ""
             comet_items: list = []
-            comet_items, browse_raw = await fetch_any_browse_feed(
-                token,
-                country,
-                hint_html=region_hub_html,
-                user_agent=config.fb_user_agent,
-                proxy_url=proxy_url_boot,
-                limit=max(json_limit * 3, 150),
-            )
+            try:
+                comet_items, browse_raw = await fetch_any_browse_feed(
+                    token,
+                    country,
+                    hint_html=region_hub_html,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    limit=max(json_limit * 3, 150),
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning("browse feed unpack error: %s", e)
+                comet_items, browse_raw = [], ""
             hub_items = listings_from_hub_html(region_hub_html)
             boot_items = merge_marketplace_feeds(comet_items, hub_items)
             from services.seller_blacklist import _profile_id
