@@ -2256,9 +2256,44 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
             continue
         seller_name = seller_name or _seller_name_from_blob(blob)
         sid = str(blob.get("id") or "").strip()
-        if sid.isdigit() and sid != lid:
+        if sid.isdigit() and len(sid) >= 8 and sid != lid:
             seller_id = sid
             break
+    if not seller_id:
+        stack: list[Any] = [node, fs]
+        seen_ids: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if id(cur) in seen_ids:
+                continue
+            seen_ids.add(id(cur))
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    kl = str(k).lower()
+                    if isinstance(v, dict) and any(
+                        x in kl
+                        for x in (
+                            "seller",
+                            "owner",
+                            "actor",
+                            "profile",
+                            "listing_creator",
+                        )
+                    ):
+                        sid = str(v.get("id") or "").strip()
+                        if sid.isdigit() and len(sid) >= 8 and sid != lid:
+                            seller_id = sid
+                            seller_name = seller_name or _seller_name_from_blob(v)
+                            break
+                        nm = _seller_name_from_blob(v)
+                        if nm and not seller_name:
+                            seller_name = nm
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+                if seller_id:
+                    break
+            elif isinstance(cur, list):
+                stack.extend(cur)
 
     photo = ""
     photo_obj = fs.get("primary_listing_photo") or fs.get("listing_photo")
@@ -2346,6 +2381,31 @@ def _extract_cursor_from_html(html: str) -> tuple[str | None, bool]:
         if cursor:
             return cursor, has_next
     return None, False
+
+
+def patch_listings_sellers_from_raw(
+    raw: str, items: list[MarketplaceListing]
+) -> int:
+    """Связать listing_id ↔ profile из сырого JSON browse (как в HTML ленте VOID)."""
+    if not raw or not items:
+        return 0
+    norm = _normalize_fb_html(raw)
+    prox = _proximity_listing_sellers(norm)
+    patched = 0
+    for it in items:
+        lid = (it.listing_id or "").strip()
+        if not lid:
+            continue
+        if prox.get(lid):
+            _merge_listing(it, prox[lid])
+        extra = _seller_from_listing_chunk(norm, lid)
+        if extra:
+            _merge_listing(it, extra)
+        from services.seller_blacklist import _profile_id
+
+        if _profile_id(it):
+            patched += 1
+    return patched
 
 
 def _walk_marketplace_json(obj: Any, out: dict[str, MarketplaceListing]) -> None:

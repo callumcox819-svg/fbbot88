@@ -35,6 +35,8 @@ from parser.marketplace import (
     is_connection_error,
     listings_from_hub_html,
     listings_to_json,
+    patch_listings_sellers_from_raw,
+    _seller_from_listing_chunk,
     void_complete_from_feed,
     void_export_reject_reason,
 )
@@ -617,6 +619,25 @@ async def _parse_impl(
                 if ok:
                     await _sleep_human(config.parse_item_delay_sec)
                 return ok, False
+            if not stop.is_set() and region_hub_html:
+                from services.seller_blacklist import _profile_id
+
+                if not _profile_id(item):
+                    patch = _seller_from_listing_chunk(
+                        region_hub_html, item.listing_id
+                    )
+                    if patch:
+                        from parser.marketplace import _merge_listing
+
+                        _merge_listing(item, patch)
+                if void_complete_from_feed(
+                    item, country, max_age_hours=max_age_hours
+                ):
+                    async with accept_lock:
+                        ok = await _accept_item(item)
+                    if ok:
+                        await _sleep_human(config.parse_item_delay_sec)
+                    return ok, False
             if not stop.is_set():
                 try:
                     await enrich_listing(
@@ -647,11 +668,39 @@ async def _parse_impl(
                     proxy_url=proxy_url_boot,
                     limit=max(json_limit * 3, 150),
                 )
-            logger.info("post-region feed: %s items", len(boot_items))
-            for boot_it in boot_items:
+            from services.seller_blacklist import _profile_id
+
+            patch_listings_sellers_from_raw(region_hub_html, boot_items)
+            with_profile = sum(1 for it in boot_items if _profile_id(it))
+            logger.info(
+                "post-region feed: %s items, person_link=%s",
+                len(boot_items),
+                with_profile,
+            )
+            boot_sem = asyncio.Semaphore(4)
+
+            async def _boot_one(it) -> None:
                 if stop.is_set() or len(collected) >= json_limit:
-                    break
-                await _process_listing(boot_it)
+                    return
+                async with boot_sem:
+                    if not _profile_id(it):
+                        patch = _seller_from_listing_chunk(
+                            region_hub_html, it.listing_id
+                        )
+                        if patch:
+                            from parser.marketplace import _merge_listing as _ml
+
+                            _ml(it, patch)
+                    ok, _ = await _process_listing(it)
+                    if ok:
+                        logger.info(
+                            "accepted %s (json %s/%s)",
+                            (it.listing_id or "")[:14],
+                            len(collected),
+                            json_limit,
+                        )
+
+            await asyncio.gather(*[_boot_one(it) for it in boot_items])
 
         try:
             while (

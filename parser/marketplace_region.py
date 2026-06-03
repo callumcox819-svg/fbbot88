@@ -226,6 +226,8 @@ async def fetch_browse_marketplace_listings(
 
     from parser.marketplace import MarketplaceListing, _walk_marketplace_json, listing_is_valid
 
+    from parser.marketplace import patch_listings_sellers_from_raw
+
     by_id: dict[str, MarketplaceListing] = {}
     _walk_marketplace_json(data, by_id)
     out: list = []
@@ -238,8 +240,15 @@ async def fetch_browse_marketplace_listings(
         out.append(item)
         if len(out) >= limit:
             break
+    n_prof = patch_listings_sellers_from_raw(raw, out)
     if out:
-        logger.info("browse feed country=%s: %s items (doc=%s)", country, len(out), doc_id[:12])
+        logger.info(
+            "browse feed country=%s: %s items sellers=%s (doc=%s)",
+            country,
+            len(out),
+            n_prof,
+            doc_id[:12],
+        )
     return out
 
 
@@ -334,6 +343,8 @@ async def fetch_browse_marketplace_comet(
         logger.info("browse comet failed: %s", e)
         return []
 
+    from parser.marketplace import patch_listings_sellers_from_raw
+
     by_id: dict[str, MarketplaceListing] = {}
     _walk_marketplace_json(data, by_id)
     out: list = []
@@ -344,8 +355,14 @@ async def fetch_browse_marketplace_comet(
         out.append(item)
         if len(out) >= limit:
             break
+    n_prof = patch_listings_sellers_from_raw(raw, out)
     if out:
-        logger.info("browse comet country=%s: %s items", country, len(out))
+        logger.info(
+            "browse comet country=%s: %s items, sellers=%s",
+            country,
+            len(out),
+            n_prof,
+        )
     else:
         logger.info("browse comet country=%s: 0 items (keys in json=%s)", country, len(by_id))
     return out
