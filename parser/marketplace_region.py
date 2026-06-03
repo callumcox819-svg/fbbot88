@@ -549,9 +549,9 @@ async def apply_marketplace_region(
         http_session=http_session,
     )
     if hub_html:
-        from parser.marketplace import _fallback_feed_doc_ids
+        from parser.marketplace import _fallback_category_feed_doc_ids
 
-        for did in _fallback_feed_doc_ids(hub_html):
+        for did in _fallback_category_feed_doc_ids(hub_html):
             if did not in doc_ids:
                 doc_ids.append(did)
     logger.info(

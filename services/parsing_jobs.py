@@ -221,9 +221,16 @@ def _progress_text(
             f"В JSON: <b>{in_json}</b> · Страниц: <b>{stats.get('pages', 0)}</b>"
         )
         if stats.get("feed_doc_auto"):
-            lines.append(
-                f"<i>doc_id ленты подобран из HTML: <code>{stats['feed_doc_auto'][:12]}…</code></i>"
-            )
+            doc_hint = stats["feed_doc_auto"][:12]
+            if stats.get("feed_doc_is_browse"):
+                lines.append(
+                    f"<i>⚠️ doc_id из HTML — browse (<code>{doc_hint}…</code>), "
+                    f"не лента категории. Задай <code>FB_MARKETPLACE_DOC_ID</code> со скролла category/…</i>"
+                )
+            else:
+                lines.append(
+                    f"<i>doc_id ленты категории из HTML: <code>{doc_hint}…</code></i>"
+                )
         elif stop_reason == "нет_связи_fb":
             lines.append(
                 "<i>Парсинг остановлен: Facebook не отдаёт ленту (прокси/блок). "
@@ -549,8 +556,18 @@ async def _parse_impl(
                 timeout_sec=22.0,
             )
             if region_doc_ids:
-                stats["feed_doc_auto"] = region_doc_ids[0]
-                logger.info("region feed doc_ids: %s", len(region_doc_ids))
+                from parser.marketplace import _browse_doc_id
+
+                browse_d = _browse_doc_id()
+                cat_ids = [d for d in region_doc_ids if d != browse_d]
+                stats["feed_doc_auto"] = (cat_ids or region_doc_ids)[0]
+                stats["feed_doc_is_browse"] = stats["feed_doc_auto"] == browse_d
+                logger.info(
+                    "region feed doc_ids: %s (category=%s browse=%s)",
+                    len(region_doc_ids),
+                    len(cat_ids),
+                    browse_d[:12] if browse_d else "",
+                )
             elif region_hub_html:
                 from parser.marketplace import _hub_has_listings
 

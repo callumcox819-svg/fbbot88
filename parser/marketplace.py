@@ -70,11 +70,20 @@ _DESC_RE = re.compile(
 _SELLER_ID_RE = re.compile(r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"')
 _PROFILE_LINK_RE = re.compile(r"/marketplace/profile/(\d{8,})")
 _PROFILE_PRODUCT_RE = re.compile(
-    r"/marketplace/profile/(\d{8,})[^\"'<>]{0,96}?product_id=(\d{8,})",
+    r"/marketplace/profile/(\d{8,})[^\"'<>]{0,96}?"
+    r"(?:product_id|productId)(?:=|\\u003d)(\d{8,})",
     re.I,
 )
 _PROFILE_PRODUCT_REV_RE = re.compile(
     r"product_id=(\d{8,})[^\"'<>]{0,96}?/marketplace/profile/(\d{8,})",
+    re.I,
+)
+_PROFILE_PRODUCT_JSON_RE = re.compile(
+    r'"product_id"\s*:\s*"(?P<lid>\d{8,})"[\s\S]{0,1200}?"id"\s*:\s*"(?P<pid>\d{8,})"',
+    re.I,
+)
+_PROFILE_PRODUCT_JSON_REV_RE = re.compile(
+    r'"id"\s*:\s*"(?P<pid>\d{8,})"[\s\S]{0,1200}?"product_id"\s*:\s*"(?P<lid>\d{8,})"',
     re.I,
 )
 _SELLER_ID_ALT_RE = re.compile(
@@ -175,21 +184,33 @@ def _html_for_discovery(html: str) -> str:
     )
 
 
-def _fallback_feed_doc_ids(hint_html: str) -> list[str]:
-    """doc_id для GraphQL ленты, если discover ничего не нашёл."""
-    ids = list(_discover_feed_doc_ids_from_html(hint_html))
+def _browse_doc_id() -> str:
+    return (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+
+
+def _fallback_category_feed_doc_ids(hint_html: str) -> list[str]:
+    """doc_id ленты категории — без browse (он только для смены региона)."""
+    browse = _browse_doc_id()
+    ids = [d for d in _discover_feed_doc_ids_from_html(hint_html) if d != browse]
     norm = _html_for_discovery(hint_html)
     for d in re.findall(r'"doc_id"\s*:\s*"(\d{15,20})"', norm):
-        if d not in ids:
+        if d not in ids and d != browse:
             ids.append(d)
     for d in re.findall(r"doc_id=(\d{15,20})", norm):
-        if d not in ids:
+        if d not in ids and d != browse:
             ids.append(d)
-    browse = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
     env = (os.getenv("FB_MARKETPLACE_DOC_ID") or "").strip()
-    for d in (env, browse):
-        if d and d not in ids:
-            ids.insert(0, d)
+    if env and env not in ids:
+        ids.insert(0, env)
+    return ids[:40]
+
+
+def _fallback_feed_doc_ids(hint_html: str) -> list[str]:
+    """Обратная совместимость: категория + browse в конце."""
+    ids = _fallback_category_feed_doc_ids(hint_html)
+    browse = _browse_doc_id()
+    if browse and browse not in ids:
+        ids.append(browse)
     return ids[:40]
 
 
@@ -255,16 +276,22 @@ def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
         for m in pat.finditer(html):
             add(10, m.group(1))
 
+    browse = _browse_doc_id()
+
     for m in re.finditer(
         r"([A-Za-z0-9_]*[Mm]arketplace[A-Za-z0-9_]*(?:Feed|Category)[A-Za-z0-9_]*)"
         r"[\s\S]{0,2500}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
         html,
     ):
         qname, doc = m.group(1), m.group(2)
+        if doc == browse:
+            continue
         score = 30
         ql = qname.lower()
         if any(x in ql for x in _CATEGORY_FEED_QUERY_MARKERS):
-            score = 5
+            score = 95
+        if "browse" in ql and "category" not in ql:
+            score = 8
         if "search" in ql and "pagination" in ql:
             score = 80
         add(score, doc)
@@ -275,20 +302,28 @@ def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
             continue
         for m in re.finditer(r"\"doc_id\"\s*:\s*\"(\d{15,20})\"", raw):
             doc = m.group(1)
+            if doc == browse:
+                continue
             score = 40
             if any(x in low for x in _CATEGORY_FEED_QUERY_MARKERS):
-                score = 15
+                score = 85
+            if "browse" in low and "categoryfeed" not in low:
+                score = 10
             if "searchcontentpagination" in low:
                 score = 90
             add(score, doc)
 
     if not scored:
         for m in re.finditer(r'"doc_id"\s*:\s*"(\d{15,20})"', html):
-            add(55, m.group(1))
+            doc = m.group(1)
+            if doc != browse:
+                add(55, doc)
         for m in re.finditer(r"doc_id=(\d{15,20})", html):
-            add(60, m.group(1))
+            doc = m.group(1)
+            if doc != browse:
+                add(60, doc)
 
-    scored.sort(key=lambda x: x[0])
+    scored.sort(key=lambda x: -x[0])
     return [doc for _, doc in scored]
 
 
@@ -1664,11 +1699,24 @@ def _index_sellers_from_relay_json(obj: Any, out: dict[str, dict[str, str]]) -> 
         typename = str(obj.get("__typename") or "")
         if not title and "Listing" in typename:
             title = _dig_str(obj, "marketplace_listing_title", "title") or "x"
+        has_seller_hint = any(k in obj for k in _SELLER_BLOB_KEYS) or bool(
+            obj.get("marketplace_listing_seller_id")
+        )
+        is_listing_node = bool(title) or "Listing" in typename or "Commerce" in typename
+        if has_seller_hint and not is_listing_node:
+            is_listing_node = True
+            if not title:
+                title = "x"
         for key in ("id", "listing_id", "legacy_listing_id"):
             val = str(obj.get(key) or "").strip()
-            if val.isdigit() and len(val) >= _MIN_LISTING_ID_LEN and title:
+            if val.isdigit() and len(val) >= _MIN_LISTING_ID_LEN and is_listing_node:
                 lid = val
                 break
+        if not lid:
+            url = str(obj.get("listing_url") or obj.get("url") or "")
+            m_url = _LISTING_ID_RE.search(url)
+            if m_url and is_listing_node:
+                lid = m_url.group(1)
         if lid:
             patch: dict[str, str] = {}
             sid_direct = str(
@@ -1689,6 +1737,21 @@ def _index_sellers_from_relay_json(obj: Any, out: dict[str, dict[str, str]]) -> 
                         for k in ("seller_id", "seller_name", "person_link"):
                             if tmp.get(k):
                                 patch[k] = str(tmp[k])
+            actors = obj.get("actors")
+            if isinstance(actors, list):
+                for act in actors:
+                    if not isinstance(act, dict):
+                        continue
+                    sid = str(act.get("id") or "").strip()
+                    if sid.isdigit() and len(sid) >= 8 and sid != lid:
+                        patch.setdefault("seller_id", sid)
+                        patch.setdefault(
+                            "person_link",
+                            f"https://www.facebook.com/marketplace/profile/{sid}/",
+                        )
+                        nm = _seller_name_from_blob(act)
+                        if nm:
+                            patch.setdefault("seller_name", nm)
             if patch:
                 prev = out.get(lid, {})
                 prev.update(patch)
@@ -1790,11 +1853,16 @@ def _index_sellers_from_dom(html: str) -> dict[str, dict[str, str]]:
 def _normalize_fb_html(html: str) -> str:
     if not html:
         return ""
-    return (
+    out = (
         html.replace("\\/", "/")
         .replace("\\u002f", "/")
         .replace("\\u002F", "/")
+        .replace("\\u003d", "=")
+        .replace("\\u003D", "=")
+        .replace("\\u0026", "&")
     )
+    out = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), out)
+    return out
 
 
 def _extract_fb_tokens(html: str) -> tuple[str | None, str | None]:
@@ -1927,6 +1995,30 @@ def _proximity_listing_sellers(html: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _discover_item_doc_ids_from_html(html: str) -> list[str]:
+    """doc_id карточки /marketplace/item/ — не подмешивать browse/feed doc_id."""
+    browse = _browse_doc_id()
+    ids: list[str] = []
+    env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
+    if env:
+        ids.append(env)
+    norm = _html_for_discovery(html)
+    for pat in _ITEM_DOC_PATTERNS:
+        for m in pat.finditer(norm):
+            d = m.group(1)
+            if d not in ids and d != browse:
+                ids.append(d)
+    for raw in _SCRIPT_JSON_RE.findall(norm):
+        low = raw.lower()
+        if "listingdetails" not in low and "productdetails" not in low:
+            continue
+        for m in re.finditer(r"\"doc_id\"\s*:\s*\"(\d{15,20})\"", raw):
+            d = m.group(1)
+            if d not in ids and d != browse:
+                ids.append(d)
+    return ids[:12]
+
+
 def _extract_item_doc_id(html: str) -> str | None:
     global _cached_item_doc_id
     env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
@@ -1934,14 +2026,11 @@ def _extract_item_doc_id(html: str) -> str | None:
         return env
     if _cached_item_doc_id:
         return _cached_item_doc_id
-    if not html:
-        return None
-    for pat in _ITEM_DOC_PATTERNS:
-        m = pat.search(html)
-        if m:
-            _cached_item_doc_id = m.group(1)
-            logger.info("discovered item doc_id %s", _cached_item_doc_id)
-            return _cached_item_doc_id
+    ids = _discover_item_doc_ids_from_html(html)
+    if ids:
+        _cached_item_doc_id = ids[0]
+        logger.info("discovered item doc_id %s", _cached_item_doc_id)
+        return _cached_item_doc_id
     return None
 
 
@@ -1980,25 +2069,13 @@ async def _enrich_via_comet_cookies(
     hint_html: str,
 ) -> dict[str, Any]:
     """GraphQL карточки через cookies + fb_dtsg (как браузер), без access_token."""
-    doc_id = _extract_item_doc_id(hint_html)
+    doc_ids = _discover_item_doc_ids_from_html(hint_html)
     lsd, dtsg = _extract_fb_tokens(hint_html)
-    if not doc_id or not dtsg or not token.c_user:
+    if not doc_ids or not dtsg or not token.c_user:
         return {}
     referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
     if country:
         referer = with_country_geo(referer, country)
-    variables = json.dumps({"listingID": listing_id, "scale": 2})
-    body = urlencode(
-        {
-            "__a": "1",
-            "__user": token.c_user,
-            "fb_dtsg": dtsg,
-            "lsd": lsd or dtsg[:12],
-            "doc_id": doc_id,
-            "variables": variables,
-            "server_timestamps": "1",
-        }
-    )
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
@@ -2009,29 +2086,104 @@ async def _enrich_via_comet_cookies(
         "Referer": referer,
         "X-FB-LSD": lsd or "",
     }
+    var_sets = [
+        {"listingID": listing_id, "scale": 2},
+        {"listing_id": listing_id, "scale": 2},
+        {"id": listing_id},
+    ]
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     try:
         async with reuse_http_session(None, proxy_url) as session:
-            async with session.post(
-                "https://www.facebook.com/api/graphql/",
-                headers=headers,
-                data=body,
-                timeout=timeout,
-            ) as resp:
-                raw = await resp.text(errors="ignore")
-                if resp.status >= 400:
-                    return {}
-                data = json.loads(raw)
+            for doc_id in doc_ids[:6]:
+                for variables in var_sets:
+                    body = urlencode(
+                        {
+                            "__a": "1",
+                            "__user": token.c_user,
+                            "fb_dtsg": dtsg,
+                            "lsd": lsd or dtsg[:12],
+                            "doc_id": doc_id,
+                            "variables": json.dumps(variables),
+                            "server_timestamps": "1",
+                        }
+                    )
+                    async with session.post(
+                        "https://www.facebook.com/api/graphql/",
+                        headers=headers,
+                        data=body,
+                        timeout=timeout,
+                    ) as resp:
+                        raw = await resp.text(errors="ignore")
+                        if resp.status >= 400:
+                            continue
+                        from parser.marketplace_region import loads_fb_api_response
+
+                        data = loads_fb_api_response(raw)
+                    patch = _seller_patch_from_graphql_payload(data, listing_id)
+                    full = _listing_dict_from_graphql_raw(raw, listing_id)
+                    if full:
+                        patch = {**patch, **full}
+                    if patch.get("seller_id") or patch.get("person_link"):
+                        logger.info(
+                            "comet item graphql ok %s profile=%s doc=%s",
+                            listing_id,
+                            str(patch.get("seller_id", ""))[:12],
+                            doc_id[:10],
+                        )
+                        return patch
     except Exception as e:
         logger.debug("comet item graphql %s: %s", listing_id, e)
+    return {}
+
+
+async def _enrich_via_ajax_item(
+    token: AccountToken,
+    listing_id: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    country: str | None,
+) -> dict[str, Any]:
+    """ajax/marketplace/item — часто отдаёт seller в JSON без полной HTML-страницы."""
+    referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
+    if country:
+        referer = with_country_geo(referer, country)
+    url = (
+        f"https://www.facebook.com/ajax/marketplace/item/?listing_id={listing_id}"
+    )
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Accept": "*/*",
+        "Accept-Language": _accept_language(country),
+        "Referer": referer,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with reuse_http_session(None, proxy_url) as session:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400 or len(raw) < 80:
+                    return {}
+    except Exception as e:
+        logger.debug("ajax item %s: %s", listing_id, e)
         return {}
-    patch = _seller_patch_from_graphql_payload(data, listing_id)
+    patch = _patch_seller_from_html(raw, listing_id)
+    relay: dict[str, dict[str, str]] = {}
+    for root in iter_fb_graphql_roots(raw):
+        found: dict[str, Any] = {}
+        if _deep_seller_patch(root, listing_id, found):
+            patch = {**patch, **found}
+        _index_sellers_from_relay_json(root, relay)
+    if relay.get(listing_id):
+        patch = {**patch, **relay[listing_id]}
+    full = _listing_dict_from_graphql_raw(raw, listing_id)
+    if full:
+        patch = {**patch, **full}
     if patch.get("seller_id") or patch.get("person_link"):
-        logger.info(
-            "comet item graphql ok %s profile=%s",
-            listing_id,
-            str(patch.get("seller_id", ""))[:12],
-        )
+        logger.info("ajax item ok %s", listing_id[:14])
     return patch
 
 
@@ -2066,18 +2218,7 @@ def _listing_dict_from_graphql_raw(raw: str, listing_id: str) -> dict[str, Any]:
 
 
 def _item_graphql_doc_ids(hint_html: str) -> list[str]:
-    ids: list[str] = []
-    env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
-    if env:
-        ids.append(env)
-    one = _extract_item_doc_id(hint_html)
-    if one and one not in ids:
-        ids.append(one)
-    if hint_html:
-        for d in _fallback_feed_doc_ids(hint_html)[:16]:
-            if d not in ids:
-                ids.append(d)
-    return ids
+    return _discover_item_doc_ids_from_html(hint_html)
 
 
 async def _enrich_via_graphql_item(
@@ -2200,6 +2341,23 @@ def build_feed_seller_index(html: str) -> dict[str, dict[str, str]]:
                 "seller_id": pid,
                 "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
             }
+    for m in _PROFILE_PRODUCT_REV_RE.finditer(norm):
+        prod, pid = m.group(1), m.group(2)
+        if prod != pid:
+            out.setdefault(prod, {}).update({
+                "seller_id": pid,
+                "person_link": f"https://www.facebook.com/marketplace/profile/{pid}/",
+            })
+    for pat in (_PROFILE_PRODUCT_JSON_RE, _PROFILE_PRODUCT_JSON_REV_RE):
+        for m in pat.finditer(norm):
+            lid, pid = m.group("lid"), m.group("pid")
+            if lid != pid:
+                out.setdefault(lid, {}).update({
+                    "seller_id": pid,
+                    "person_link": (
+                        f"https://www.facebook.com/marketplace/profile/{pid}/"
+                    ),
+                })
     for lid, ent in _chunk_sellers_for_all_listings(norm).items():
         out[lid] = dict(ent)
     for lid, ent in _proximity_listing_sellers(norm).items():
@@ -2269,6 +2427,12 @@ def _seller_patch_by_product_id(html: str, listing_id: str) -> dict[str, Any]:
                 prod, pid = m.group(1), m.group(2)
             if prod == listing_id and pid != listing_id:
                 return _seller_patch_for_profile_id(h, pid)
+    for pat in (_PROFILE_PRODUCT_JSON_RE, _PROFILE_PRODUCT_JSON_REV_RE):
+        for m in pat.finditer(h):
+            if m.group("lid") == listing_id:
+                pid = m.group("pid")
+                if pid != listing_id:
+                    return _seller_patch_for_profile_id(h, pid)
     return {}
 
 
@@ -2647,23 +2811,19 @@ def patch_listings_sellers_from_raw(
         return 0
     from services.seller_blacklist import _profile_id
 
-    relay: dict[str, dict[str, str]] = {}
+    relay = build_feed_seller_index(raw)
+    norm = _normalize_fb_html(raw)
     stripped = raw.lstrip()
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             _index_sellers_from_relay_json(json.loads(raw), relay)
         except json.JSONDecodeError:
             pass
-    norm = _normalize_fb_html(raw)
     for script in _SCRIPT_JSON_RE.findall(norm):
         try:
             _index_sellers_from_relay_json(json.loads(script), relay)
         except json.JSONDecodeError:
             continue
-    prox = _proximity_listing_sellers(norm)
-    for lid, ent in prox.items():
-        prev = relay.setdefault(lid, {})
-        prev.update({k: v for k, v in ent.items() if v})
     patched = 0
     for it in items:
         lid = (it.listing_id or "").strip()
@@ -2821,6 +2981,20 @@ async def enrich_listing(
         _extract_item_doc_id(feed_hint)
     apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
     if listing_void_ready(item):
+        return item
+
+    ajax_patch = await _enrich_via_ajax_item(
+        token,
+        lid,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=timeout_sec,
+        country=country,
+    )
+    if ajax_patch:
+        _merge_listing(item, ajax_patch)
+    if listing_void_ready(item):
+        logger.info("enrich %s void-ready via ajax", lid)
         return item
 
     gql_patch = await _enrich_via_graphql_item(
@@ -3217,7 +3391,7 @@ async def _fetch_page(
     if not doc_ids and region_hint_html:
         doc_ids = _discover_feed_doc_ids_from_html(region_hint_html)[:24]
     if not doc_ids and region_hint_html:
-        doc_ids = _fallback_feed_doc_ids(region_hint_html)
+        doc_ids = _fallback_category_feed_doc_ids(region_hint_html)
         if doc_ids:
             logger.info("feed fallback doc_ids: %s", len(doc_ids))
     if not doc_ids and region_hint_html:
