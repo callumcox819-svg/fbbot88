@@ -313,6 +313,30 @@ def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
                 score = 90
             add(score, doc)
 
+    for m in re.finditer(
+        r'"doc_id"\s*:\s*"(\d{15,20})"[\s\S]{0,1200}?seoURL',
+        html,
+        re.I,
+    ):
+        doc = m.group(1)
+        if doc != browse:
+            add(92, doc)
+    for m in re.finditer(
+        r'seoURL[\s\S]{0,1200}?"doc_id"\s*:\s*"(\d{15,20})"',
+        html,
+        re.I,
+    ):
+        doc = m.group(1)
+        if doc != browse:
+            add(93, doc)
+    for m in re.finditer(
+        r'"queryID"\s*:\s*"(\d{15,20})"[\s\S]{0,800}?[Mm]arketplace',
+        html,
+    ):
+        doc = m.group(1)
+        if doc != browse:
+            add(70, doc)
+
     if not scored:
         for m in re.finditer(r'"doc_id"\s*:\s*"(\d{15,20})"', html):
             doc = m.group(1)
@@ -384,6 +408,8 @@ _category_feed_html: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "category_feed_html", default=None
 )
 _cached_item_doc_id: str | None = None
+_item_doc_prime_lock: asyncio.Lock | None = None
+_item_doc_prime_done: bool = False
 
 _ITEM_DOC_PATTERNS = (
     re.compile(
@@ -1878,8 +1904,12 @@ def _extract_fb_tokens(html: str) -> tuple[str | None, str | None]:
             break
     for pat in (
         r'"DTSGInitData",\[\],\{"token":"([^"]+)"',
+        r'"DTSGInitialData"[^]]{0,120}?"token":"([^"]+)"',
+        r'\["DTSG",[^\]]{0,80}?"token":"([^"]+)"',
         r'"dtsg":\{"token":"([^"]+)"',
+        r'"dtsg"\s*:\s*\{"token":"([^"]+)"',
         r'name="fb_dtsg" value="([^"]+)"',
+        r'fb_dtsg["\s:]+([A-Za-z0-9:_-]{20,})',
     ):
         m = re.search(pat, html)
         if m:
@@ -1909,8 +1939,13 @@ def _seller_from_listing_chunk(html: str, listing_id: str) -> dict[str, str]:
     patterns = (
         rf'"{listing_id}"[\s\S]{{0,8000}}?"marketplace_listing_seller"[\s\S]{{0,1200}}?"id"\s*:\s*"(\d{{8,}})"',
         rf'"{listing_id}"[\s\S]{{0,8000}}?"seller"[\s\S]{{0,800}}?"id"\s*:\s*"(\d{{8,}})"',
+        rf'"{listing_id}"[\s\S]{{0,12000}}?"owner"[\s\S]{{0,800}}?"id"\s*:\s*"(\d{{8,}})"',
+        rf'"{listing_id}"[\s\S]{{0,12000}}?"actor"[\s\S]{{0,800}}?"id"\s*:\s*"(\d{{8,}})"',
+        rf'"for_sale_item_id"\s*:\s*"{listing_id}"[\s\S]{{0,12000}}?"id"\s*:\s*"(\d{{8,}})"',
+        rf'"listing_id"\s*:\s*"{listing_id}"[\s\S]{{0,12000}}?"seller_id"\s*:\s*"(\d{{8,}})"',
         r'marketplace_listing_seller(?:_id)?"\s*:\s*"(\d{8,})"',
         r'"marketplace_listing_seller_id"\s*:\s*"(\d+)"',
+        r'"seller_mobile_id"\s*:\s*"(\d{8,})"',
     )
     for pat in patterns:
         m = re.search(pat, chunk, re.I)
@@ -2218,7 +2253,73 @@ def _listing_dict_from_graphql_raw(raw: str, listing_id: str) -> dict[str, Any]:
 
 
 def _item_graphql_doc_ids(hint_html: str) -> list[str]:
-    return _discover_item_doc_ids_from_html(hint_html)
+    global _cached_item_doc_id
+    browse = _browse_doc_id()
+    ids = _discover_item_doc_ids_from_html(hint_html)
+    if _cached_item_doc_id and _cached_item_doc_id not in ids:
+        ids.insert(0, _cached_item_doc_id)
+    if hint_html:
+        for d in _discover_feed_doc_ids_from_html(hint_html)[:10]:
+            if d not in ids and d != browse:
+                ids.append(d)
+    return ids[:18]
+
+
+async def prime_item_doc_id_cache(
+    token: AccountToken,
+    listing_id: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 22.0,
+    country: str | None = None,
+) -> None:
+    """Один раз загрузить /marketplace/item/ и закэшировать doc_id карточки для GraphQL."""
+    global _cached_item_doc_id, _item_doc_prime_done, _item_doc_prime_lock
+    if _cached_item_doc_id or (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip():
+        return
+    if _item_doc_prime_lock is None:
+        _item_doc_prime_lock = asyncio.Lock()
+    async with _item_doc_prime_lock:
+        if _cached_item_doc_id or _item_doc_prime_done:
+            return
+        _item_doc_prime_done = True
+        locale_q = ""
+        if country == "fi":
+            locale_q = "?locale=fi_FI"
+        elif country == "ch":
+            locale_q = "?locale=de_CH"
+        url = f"https://www.facebook.com/marketplace/item/{listing_id}/{locale_q}"
+        referer = "https://www.facebook.com/marketplace/"
+        if country and country in COUNTRY_LOCATIONS:
+            slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
+            if slugs:
+                referer = f"https://www.facebook.com/marketplace/{str(slugs[0]).strip('/')}/"
+        headers = {
+            "User-Agent": user_agent,
+            "Cookie": cookies_header(token.cookies),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": _accept_language(country),
+            "Referer": referer,
+        }
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        try:
+            async with reuse_http_session(None, proxy_url) as session:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    if resp.status >= 400:
+                        return
+                    html = await resp.text(errors="ignore")
+        except Exception as e:
+            logger.debug("prime item doc_id %s: %s", listing_id, e)
+            return
+        if _looks_like_login_wall(html):
+            return
+        did = _extract_item_doc_id(html)
+        if did:
+            logger.info("primed item doc_id %s from listing %s", did[:12], listing_id[:12])
+        sp = _patch_seller_from_item_page(html, listing_id)
+        if sp.get("person_link"):
+            logger.info("primed seller hint from item page %s", listing_id[:12])
 
 
 async def _enrich_via_graphql_item(
@@ -2293,38 +2394,58 @@ async def _enrich_via_graphql_item(
                         "doc_id": doc_id,
                         "variables": json.dumps(variables),
                     })
+                endpoints: list[tuple[str, dict[str, str] | None]] = [
+                    ("https://www.facebook.com/api/graphql/", None),
+                ]
+                if token.access_token:
+                    endpoints.append(("https://graph.facebook.com/graphql", None))
                 for body in bodies:
                     hdrs = dict(headers)
                     if body.get("fb_dtsg") and lsd:
                         hdrs["X-FB-LSD"] = lsd
-                    try:
-                        async with session.post(
-                            "https://www.facebook.com/api/graphql/",
-                            headers=hdrs,
-                            data=body,
-                            timeout=timeout,
-                        ) as resp:
-                            raw = await resp.text(errors="ignore")
-                            if resp.status >= 400:
+                    for gql_url, extra_params in endpoints:
+                        post_data = dict(body)
+                        if extra_params:
+                            post_data.update(extra_params)
+                        if gql_url.startswith("https://graph.facebook.com"):
+                            if not token.access_token:
                                 continue
-                            from parser.marketplace_region import loads_fb_api_response
+                            post_data["access_token"] = token.access_token
+                        try:
+                            async with session.post(
+                                gql_url,
+                                headers=hdrs,
+                                data=post_data,
+                                timeout=timeout,
+                            ) as resp:
+                                raw = await resp.text(errors="ignore")
+                                if resp.status >= 400:
+                                    continue
+                                from parser.marketplace_region import (
+                                    loads_fb_api_response,
+                                )
 
-                            data = loads_fb_api_response(raw)
-                    except Exception as e:
-                        logger.debug("item graphql %s doc=%s: %s", listing_id, doc_id[:8], e)
-                        continue
-                    patch = _seller_patch_from_graphql_payload(data, listing_id)
-                    full = _listing_dict_from_graphql_raw(raw, listing_id)
-                    if full:
-                        patch = {**patch, **full}
-                    if patch.get("seller_id") or patch.get("person_link") or patch.get("price"):
-                        logger.info(
-                            "item graphql ok %s profile=%s doc=%s",
-                            listing_id,
-                            str(patch.get("seller_id", ""))[:12],
-                            doc_id[:10],
-                        )
-                        return patch
+                                data = loads_fb_api_response(raw)
+                        except Exception as e:
+                            logger.debug(
+                                "item graphql %s doc=%s: %s",
+                                listing_id,
+                                doc_id[:8],
+                                e,
+                            )
+                            continue
+                        patch = _seller_patch_from_graphql_payload(data, listing_id)
+                        full = _listing_dict_from_graphql_raw(raw, listing_id)
+                        if full:
+                            patch = {**patch, **full}
+                        if patch.get("seller_id") or patch.get("person_link") or patch.get("price"):
+                            logger.info(
+                                "item graphql ok %s profile=%s doc=%s",
+                                listing_id,
+                                str(patch.get("seller_id", ""))[:12],
+                                doc_id[:10],
+                            )
+                            return patch
     return {}
 
 
@@ -2980,8 +3101,23 @@ async def enrich_listing(
     if feed_hint:
         _extract_item_doc_id(feed_hint)
     apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
+    if not _profile_id(item):
+        extra = _seller_from_listing_chunk(feed_hint, lid) if feed_hint else {}
+        if extra:
+            _merge_listing(item, extra)
     if listing_void_ready(item):
         return item
+
+    await prime_item_doc_id_cache(
+        token,
+        lid,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=min(timeout_sec, 24.0),
+        country=country,
+    )
+    if feed_hint:
+        _extract_item_doc_id(feed_hint)
 
     ajax_patch = await _enrich_via_ajax_item(
         token,

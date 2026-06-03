@@ -44,9 +44,11 @@ from parser.marketplace import (
     void_complete_from_feed,
     void_export_reject_reason,
 )
+from parser.marketplace import prime_item_doc_id_cache
 from parser.marketplace_region import (
     apply_marketplace_region,
     fetch_any_browse_feed,
+    fetch_category_hub_snapshot,
     prime_category_feed_region,
 )
 from data.preset_categories import parse_categories_for_country
@@ -577,6 +579,33 @@ async def _parse_impl(
                     _hub_has_listings(region_hub_html),
                     len(region_doc_ids),
                 )
+            if active_cats and not stop.is_set() and not token_dead_flag["value"]:
+                snap_html, snap_docs = await fetch_category_hub_snapshot(
+                    token,
+                    country,
+                    active_cats[0].url_path,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    timeout_sec=22.0,
+                )
+                if snap_html and len(snap_html) > len(region_hub_html or ""):
+                    region_hub_html = snap_html
+                for d in snap_docs:
+                    if d not in region_doc_ids:
+                        region_doc_ids.insert(0, d)
+                if snap_docs:
+                    from parser.marketplace import _browse_doc_id
+
+                    browse_d = _browse_doc_id()
+                    cat_ids = [x for x in region_doc_ids if x != browse_d]
+                    stats["feed_doc_auto"] = (cat_ids or region_doc_ids)[0]
+                    stats["feed_doc_is_browse"] = stats["feed_doc_auto"] == browse_d
+                logger.info(
+                    "category snapshot merged: html=%s doc_ids=%s profiles=%s",
+                    len(region_hub_html or ""),
+                    len(region_doc_ids),
+                    (region_hub_html or "").count("/marketplace/profile/"),
+                )
         except AccountTokenDeadError:
             token_dead_flag["value"] = True
 
@@ -713,6 +742,19 @@ async def _parse_impl(
                 len(boot_items),
                 with_profile,
             )
+            first_lid = next(
+                ((it.listing_id or "").strip() for it in boot_items if (it.listing_id or "").strip()),
+                "",
+            )
+            if first_lid:
+                await prime_item_doc_id_cache(
+                    token,
+                    first_lid,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    timeout_sec=24.0,
+                    country=country,
+                )
             boot_sem = asyncio.Semaphore(4)
 
             async def _boot_one(it) -> None:
@@ -756,13 +798,29 @@ async def _parse_impl(
                 proxy_used = proxy_url
 
                 try:
-                    await prime_category_feed_region(
+                    cat_html, cat_docs = await prime_category_feed_region(
                         token,
                         country,
                         cat.url_path,
                         user_agent=config.fb_user_agent,
                         proxy_url=proxy_url,
                     )
+                    if cat_html:
+                        if len(cat_html) > len(region_hub_html or ""):
+                            region_hub_html = cat_html
+                        _category_feed_html.set(cat_html)
+                        for d in cat_docs:
+                            if d not in region_doc_ids:
+                                region_doc_ids.insert(0, d)
+                        if cat_docs:
+                            from parser.marketplace import _browse_doc_id
+
+                            browse_d = _browse_doc_id()
+                            cids = [x for x in region_doc_ids if x != browse_d]
+                            stats["feed_doc_auto"] = (cids or region_doc_ids)[0]
+                            stats["feed_doc_is_browse"] = (
+                                stats["feed_doc_auto"] == browse_d
+                            )
                 except AccountTokenDeadError:
                     raise
     

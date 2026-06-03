@@ -590,10 +590,37 @@ async def prime_category_feed_region(
     proxy_url: str | None,
     timeout_sec: float = 18.0,
     http_session: aiohttp.ClientSession | None = None,
-) -> None:
-    """Открыть ленту категории с geo до парсинга (loc_id + finland)."""
+) -> tuple[str, list[str]]:
+    """Открыть ленту категории; вернуть HTML + doc_id для GraphQL пагинации."""
+    return await fetch_category_hub_snapshot(
+        token,
+        country,
+        url_path,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=timeout_sec,
+        http_session=http_session,
+    )
+
+
+async def fetch_category_hub_snapshot(
+    token: AccountToken,
+    country: str,
+    url_path: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 18.0,
+    http_session: aiohttp.ClientSession | None = None,
+) -> tuple[str, list[str]]:
+    """HTML категории + doc_id ленты (продавцы в Relay JSON, не только hub)."""
     if country not in COUNTRY_LOCATIONS:
-        return
+        return "", []
+    from parser.marketplace import (
+        _discover_feed_doc_ids_from_html,
+        _fallback_category_feed_doc_ids,
+    )
+
     headers = _fb_headers(
         token, user_agent, "https://www.facebook.com/marketplace/", country=country
     )
@@ -602,15 +629,45 @@ async def prime_category_feed_region(
         connect=min(18.0, timeout_sec),
         sock_read=max(12.0, timeout_sec - 4.0),
     )
+    best_html = ""
+    doc_ids: list[str] = []
     async with reuse_http_session(http_session, proxy_url) as session:
-        for path in _category_prime_paths(country, url_path)[:2]:
+        for path in _category_prime_paths(country, url_path)[:3]:
             url = urljoin(_FB, path if path.endswith("/") else f"{path}/")
             try:
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    await _read_response_body(resp, max_bytes=4_000_000)
-                    logger.info("category prime GET %s", path[:56])
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    max_redirects=8,
+                    allow_redirects=True,
+                ) as resp:
+                    html = await _read_response_body(resp, max_bytes=6_000_000)
+                    if "login" in str(resp.url).lower():
+                        continue
+                    logger.info(
+                        "category prime GET %s bytes=%s",
+                        path[:56],
+                        len(html),
+                    )
+                    if len(html) > len(best_html):
+                        best_html = html
+                    for did in _discover_feed_doc_ids_from_html(html):
+                        if did not in doc_ids:
+                            doc_ids.append(did)
             except Exception as e:
                 logger.warning("category prime %s: %s", path[:40], e)
+    if best_html:
+        for did in _fallback_category_feed_doc_ids(best_html):
+            if did not in doc_ids:
+                doc_ids.append(did)
+        logger.info(
+            "category snapshot %s bytes doc_ids=%s profiles=%s",
+            len(best_html),
+            len(doc_ids),
+            best_html.count("/marketplace/profile/"),
+        )
+    return best_html, doc_ids
 
 
 def append_geo_to_marketplace_url(url: str, country: str) -> str:
