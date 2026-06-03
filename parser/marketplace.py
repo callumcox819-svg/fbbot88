@@ -931,18 +931,43 @@ def feed_stage_reject_reason(
     return None
 
 
+def void_missing_fields(item: MarketplaceListing) -> list[str]:
+    """Какие поля void-parser-result ещё не заполнены."""
+    from services.seller_blacklist import _profile_id
+
+    miss: list[str] = []
+    if not (item.title or "").strip():
+        miss.append("title")
+    if not _profile_id(item):
+        miss.append("person_link")
+    if not (item.seller_name or "").strip():
+        miss.append("seller_name")
+    if not (item.price or "").strip():
+        miss.append("price")
+    if not (item.photo or "").strip():
+        miss.append("photo")
+    desc = (item.item_desc or "").strip()
+    if not desc or desc.upper() == "N/A":
+        miss.append("item_desc")
+    if not (item.location or "").strip():
+        miss.append("location")
+    if not (item.created_date or "").strip() and not item.created_timestamp:
+        miss.append("created_date")
+    return miss
+
+
+def listing_void_ready(item: MarketplaceListing) -> bool:
+    """Полная карточка как void-parser-result (после enrich с токеном)."""
+    return not void_missing_fields(item)
+
+
 def void_export_reject_reason(
     item: MarketplaceListing,
     country: str | None = None,
     *,
     max_age_hours: float | None = None,
 ) -> str | None:
-    """
-    Как VOID JSON: item_title + item_link + person_link (profile).
-    Цена/фото/описание добираются enrich; пустые поля — как в void-parser-result.
-    """
-    from services.seller_blacklist import _profile_id
-
+    """В JSON только полная карточка VOID: seller, price, photo, desc, person_link."""
     if not listing_is_valid(item):
         return "нет_заголовка"
     if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
@@ -959,14 +984,25 @@ def void_export_reject_reason(
     if lid and sid and lid == sid:
         item.seller_id = ""
         item.person_link = ""
-    if not _profile_id(item):
-        return "нет_продавца"
     if not (item.link or "").strip() and item.listing_id:
         item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
     wrong = country_export_reject_reason(item, country)
     if wrong:
         return wrong
-    return None
+    if listing_void_ready(item):
+        return None
+    miss = void_missing_fields(item)
+    if "person_link" in miss:
+        return "нет_продавца"
+    if "seller_name" in miss:
+        return "нет_имени"
+    if "item_desc" in miss:
+        return "нет_описания"
+    if "location" in miss or "created_date" in miss:
+        return "нет_даты_локации"
+    if "price" in miss or "photo" in miss:
+        return "мало_полей"
+    return "мало_полей"
 
 
 def prepare_listing_for_void_export(
@@ -1002,12 +1038,10 @@ def void_complete_from_feed(
     *,
     max_age_hours: float,
 ) -> bool:
-    """В JSON как VOID: достаточно person_link + заголовок; цена/фото — с enrich или пустые."""
-    from services.seller_blacklist import _profile_id
-
-    if not _profile_id(item):
+    """Пропуск enrich только если карточка уже полная как void-parser-result."""
+    if void_export_reject_reason(item, country, max_age_hours=max_age_hours) is not None:
         return False
-    return void_export_reject_reason(item, country, max_age_hours=max_age_hours) is None
+    return listing_void_ready(item)
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:
@@ -2001,6 +2035,36 @@ async def _enrich_via_comet_cookies(
     return patch
 
 
+def _listing_dict_from_graphql_raw(raw: str, listing_id: str) -> dict[str, Any]:
+    """Все поля объявления из ответа GraphQL карточки."""
+    by_id: dict[str, MarketplaceListing] = {}
+    for root in iter_fb_graphql_roots(raw):
+        _walk_marketplace_json(root, by_id)
+    hit = by_id.get(listing_id)
+    if not hit:
+        return {}
+    return {
+        k: getattr(hit, k)
+        for k in (
+            "title",
+            "price",
+            "photo",
+            "seller_id",
+            "seller_name",
+            "person_link",
+            "item_desc",
+            "location",
+            "created_date",
+            "created_timestamp",
+            "person_reg_date",
+            "gender",
+            "ads_number",
+            "rating",
+        )
+        if getattr(hit, k, None)
+    }
+
+
 def _item_graphql_doc_ids(hint_html: str) -> list[str]:
     ids: list[str] = []
     env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
@@ -2109,26 +2173,10 @@ async def _enrich_via_graphql_item(
                         logger.debug("item graphql %s doc=%s: %s", listing_id, doc_id[:8], e)
                         continue
                     patch = _seller_patch_from_graphql_payload(data, listing_id)
-                    if not patch.get("price") or not patch.get("photo"):
-                        by_id: dict[str, MarketplaceListing] = {}
-                        for root in iter_fb_graphql_roots(raw):
-                            _walk_marketplace_json(root, by_id)
-                        hit = by_id.get(listing_id)
-                        if hit:
-                            patch = {
-                                **patch,
-                                "title": hit.title,
-                                "price": hit.price,
-                                "photo": hit.photo,
-                                "seller_id": hit.seller_id or patch.get("seller_id"),
-                                "seller_name": hit.seller_name or patch.get("seller_name"),
-                                "person_link": hit.person_link or patch.get("person_link"),
-                                "item_desc": hit.item_desc,
-                                "location": hit.location,
-                                "created_date": hit.created_date,
-                                "created_timestamp": hit.created_timestamp,
-                            }
-                    if patch.get("seller_id") or patch.get("person_link"):
+                    full = _listing_dict_from_graphql_raw(raw, listing_id)
+                    if full:
+                        patch = {**patch, **full}
+                    if patch.get("seller_id") or patch.get("person_link") or patch.get("price"):
                         logger.info(
                             "item graphql ok %s profile=%s doc=%s",
                             listing_id,
@@ -2764,7 +2812,7 @@ async def enrich_listing(
     country: str | None = None,
     hub_html: str = "",
 ) -> MarketplaceListing:
-    """Догружает цену, описание, продавца с карточки объявления."""
+    """Карточка /marketplace/item/ + GraphQL с токеном — все поля как void-parser-result."""
     from services.seller_blacklist import _profile_id
 
     lid = item.listing_id
@@ -2772,7 +2820,22 @@ async def enrich_listing(
     if feed_hint:
         _extract_item_doc_id(feed_hint)
     apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
-    if listing_enrich_complete(item):
+    if listing_void_ready(item):
+        return item
+
+    gql_patch = await _enrich_via_graphql_item(
+        token,
+        lid,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        timeout_sec=timeout_sec,
+        country=country,
+        hint_html=feed_hint,
+    )
+    if gql_patch:
+        _merge_listing(item, gql_patch)
+    if listing_void_ready(item):
+        logger.info("enrich %s void-ready via graphql", lid)
         return item
 
     if feed_hint:
@@ -2787,21 +2850,8 @@ async def enrich_listing(
         )
         if comet:
             _merge_listing(item, comet)
-            if listing_enrich_complete(item):
-                return item
-
-    gql_patch = await _enrich_via_graphql_item(
-        token,
-        lid,
-        user_agent=user_agent,
-        proxy_url=proxy_url,
-        timeout_sec=timeout_sec,
-        country=country,
-        hint_html=feed_hint,
-    )
-    if gql_patch:
-        _merge_listing(item, gql_patch)
-        if listing_enrich_complete(item):
+        if listing_void_ready(item):
+            logger.info("enrich %s void-ready via comet", lid)
             return item
 
     locale_q = ""
@@ -2850,20 +2900,17 @@ async def enrich_listing(
         sp = _patch_seller_from_item_page(html, lid)
         if sp:
             _merge_listing(item, sp)
-            if listing_enrich_complete(item):
-                logger.info(
-                    "enrich %s seller ok via %s (html=%s profiles=%s)",
-                    lid,
-                    url[:40],
-                    len(html),
-                    _normalize_fb_html(html).count("/marketplace/profile/"),
-                )
-                return item
         if not (item.seller_name or "").strip():
             nm = _seller_name_near_listing_in_html(html, lid)
             if nm:
                 item.seller_name = nm
-        if listing_enrich_complete(item):
+        if listing_void_ready(item):
+            logger.info(
+                "enrich %s void-ready via %s (html=%s)",
+                lid,
+                url[:40],
+                len(html),
+            )
             return item
         comet = await _enrich_via_comet_cookies(
             token,
@@ -2876,8 +2923,8 @@ async def enrich_listing(
         )
         if comet:
             _merge_listing(item, comet)
-            if listing_enrich_complete(item):
-                return item
+        if listing_void_ready(item):
+            return item
         gql_patch = await _enrich_via_graphql_item(
             token,
             lid,
@@ -2889,17 +2936,15 @@ async def enrich_listing(
         )
         if gql_patch:
             _merge_listing(item, gql_patch)
-            if listing_enrich_complete(item):
-                return item
+        if listing_void_ready(item):
+            return item
 
-    if not _profile_id(item):
-        hint = _normalize_fb_html(feed_hint) if feed_hint else ""
-        prod_links = len(_PROFILE_PRODUCT_RE.findall(hint)) if hint else 0
+    miss = void_missing_fields(item)
+    if miss:
         logger.info(
-            "enrich %s: no person_link (feed_profiles=%s product_id_links=%s graphql=%s)",
+            "enrich %s incomplete VOID fields=%s (token=%s)",
             lid,
-            hint.count("/marketplace/profile/") if hint else 0,
-            prod_links,
+            ",".join(miss),
             bool(token.access_token),
         )
     return item

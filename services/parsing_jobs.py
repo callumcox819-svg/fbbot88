@@ -79,6 +79,9 @@ _REJECT_LABELS: dict[str, str] = {
     "старше_24ч": "Старше 24 ч",
     "нет_данных": "Нет продавца/описания",
     "нет_продавца": "Нет person_link (как VOID)",
+    "нет_имени": "Нет имени продавца",
+    "нет_описания": "Нет описания",
+    "нет_даты_локации": "Нет даты/локации",
 }
 
 
@@ -364,8 +367,8 @@ async def _finalize_parse_run(
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
-                "\n<i>Как VOID JSON: person_link продавца + item_link объявления "
-                "(как void-parser-result). Цена/фото добираются с карточки. "
+                "\n<i>VOID JSON: полная карточка (цена, фото, описание, имя, "
+                "person_link, дата, локация) — только после enrich с токеном. "
                 "(цена+фото+profile). ЧС, старше 24 ч.</i>"
             )
             await on_status("\n".join(lines))
@@ -650,7 +653,7 @@ async def _parse_impl(
                         item,
                         user_agent=config.fb_user_agent,
                         proxy_url=proxy_used,
-                        timeout_sec=24.0,
+                        timeout_sec=32.0,
                         country=country,
                         hub_html=region_hub_html,
                     )
@@ -693,10 +696,7 @@ async def _parse_impl(
                 len(boot_items),
                 with_profile,
             )
-            boot_items.sort(
-                key=lambda it: (0 if _profile_id(it) else 1, it.listing_id or "")
-            )
-            boot_sem = asyncio.Semaphore(6)
+            boot_sem = asyncio.Semaphore(4)
 
             async def _boot_one(it) -> None:
                 if stop.is_set() or len(collected) >= json_limit:
