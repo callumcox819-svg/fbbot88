@@ -35,7 +35,10 @@ from parser.marketplace import (
     is_connection_error,
     listings_from_hub_html,
     listings_to_json,
+    merge_marketplace_feeds,
     patch_listings_sellers_from_raw,
+    _category_feed_html,
+    _extract_item_doc_id,
     _seller_from_listing_chunk,
     void_complete_from_feed,
     void_export_reject_reason,
@@ -647,6 +650,7 @@ async def _parse_impl(
                         proxy_url=proxy_used,
                         timeout_sec=24.0,
                         country=country,
+                        hub_html=region_hub_html,
                     )
                 except AccountTokenDeadError:
                     token_dead_flag["value"] = True
@@ -658,18 +662,24 @@ async def _parse_impl(
             return ok, False
 
         if not token_dead_flag["value"] and region_hub_html:
-            boot_items = listings_from_hub_html(region_hub_html)
-            if not boot_items:
-                boot_items = await fetch_any_browse_feed(
-                    token,
-                    country,
-                    hint_html=region_hub_html,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url_boot,
-                    limit=max(json_limit * 3, 150),
-                )
+            _category_feed_html.set(region_hub_html)
+            _extract_item_doc_id(region_hub_html)
+            browse_raw = ""
+            comet_items: list = []
+            comet_items, browse_raw = await fetch_any_browse_feed(
+                token,
+                country,
+                hint_html=region_hub_html,
+                user_agent=config.fb_user_agent,
+                proxy_url=proxy_url_boot,
+                limit=max(json_limit * 3, 150),
+            )
+            hub_items = listings_from_hub_html(region_hub_html)
+            boot_items = merge_marketplace_feeds(comet_items, hub_items)
             from services.seller_blacklist import _profile_id
 
+            if browse_raw:
+                patch_listings_sellers_from_raw(browse_raw, boot_items)
             patch_listings_sellers_from_raw(region_hub_html, boot_items)
             with_profile = sum(1 for it in boot_items if _profile_id(it))
             logger.info(

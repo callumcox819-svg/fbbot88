@@ -170,11 +170,11 @@ async def fetch_browse_marketplace_listings(
     http_session: aiohttp.ClientSession | None = None,
     category_label: str = "Browse",
     limit: int = 80,
-) -> list:
+) -> tuple[list, str]:
     """Лента browse/search GraphQL (filter_location_id) — когда category HTML не открывается."""
     loc_id = _filter_location_id(country)
     if not loc_id or not token.access_token or country not in COUNTRY_LOCATIONS:
-        return []
+        return [], ""
 
     doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
     variables: dict[str, Any] = {
@@ -222,7 +222,7 @@ async def fetch_browse_marketplace_listings(
                 data = json.loads(raw)
     except Exception as e:
         logger.info("browse feed failed country=%s: %s", country, e)
-        return []
+        return [], ""
 
     from parser.marketplace import MarketplaceListing, _walk_marketplace_json, listing_is_valid
 
@@ -249,7 +249,7 @@ async def fetch_browse_marketplace_listings(
             n_prof,
             doc_id[:12],
         )
-    return out
+    return out, raw
 
 
 def _browse_variables(country: str) -> dict[str, Any] | None:
@@ -283,7 +283,7 @@ async def fetch_browse_marketplace_comet(
     http_session: aiohttp.ClientSession | None = None,
     category_label: str = "Browse",
     limit: int = 120,
-) -> list:
+) -> tuple[list, str]:
     """Browse-лента через fb_dtsg (как браузер VOID), без access_token."""
     from parser.marketplace import (
         MarketplaceListing,
@@ -295,11 +295,11 @@ async def fetch_browse_marketplace_comet(
 
     variables = _browse_variables(country)
     if not variables or country not in COUNTRY_LOCATIONS:
-        return []
+        return [], ""
     lsd, dtsg = _extract_fb_tokens(_html_for_discovery(hint_html))
     if not dtsg or not token.c_user:
         logger.info("browse comet skip: dtsg=%s c_user=%s", bool(dtsg), bool(token.c_user))
-        return []
+        return [], ""
 
     doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
     referer = urljoin(_FB, COUNTRY_LOCATIONS[country]["marketplace_slugs"][0] + "/")
@@ -335,13 +335,13 @@ async def fetch_browse_marketplace_comet(
                 raw = await resp.text(errors="ignore")
                 if resp.status >= 400:
                     logger.info("browse comet HTTP %s", resp.status)
-                    return []
+                    return [], ""
                 if "login" in raw.lower()[:500]:
-                    return []
+                    return [], ""
                 data = json.loads(raw)
     except Exception as e:
         logger.info("browse comet failed: %s", e)
-        return []
+        return [], ""
 
     from parser.marketplace import patch_listings_sellers_from_raw
 
@@ -365,7 +365,7 @@ async def fetch_browse_marketplace_comet(
         )
     else:
         logger.info("browse comet country=%s: 0 items (keys in json=%s)", country, len(by_id))
-    return out
+    return out, raw
 
 
 async def fetch_any_browse_feed(
@@ -377,9 +377,9 @@ async def fetch_any_browse_feed(
     proxy_url: str | None,
     http_session: aiohttp.ClientSession | None = None,
     limit: int = 120,
-) -> list:
+) -> tuple[list, str]:
     if hint_html:
-        items = await fetch_browse_marketplace_comet(
+        items, raw = await fetch_browse_marketplace_comet(
             token,
             country,
             hint_html=hint_html,
@@ -389,7 +389,7 @@ async def fetch_any_browse_feed(
             limit=limit,
         )
         if items:
-            return items
+            return items, raw
     return await fetch_browse_marketplace_listings(
         token,
         country,

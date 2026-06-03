@@ -1529,6 +1529,16 @@ def _index_sellers_from_relay_json(obj: Any, out: dict[str, dict[str, str]]) -> 
                 break
         if lid:
             patch: dict[str, str] = {}
+            sid_direct = str(
+                obj.get("marketplace_listing_seller_id")
+                or obj.get("seller_id")
+                or ""
+            ).strip()
+            if sid_direct.isdigit() and len(sid_direct) >= 8 and sid_direct != lid:
+                patch["seller_id"] = sid_direct
+                patch["person_link"] = (
+                    f"https://www.facebook.com/marketplace/profile/{sid_direct}/"
+                )
             for sk in _SELLER_BLOB_KEYS:
                 blob = obj.get(sk)
                 if isinstance(blob, dict):
@@ -1859,7 +1869,7 @@ async def _enrich_via_comet_cookies(
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     try:
-        async with _session_for_proxy(proxy_url) as session:
+        async with reuse_http_session(None, proxy_url) as session:
             async with session.post(
                 "https://www.facebook.com/api/graphql/",
                 headers=headers,
@@ -1917,33 +1927,69 @@ async def _enrich_via_graphql_item(
         "Origin": "https://www.facebook.com",
         "Referer": referer,
     }
+    lsd, dtsg = _extract_fb_tokens(_html_for_discovery(hint_html))
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    async with _session_for_proxy(proxy_url) as session:
+    async with reuse_http_session(None, proxy_url) as session:
         for variables in variable_sets:
-            body: dict[str, str] = {
-                "doc_id": doc_id,
-                "variables": json.dumps(variables),
-            }
+            bodies: list[dict[str, str]] = []
             if token.access_token:
-                body["access_token"] = token.access_token
-            try:
-                async with session.post(
-                    "https://www.facebook.com/api/graphql/",
-                    headers=headers,
-                    data=body,
-                    timeout=timeout,
-                ) as resp:
-                    raw = await resp.text(errors="ignore")
-                    if resp.status >= 400:
-                        continue
-                    data = json.loads(raw)
-            except Exception as e:
-                logger.debug("item graphql %s: %s", listing_id, e)
-                continue
-            patch = _seller_patch_from_graphql_payload(data, listing_id)
-            if patch.get("seller_id") or patch.get("person_link"):
-                logger.info("item graphql ok %s profile=%s", listing_id, patch.get("seller_id", "")[:12])
-                return patch
+                bodies.append({
+                    "doc_id": doc_id,
+                    "variables": json.dumps(variables),
+                    "access_token": token.access_token,
+                })
+            if dtsg and token.c_user:
+                bodies.append({
+                    "__a": "1",
+                    "__user": token.c_user,
+                    "fb_dtsg": dtsg,
+                    "lsd": lsd or dtsg[:12],
+                    "doc_id": doc_id,
+                    "variables": json.dumps(variables),
+                    "server_timestamps": "1",
+                })
+                if token.access_token:
+                    bodies.append({
+                        "__a": "1",
+                        "__user": token.c_user,
+                        "fb_dtsg": dtsg,
+                        "lsd": lsd or dtsg[:12],
+                        "doc_id": doc_id,
+                        "variables": json.dumps(variables),
+                        "access_token": token.access_token,
+                        "server_timestamps": "1",
+                    })
+            if not bodies:
+                bodies.append({
+                    "doc_id": doc_id,
+                    "variables": json.dumps(variables),
+                })
+            for body in bodies:
+                hdrs = dict(headers)
+                if body.get("fb_dtsg") and lsd:
+                    hdrs["X-FB-LSD"] = lsd
+                try:
+                    async with session.post(
+                        "https://www.facebook.com/api/graphql/",
+                        headers=hdrs,
+                        data=body,
+                        timeout=timeout,
+                    ) as resp:
+                        raw = await resp.text(errors="ignore")
+                        if resp.status >= 400:
+                            continue
+                        data = json.loads(raw)
+                except Exception as e:
+                    logger.debug("item graphql %s: %s", listing_id, e)
+                    continue
+                patch = _seller_patch_from_graphql_payload(data, listing_id)
+                if patch.get("seller_id") or patch.get("person_link"):
+                    logger.info(
+                        "item graphql ok %s profile=%s",
+                        listing_id,
+                        str(patch.get("seller_id", ""))[:12],
+                    )
+                    return patch
     return {}
 
 
@@ -2250,6 +2296,11 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
     location = _dig_str(fs, "marketplace_listing_location", "location")
     seller_name = ""
     seller_id = ""
+    sid_direct = str(
+        fs.get("marketplace_listing_seller_id") or node.get("marketplace_listing_seller_id") or ""
+    ).strip()
+    if sid_direct.isdigit() and len(sid_direct) >= 8 and sid_direct != lid:
+        seller_id = sid_direct
     for key in _SELLER_BLOB_KEYS:
         blob = fs.get(key) or node.get(key)
         if not isinstance(blob, dict):
@@ -2386,26 +2437,81 @@ def _extract_cursor_from_html(html: str) -> tuple[str | None, bool]:
 def patch_listings_sellers_from_raw(
     raw: str, items: list[MarketplaceListing]
 ) -> int:
-    """Связать listing_id ↔ profile из сырого JSON browse (как в HTML ленте VOID)."""
+    """Связать listing_id ↔ profile из browse GraphQL / hub Relay JSON."""
     if not raw or not items:
         return 0
+    from services.seller_blacklist import _profile_id
+
+    relay: dict[str, dict[str, str]] = {}
+    stripped = raw.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            _index_sellers_from_relay_json(json.loads(raw), relay)
+        except json.JSONDecodeError:
+            pass
     norm = _normalize_fb_html(raw)
+    for script in _SCRIPT_JSON_RE.findall(norm):
+        try:
+            _index_sellers_from_relay_json(json.loads(script), relay)
+        except json.JSONDecodeError:
+            continue
     prox = _proximity_listing_sellers(norm)
+    for lid, ent in prox.items():
+        prev = relay.setdefault(lid, {})
+        prev.update({k: v for k, v in ent.items() if v})
     patched = 0
     for it in items:
         lid = (it.listing_id or "").strip()
         if not lid:
             continue
-        if prox.get(lid):
-            _merge_listing(it, prox[lid])
+        if relay.get(lid):
+            _merge_listing(it, relay[lid])
         extra = _seller_from_listing_chunk(norm, lid)
         if extra:
             _merge_listing(it, extra)
-        from services.seller_blacklist import _profile_id
-
         if _profile_id(it):
             patched += 1
     return patched
+
+
+def merge_marketplace_feeds(
+    *feeds: list[MarketplaceListing],
+) -> list[MarketplaceListing]:
+    """Объединить ленты: приоритет записи с person_link / более полным seller."""
+    from services.seller_blacklist import _profile_id
+
+    by_id: dict[str, MarketplaceListing] = {}
+    for feed in feeds:
+        for it in feed:
+            lid = (it.listing_id or "").strip()
+            if not lid:
+                continue
+            prev = by_id.get(lid)
+            if prev is None:
+                by_id[lid] = it
+                continue
+            if _profile_id(it) and not _profile_id(prev):
+                by_id[lid] = it
+            elif _profile_id(it) and _profile_id(prev):
+                _merge_listing(prev, {
+                    k: getattr(it, k, "")
+                    for k in (
+                        "seller_id",
+                        "seller_name",
+                        "person_link",
+                        "price",
+                        "photo",
+                        "title",
+                    )
+                    if getattr(it, k, None)
+                })
+            else:
+                _merge_listing(prev, {
+                    k: getattr(it, k, "")
+                    for k in ("price", "photo", "title", "seller_name")
+                    if getattr(it, k, None)
+                })
+    return list(by_id.values())
 
 
 def _walk_marketplace_json(obj: Any, out: dict[str, MarketplaceListing]) -> None:
@@ -2499,12 +2605,15 @@ async def enrich_listing(
     proxy_url: str | None,
     timeout_sec: float = 20.0,
     country: str | None = None,
+    hub_html: str = "",
 ) -> MarketplaceListing:
     """Догружает цену, описание, продавца с карточки объявления."""
     from services.seller_blacklist import _profile_id
 
     lid = item.listing_id
-    feed_hint = _category_feed_html.get() or ""
+    feed_hint = hub_html or _category_feed_html.get() or ""
+    if feed_hint:
+        _extract_item_doc_id(feed_hint)
     apply_feed_seller_index(item, build_feed_seller_index(feed_hint))
     if listing_enrich_complete(item):
         return item
@@ -2569,7 +2678,7 @@ async def enrich_listing(
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     for url in urls:
         try:
-            async with _session_for_proxy(proxy_url) as session:
+            async with reuse_http_session(None, proxy_url) as session:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status >= 400:
                         continue
