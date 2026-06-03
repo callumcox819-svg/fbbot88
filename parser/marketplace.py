@@ -1002,18 +1002,12 @@ def void_complete_from_feed(
     *,
     max_age_hours: float,
 ) -> bool:
-    """Пропускаем enrich если в ленте уже есть person_link + цена/фото (+ опционально имя)."""
+    """В JSON как VOID: достаточно person_link + заголовок; цена/фото — с enrich или пустые."""
     from services.seller_blacklist import _profile_id
 
     if not _profile_id(item):
         return False
-    if void_export_reject_reason(item, country, max_age_hours=max_age_hours) is not None:
-        return False
-    if listing_enrich_complete(item):
-        return True
-    price = (item.price or "").strip()
-    photo = (item.photo or "").strip()
-    return bool(price or photo)
+    return void_export_reject_reason(item, country, max_age_hours=max_age_hours) is None
 
 
 def _country_location_ok(location: str, country: str | None) -> bool:

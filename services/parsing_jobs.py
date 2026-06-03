@@ -693,7 +693,10 @@ async def _parse_impl(
                 len(boot_items),
                 with_profile,
             )
-            boot_sem = asyncio.Semaphore(4)
+            boot_items.sort(
+                key=lambda it: (0 if _profile_id(it) else 1, it.listing_id or "")
+            )
+            boot_sem = asyncio.Semaphore(6)
 
             async def _boot_one(it) -> None:
                 if stop.is_set() or len(collected) >= json_limit:

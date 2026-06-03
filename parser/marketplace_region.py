@@ -232,8 +232,17 @@ async def fetch_browse_marketplace_listings(
                 timeout=timeout,
             ) as resp:
                 raw = await resp.text(errors="ignore")
-                if resp.status >= 400 or "login" in raw.lower()[:400]:
-                    return [], ""
+                if resp.status >= 400:
+                    logger.info(
+                        "browse feed HTTP %s country=%s (len=%s)",
+                        resp.status,
+                        country,
+                        len(raw),
+                    )
+                    return [], raw
+                if "login" in raw.lower()[:400]:
+                    logger.info("browse feed login wall country=%s", country)
+                    return [], raw
     except json.JSONDecodeError as e:
         logger.info(
             "browse feed bad json country=%s (len=%s): %s",
@@ -262,6 +271,13 @@ async def fetch_browse_marketplace_listings(
             len(out),
             n_prof,
             doc_id[:12],
+        )
+    elif raw:
+        logger.info(
+            "browse feed 0 items country=%s raw_len=%s %s",
+            country,
+            len(raw),
+            raw[:160].replace("\n", " "),
         )
     return out, raw
 
@@ -317,17 +333,18 @@ async def fetch_browse_marketplace_comet(
 
     doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
     referer = urljoin(_FB, COUNTRY_LOCATIONS[country]["marketplace_slugs"][0] + "/")
-    body = urlencode(
-        {
-            "__a": "1",
-            "__user": token.c_user,
-            "fb_dtsg": dtsg,
-            "lsd": lsd or dtsg[:12],
-            "doc_id": doc_id,
-            "variables": json.dumps(variables),
-            "server_timestamps": "1",
-        }
-    )
+    payload: dict[str, str] = {
+        "__a": "1",
+        "__user": token.c_user,
+        "fb_dtsg": dtsg,
+        "lsd": lsd or dtsg[:12],
+        "doc_id": doc_id,
+        "variables": json.dumps(variables),
+        "server_timestamps": "1",
+    }
+    if token.access_token:
+        payload["access_token"] = token.access_token
+    body = urlencode(payload)
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies_header(token.cookies),
@@ -382,10 +399,12 @@ async def fetch_browse_marketplace_comet(
             n_prof,
         )
     else:
+        preview = (raw or "")[:180].replace("\n", " ")
         logger.info(
-            "browse comet country=%s: 0 items (raw_len=%s)",
+            "browse comet country=%s: 0 items (raw_len=%s) %s",
             country,
             len(raw),
+            preview,
         )
     return out, raw
 
@@ -529,6 +548,12 @@ async def apply_marketplace_region(
         timeout_sec=min(timeout_sec, 12.0),
         http_session=http_session,
     )
+    if hub_html:
+        from parser.marketplace import _fallback_feed_doc_ids
+
+        for did in _fallback_feed_doc_ids(hub_html):
+            if did not in doc_ids:
+                doc_ids.append(did)
     logger.info(
         "marketplace region applied: %s (hub_html=%s, feed_doc_ids=%s)",
         label,
