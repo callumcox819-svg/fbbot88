@@ -675,14 +675,15 @@ def listing_is_wrong_country(
 
 def listing_is_valid(item: MarketplaceListing) -> bool:
     """Реальное объявление: не плейсхолдер и id из /marketplace/item/."""
-    title = (item.title or "").strip()
-    if not title or title.startswith("Listing "):
-        return False
     lid = (item.listing_id or "").strip()
     if not lid.isdigit() or len(lid) < _MIN_LISTING_ID_LEN:
         return False
-    link = item.link or ""
-    if f"/marketplace/item/{lid}" not in link:
+    if not item.link:
+        item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
+    title = (item.title or "").strip()
+    if not title:
+        item.title = f"Item {lid}"
+    if title.startswith("Listing ") and not (item.price or item.photo or item.person_link):
         return False
     return True
 
@@ -1165,11 +1166,8 @@ async def fetch_category_listings(
         short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
         if on_url_progress:
             await on_url_progress(i, total_urls, short)
-        fetch_urls = [url]
-        if country:
-            geo_u = with_country_geo(url, country)
-            if geo_u != url:
-                fetch_urls.append(geo_u)
+        # Geo в query даёт TooManyRedirects на category; регион уже в cookies.
+        fetch_urls = [url.split("?")[0].rstrip("/") + "/"]
         cursor: str | None = None
         discovered_doc: str | None = None
         stale_feed_pages = 0
@@ -1354,14 +1352,10 @@ async def fetch_category_listings(
                 if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                     logger.info("skip url %s: %s", url, e)
                     break
-                if page_idx == 0:
-                    raise
-                logger.info("stop pagination %s after p%s: %s", short, page_idx + 1, e)
+                logger.warning("feed %s p%s runtime: %s", short, page_idx + 1, e)
                 break
             except Exception as e:
-                if page_idx == 0:
-                    raise
-                logger.warning("stop pagination %s after p%s: %s", short, page_idx + 1, e)
+                logger.warning("feed %s p%s failed: %s", short, page_idx + 1, e)
                 break
 
     exhausted = (
@@ -2371,7 +2365,7 @@ def _walk_marketplace_json(obj: Any, out: dict[str, MarketplaceListing]) -> None
 
 def _parse_embedded_scripts(html: str) -> dict[str, MarketplaceListing]:
     by_id: dict[str, MarketplaceListing] = {}
-    for raw in _SCRIPT_JSON_RE.findall(html):
+    for raw in _SCRIPT_JSON_RE.findall(_html_for_discovery(html)):
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:

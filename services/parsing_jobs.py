@@ -40,7 +40,7 @@ from parser.marketplace import (
 )
 from parser.marketplace_region import (
     apply_marketplace_region,
-    fetch_browse_marketplace_listings,
+    fetch_any_browse_feed,
     prime_category_feed_region,
 )
 from data.preset_categories import parse_categories_for_country
@@ -511,13 +511,20 @@ async def _parse_impl(
         country_label = " 🇫🇮"
     current_step["text"] = f"Категорий VOID: {cat_count}{country_label}"
     await status_progress()
-    logger.info("parse start tg=%s limit=%s cats=%s country=%s", telegram_id, json_limit, cat_count, country)
+    logger.info(
+        "parse start tg=%s limit=%s cats=%s country=%s token_uid=%s access_token=%s",
+        telegram_id,
+        json_limit,
+        cat_count,
+        country,
+        bool(token.c_user),
+        bool(token.access_token),
+    )
 
     async with Session() as session:
         proxy_url_boot = await pick_random_proxy_url(session, user_id)
     region_doc_ids: list[str] = []
     region_hub_html = ""
-    hub_boot_done = False
     parse_error: str | None = None
 
     async with fb_http_session(proxy_url_boot, token.cookies):
@@ -546,6 +553,106 @@ async def _parse_impl(
         except AccountTokenDeadError:
             token_dead_flag["value"] = True
 
+        proxy_used = proxy_url_boot
+        accept_lock = asyncio.Lock()
+
+        async def _accept_item(item) -> bool:
+            normalize_seller_identity(item)
+            lid = (item.listing_id or "").strip()
+            if lid in accepted_listing_ids:
+                return False
+            ck = canonical_seller_key(item)
+            if ck in accepted_seller_ids or is_seller_blocked(
+                item, blocked_sellers | session_sellers
+            ):
+                _record_reject(stats, "повторный_продавец")
+                return False
+            reason = void_export_reject_reason(
+                item, country, max_age_hours=max_age_hours
+            )
+            if reason:
+                _record_reject(stats, reason)
+                return False
+            for sk in seller_keys_for_item(item):
+                session_sellers.add(sk)
+                blocked_sellers.add(sk)
+            if ck:
+                accepted_seller_ids.add(ck)
+            async with Session() as session:
+                await remember_seller(session, user_id, country, item)
+            normalize_listing_for_export(item, country)
+            if lid:
+                accepted_listing_ids.add(lid)
+            collected.append(item)
+            return True
+
+        async def _process_listing(item) -> tuple[bool, bool]:
+            if stop.is_set() or len(collected) >= json_limit:
+                return False, False
+            async with seen_lock:
+                lid = (item.listing_id or "").strip()
+                if not lid or lid in seen_listing_ids:
+                    return False, False
+                seen_listing_ids.add(lid)
+                stats["checked"] = stats.get("checked", 0) + 1
+            blocked = blocked_sellers | session_sellers
+            if is_seller_blocked(item, blocked):
+                _record_reject(stats, "повторный_продавец")
+                return False, True
+            wrong_country = country_export_reject_reason(item, country)
+            if wrong_country:
+                _record_reject(stats, wrong_country)
+                return False, False
+            reason = export_reject_reason(
+                item, country, max_age_hours=max_age_hours
+            )
+            if reason in _HARD_FEED_REJECT:
+                _record_reject(stats, reason)
+                return False, False
+            if void_complete_from_feed(
+                item, country, max_age_hours=max_age_hours
+            ):
+                async with accept_lock:
+                    ok = await _accept_item(item)
+                if ok:
+                    await _sleep_human(config.parse_item_delay_sec)
+                return ok, False
+            if not stop.is_set():
+                try:
+                    await enrich_listing(
+                        token,
+                        item,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_used,
+                        timeout_sec=24.0,
+                        country=country,
+                    )
+                except AccountTokenDeadError:
+                    token_dead_flag["value"] = True
+                    raise
+            async with accept_lock:
+                ok = await _accept_item(item)
+            if ok:
+                await _sleep_human(config.parse_item_delay_sec)
+            return ok, False
+
+        if not token_dead_flag["value"] and region_hub_html:
+            boot_items = listings_from_hub_html(region_hub_html)
+            if not boot_items:
+                boot_items = await fetch_any_browse_feed(
+                    token,
+                    country,
+                    hint_html=region_hub_html,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    limit=max(json_limit * 3, 150),
+                )
+            logger.info("post-region feed: %s items", len(boot_items))
+            for boot_it in boot_items:
+                if stop.is_set() or len(collected) >= json_limit:
+                    break
+                await _process_listing(boot_it)
+
         try:
             while (
                 not token_dead_flag["value"]
@@ -561,7 +668,8 @@ async def _parse_impl(
                 await status_progress()
     
                 proxy_url = proxy_url_boot
-    
+                proxy_used = proxy_url
+
                 try:
                     await prime_category_feed_region(
                         token,
@@ -586,107 +694,7 @@ async def _parse_impl(
                 cat_added = 0
                 page_raw = 0
                 stop_cat_pages = {"value": False}
-                accept_lock = asyncio.Lock()
-    
-                async def _accept_item(item) -> bool:
-                    normalize_seller_identity(item)
-                    lid = (item.listing_id or "").strip()
-                    if lid in accepted_listing_ids:
-                        return False
-                    ck = canonical_seller_key(item)
-                    if ck in accepted_seller_ids or is_seller_blocked(
-                        item, blocked_sellers | session_sellers
-                    ):
-                        _record_reject(stats, "повторный_продавец")
-                        return False
-                    reason = void_export_reject_reason(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if reason:
-                        _record_reject(stats, reason)
-                        return False
-                    for sk in seller_keys_for_item(item):
-                        session_sellers.add(sk)
-                        blocked_sellers.add(sk)
-                    if ck:
-                        accepted_seller_ids.add(ck)
-                    async with Session() as session:
-                        await remember_seller(session, user_id, country, item)
-                    normalize_listing_for_export(item, country)
-                    if lid:
-                        accepted_listing_ids.add(lid)
-                    collected.append(item)
-                    return True
-    
-                async def _process_listing(item) -> tuple[bool, bool]:
-                    """Возвращает (accepted, dup_skip)."""
-                    if stop.is_set() or len(collected) >= json_limit:
-                        return False, False
-                    async with seen_lock:
-                        lid = (item.listing_id or "").strip()
-                        if not lid or lid in seen_listing_ids:
-                            return False, False
-                        seen_listing_ids.add(lid)
-                        stats["checked"] = stats.get("checked", 0) + 1
-                    blocked = blocked_sellers | session_sellers
-                    if is_seller_blocked(item, blocked):
-                        _record_reject(stats, "повторный_продавец")
-                        return False, True
-                    wrong_country = country_export_reject_reason(item, country)
-                    if wrong_country:
-                        _record_reject(stats, wrong_country)
-                        return False, False
-                    reason = export_reject_reason(
-                        item, country, max_age_hours=max_age_hours
-                    )
-                    if reason in _HARD_FEED_REJECT:
-                        _record_reject(stats, reason)
-                        return False, False
-                    if void_complete_from_feed(
-                        item, country, max_age_hours=max_age_hours
-                    ):
-                        async with accept_lock:
-                            ok = await _accept_item(item)
-                        if ok:
-                            await _sleep_human(config.parse_item_delay_sec)
-                        return ok, False
-                    if not stop.is_set():
-                        try:
-                            await enrich_listing(
-                                token,
-                                item,
-                                user_agent=config.fb_user_agent,
-                                proxy_url=proxy_used,
-                                timeout_sec=24.0,
-                                country=country,
-                            )
-                        except AccountTokenDeadError:
-                            token_dead_flag["value"] = True
-                            raise
-                    async with accept_lock:
-                        ok = await _accept_item(item)
-                    if ok:
-                        await _sleep_human(config.parse_item_delay_sec)
-                    return ok, False
-    
-                if not hub_boot_done and region_hub_html:
-                    hub_boot_done = True
-                    hub_items = listings_from_hub_html(region_hub_html)
-                    if not hub_items:
-                        hub_items = await fetch_browse_marketplace_listings(
-                            token,
-                            country,
-                            user_agent=config.fb_user_agent,
-                            proxy_url=proxy_url,
-                            category_label="CH browse",
-                            limit=max(json_limit * 2, 120),
-                        )
-                    logger.info("hub/bootstrap feed: %s items", len(hub_items))
-                    for hub_it in hub_items:
-                        if stop.is_set() or len(collected) >= json_limit:
-                            break
-                        await _process_listing(hub_it)
-    
+
                 async def on_page_items(page_items: list) -> None:
                     nonlocal cat_added, page_raw
                     page_raw = len(page_items)

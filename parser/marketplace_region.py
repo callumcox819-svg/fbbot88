@@ -243,6 +243,146 @@ async def fetch_browse_marketplace_listings(
     return out
 
 
+def _browse_variables(country: str) -> dict[str, Any] | None:
+    loc_id = _filter_location_id(country)
+    if not loc_id:
+        return None
+    return {
+        "params": {
+            "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": ""},
+            "browse_request_params": {
+                "filter_location_id": loc_id,
+                "filter_price_lower_bound": 0,
+                "filter_price_upper_bound": 214748364700,
+            },
+            "custom_request_params": {
+                "surface": "BROWSE",
+                "search_vertical": "C2C",
+            },
+        },
+    }
+
+
+async def fetch_browse_marketplace_comet(
+    token: AccountToken,
+    country: str,
+    *,
+    hint_html: str,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 22.0,
+    http_session: aiohttp.ClientSession | None = None,
+    category_label: str = "Browse",
+    limit: int = 120,
+) -> list:
+    """Browse-лента через fb_dtsg (как браузер VOID), без access_token."""
+    from parser.marketplace import (
+        MarketplaceListing,
+        _extract_fb_tokens,
+        _html_for_discovery,
+        _walk_marketplace_json,
+        listing_is_valid,
+    )
+
+    variables = _browse_variables(country)
+    if not variables or country not in COUNTRY_LOCATIONS:
+        return []
+    lsd, dtsg = _extract_fb_tokens(_html_for_discovery(hint_html))
+    if not dtsg or not token.c_user:
+        logger.info("browse comet skip: dtsg=%s c_user=%s", bool(dtsg), bool(token.c_user))
+        return []
+
+    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    referer = urljoin(_FB, COUNTRY_LOCATIONS[country]["marketplace_slugs"][0] + "/")
+    body = urlencode(
+        {
+            "__a": "1",
+            "__user": token.c_user,
+            "fb_dtsg": dtsg,
+            "lsd": lsd or dtsg[:12],
+            "doc_id": doc_id,
+            "variables": json.dumps(variables),
+            "server_timestamps": "1",
+        }
+    )
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Origin": "https://www.facebook.com",
+        "Referer": referer,
+        "X-FB-LSD": lsd or "",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with reuse_http_session(http_session, proxy_url) as session:
+            async with session.post(
+                "https://www.facebook.com/api/graphql/",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            ) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400:
+                    logger.info("browse comet HTTP %s", resp.status)
+                    return []
+                if "login" in raw.lower()[:500]:
+                    return []
+                data = json.loads(raw)
+    except Exception as e:
+        logger.info("browse comet failed: %s", e)
+        return []
+
+    by_id: dict[str, MarketplaceListing] = {}
+    _walk_marketplace_json(data, by_id)
+    out: list = []
+    for lid, item in by_id.items():
+        if not listing_is_valid(item):
+            continue
+        item.category = category_label
+        out.append(item)
+        if len(out) >= limit:
+            break
+    if out:
+        logger.info("browse comet country=%s: %s items", country, len(out))
+    else:
+        logger.info("browse comet country=%s: 0 items (keys in json=%s)", country, len(by_id))
+    return out
+
+
+async def fetch_any_browse_feed(
+    token: AccountToken,
+    country: str,
+    *,
+    hint_html: str,
+    user_agent: str,
+    proxy_url: str | None,
+    http_session: aiohttp.ClientSession | None = None,
+    limit: int = 120,
+) -> list:
+    if hint_html:
+        items = await fetch_browse_marketplace_comet(
+            token,
+            country,
+            hint_html=hint_html,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            http_session=http_session,
+            limit=limit,
+        )
+        if items:
+            return items
+    return await fetch_browse_marketplace_listings(
+        token,
+        country,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        http_session=http_session,
+        limit=limit,
+    )
+
+
 async def _read_response_body(resp: aiohttp.ClientResponse, max_bytes: int = 8_000_000) -> str:
     chunks: list[bytes] = []
     total = 0
@@ -385,7 +525,7 @@ async def prime_category_feed_region(
     )
     async with reuse_http_session(http_session, proxy_url) as session:
         for path in _category_prime_paths(country, url_path)[:2]:
-            url = _url_with_geo(urljoin(_FB, path), country)
+            url = urljoin(_FB, path if path.endswith("/") else f"{path}/")
             try:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     await _read_response_body(resp, max_bytes=4_000_000)
