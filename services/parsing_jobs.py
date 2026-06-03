@@ -185,6 +185,7 @@ def _progress_text(
     step: str = "",
     stats: dict | None = None,
     max_age_hours: float = 0,
+    stop_reason: str = "",
 ) -> str:
     age_hint = ""
     if max_age_hours > 0:
@@ -474,6 +475,7 @@ async def _parse_impl(
                     step=current_step["text"],
                     stats=stats,
                     max_age_hours=max_age_hours,
+                    stop_reason=stop_reason,
                 )
             )
 
