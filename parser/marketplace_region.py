@@ -160,6 +160,89 @@ async def _graphql_browse_prime(
     return False
 
 
+async def fetch_browse_marketplace_listings(
+    token: AccountToken,
+    country: str,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float = 20.0,
+    http_session: aiohttp.ClientSession | None = None,
+    category_label: str = "Browse",
+    limit: int = 80,
+) -> list:
+    """Лента browse/search GraphQL (filter_location_id) — когда category HTML не открывается."""
+    loc_id = _filter_location_id(country)
+    if not loc_id or not token.access_token or country not in COUNTRY_LOCATIONS:
+        return []
+
+    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    variables: dict[str, Any] = {
+        "params": {
+            "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": ""},
+            "browse_request_params": {
+                "filter_location_id": loc_id,
+                "filter_price_lower_bound": 0,
+                "filter_price_upper_bound": 214748364700,
+            },
+            "custom_request_params": {
+                "surface": "BROWSE",
+                "search_vertical": "C2C",
+            },
+        },
+    }
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Origin": "https://www.facebook.com",
+        "Referer": _url_with_geo(
+            urljoin(_FB, COUNTRY_LOCATIONS[country]["marketplace_slugs"][0] + "/"),
+            country,
+        ),
+    }
+    body = {
+        "doc_id": doc_id,
+        "variables": json.dumps(variables),
+        "access_token": token.access_token,
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with reuse_http_session(http_session, proxy_url) as session:
+            async with session.post(
+                "https://www.facebook.com/api/graphql/",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            ) as resp:
+                raw = await resp.text(errors="ignore")
+                if resp.status >= 400 or "login" in raw.lower()[:400]:
+                    return []
+                data = json.loads(raw)
+    except Exception as e:
+        logger.info("browse feed failed country=%s: %s", country, e)
+        return []
+
+    from parser.marketplace import MarketplaceListing, _walk_marketplace_json, listing_is_valid
+
+    by_id: dict[str, MarketplaceListing] = {}
+    _walk_marketplace_json(data, by_id)
+    out: list = []
+    for lid, item in by_id.items():
+        if not listing_is_valid(item):
+            continue
+        item.category = category_label
+        if not item.link:
+            item.link = f"https://www.facebook.com/marketplace/item/{lid}/"
+        out.append(item)
+        if len(out) >= limit:
+            break
+    if out:
+        logger.info("browse feed country=%s: %s items (doc=%s)", country, len(out), doc_id[:12])
+    return out
+
+
 async def _read_response_body(resp: aiohttp.ClientResponse, max_bytes: int = 8_000_000) -> str:
     chunks: list[bytes] = []
     total = 0
@@ -231,7 +314,10 @@ async def apply_marketplace_region(
                     logger.info("marketplace region GET %s", url.replace(_FB, "")[:56])
                     if len(html) > len(hub_html):
                         hub_html = html
-                    from parser.marketplace import _discover_feed_doc_ids_from_html
+                    from parser.marketplace import (
+                        _discover_feed_doc_ids_from_html,
+                        _hub_has_listings,
+                    )
 
                     for did in _discover_feed_doc_ids_from_html(html):
                         if did not in doc_ids:

@@ -229,14 +229,24 @@ def _discover_feed_doc_ids_from_html(html: str) -> list[str]:
     return [doc for _, doc in scored]
 
 
+def _hub_has_listings(html: str) -> bool:
+    h = _html_for_discovery(html)
+    if h.count("/marketplace/item/") >= 1:
+        return True
+    if len(_LISTING_ID_JSON_RE.findall(h)) >= 3:
+        return True
+    return bool(_parse_embedded_scripts(h))
+
+
 def listings_from_hub_html(
     html: str, *, category_label: str = "Marketplace"
 ) -> list["MarketplaceListing"]:
     """Объявления с hub switzerland/ — если category URL не открывается."""
-    if not html or html.count("/marketplace/item/") < 2:
+    norm = _html_for_discovery(html)
+    if not html or not _hub_has_listings(html):
         return []
-    by_id = _parse_embedded_scripts(_html_for_discovery(html))
-    items = list(by_id.values()) if by_id else _parse_html(html, category_label)
+    by_id = _parse_embedded_scripts(norm)
+    items = list(by_id.values()) if by_id else _parse_html(norm, category_label)
     out: list[MarketplaceListing] = []
     seen: set[str] = set()
     for it in items:
@@ -1155,7 +1165,11 @@ async def fetch_category_listings(
         short = url.replace("https://www.facebook.com/marketplace/", "")[:48]
         if on_url_progress:
             await on_url_progress(i, total_urls, short)
-        fetch_url = with_country_geo(url, country)
+        fetch_urls = [url]
+        if country:
+            geo_u = with_country_geo(url, country)
+            if geo_u != url:
+                fetch_urls.append(geo_u)
         cursor: str | None = None
         discovered_doc: str | None = None
         stale_feed_pages = 0
@@ -1167,33 +1181,48 @@ async def fetch_category_listings(
             page_doc = discovered_doc or (env_feed_doc if not skip_env_doc else None)
             logger.info(
                 "GET %s page=%s doc=%s env=%s disc=%s",
-                fetch_url,
+                fetch_urls[0][:80],
                 page_idx + 1,
                 bool(page_doc),
                 bool(env_feed_doc and not skip_env_doc),
                 bool(discovered_doc),
             )
             try:
-                batch, meta, cursor, has_next = await _fetch_page(
-                    token,
-                    url=fetch_url,
-                    user_agent=user_agent,
-                    proxy_url=proxy_url,
-                    timeout_sec=timeout_sec,
-                    category_label=category_label,
-                    graphql_doc_id=page_doc,
-                    cursor=cursor,
-                    country=country,
-                    region_hint_html=region_hint_html,
-                    seed_doc_ids=seed_doc_ids,
-                    http_session=http_session,
-                )
+                batch: list[MarketplaceListing] = []
+                meta: dict[str, Any] = {}
+                has_next = False
+                page_err: Exception | None = None
+                for fetch_url in fetch_urls:
+                    try:
+                        batch, meta, cursor, has_next = await _fetch_page(
+                            token,
+                            url=fetch_url,
+                            user_agent=user_agent,
+                            proxy_url=proxy_url,
+                            timeout_sec=timeout_sec,
+                            category_label=category_label,
+                            graphql_doc_id=page_doc,
+                            cursor=cursor,
+                            country=country,
+                            region_hint_html=region_hint_html,
+                            seed_doc_ids=seed_doc_ids,
+                            http_session=http_session,
+                        )
+                        if batch or meta.get("parsed") or meta.get("source", "").startswith("graphql"):
+                            break
+                    except Exception as e:
+                        page_err = e
+                        logger.info("fetch try %s: %s", fetch_url[:72], e)
+                        continue
+                if page_err and not batch and not meta.get("parsed"):
+                    logger.warning("category page failed %s: %s", short, page_err)
+                    break
                 if page_idx == 0 and not discovered_doc:
                     candidates = meta.get("discovered_doc_ids") or []
                     if not candidates and meta.get("discovered_doc_id"):
                         candidates = [str(meta["discovered_doc_id"])]
                     if cursor and candidates:
-                        seo = _seo_path_from_url(fetch_url)
+                        seo = _seo_path_from_url(fetch_urls[0])
                         for cand in candidates[:8]:
                             gql_try = await _fetch_graphql_category(
                                 token,
@@ -1371,6 +1400,8 @@ def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
 
 def is_connection_error(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, OSError)):
+        return True
+    if type(exc).__name__ == "TooManyRedirects":
         return True
     status = getattr(exc, "status", None)
     if status == 0:
@@ -2820,6 +2851,18 @@ async def _fetch_page(
     if not doc_ids and region_hint_html:
         doc_ids = _discover_feed_doc_ids_from_html(region_hint_html)[:24]
     if not doc_ids and region_hint_html:
+        brute = list(
+            dict.fromkeys(
+                re.findall(
+                    r'"doc_id"\s*:\s*"(\d{15,20})"',
+                    _html_for_discovery(region_hint_html),
+                )
+            )
+        )[:32]
+        for d in brute:
+            if d not in doc_ids:
+                doc_ids.append(d)
+    if not doc_ids and region_hint_html:
         _, dtsg = _extract_fb_tokens(_html_for_discovery(region_hint_html))
         logger.warning(
             "feed doc_ids=0 hub=%s bytes dtsg=%s — только HTML категории",
@@ -2965,7 +3008,18 @@ async def _fetch_page(
             type(last_exc).__name__,
             last_exc,
         )
-        raise last_exc
+        return (
+            [],
+            {
+                "html_len": 0,
+                "link_count": 0,
+                "parsed": 0,
+                "source": "html_error",
+                "fetch_error": type(last_exc).__name__,
+            },
+            None,
+            False,
+        )
 
     meta: dict[str, Any] = {
         "html_len": len(html),

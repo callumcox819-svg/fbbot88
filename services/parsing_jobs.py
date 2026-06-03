@@ -38,7 +38,11 @@ from parser.marketplace import (
     void_complete_from_feed,
     void_export_reject_reason,
 )
-from parser.marketplace_region import apply_marketplace_region, prime_category_feed_region
+from parser.marketplace_region import (
+    apply_marketplace_region,
+    fetch_browse_marketplace_listings,
+    prime_category_feed_region,
+)
 from data.preset_categories import parse_categories_for_country
 from services.proxies import pick_random_proxy_url
 from services.seller_blacklist import (
@@ -531,10 +535,13 @@ async def _parse_impl(
                 stats["feed_doc_auto"] = region_doc_ids[0]
                 logger.info("region feed doc_ids: %s", len(region_doc_ids))
             elif region_hub_html:
+                from parser.marketplace import _hub_has_listings
+
                 logger.info(
-                    "region hub ok (%s bytes, item links=%s), doc_ids пока 0",
+                    "region hub ok (%s bytes, has_listings=%s), doc_ids=%s",
                     len(region_hub_html),
-                    region_hub_html.count("/marketplace/item/"),
+                    _hub_has_listings(region_hub_html),
+                    len(region_doc_ids),
                 )
         except AccountTokenDeadError:
             token_dead_flag["value"] = True
@@ -665,7 +672,16 @@ async def _parse_impl(
                 if not hub_boot_done and region_hub_html:
                     hub_boot_done = True
                     hub_items = listings_from_hub_html(region_hub_html)
-                    logger.info("hub bootstrap: %s items", len(hub_items))
+                    if not hub_items:
+                        hub_items = await fetch_browse_marketplace_listings(
+                            token,
+                            country,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_url,
+                            category_label="CH browse",
+                            limit=max(json_limit * 2, 120),
+                        )
+                    logger.info("hub/bootstrap feed: %s items", len(hub_items))
                     for hub_it in hub_items:
                         if stop.is_set() or len(collected) >= json_limit:
                             break
@@ -804,13 +820,15 @@ async def _parse_impl(
                         await status_progress()
                         if connect_fails >= 3 and len(collected) == 0:
                             hint = (
-                                "❌ <b>Facebook не отвечает</b> (ошибка 0 / обрыв связи).\n\n"
-                                "Проверь SOCKS5 прокси страны поиска в ⚙️ → 🌐 Прокси "
-                                "или смени прокси. Без рабочего прокси Railway часто режет FB."
+                                "❌ <b>Facebook не отвечает</b> (прокси / редиректы).\n\n"
+                                "Проверь SOCKS5 CH/FI в ⚙️ → 🌐 Прокси. "
+                                "Парсинг остановлен — попробуй другой прокси."
                             )
                             if on_status:
                                 await on_status(hint)
-                            raise RuntimeError("Нет связи с Facebook") from err
+                            stop_reason = "нет_связи_fb"
+                            stop.set()
+                            break
                     if category_fetch_fails >= 18 and len(collected) == 0:
                         stop_reason = "нет_связи_fb"
                         stop.set()
