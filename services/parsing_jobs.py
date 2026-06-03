@@ -25,6 +25,7 @@ from parser.account_token import (
     is_account_token_dead,
     parse_account_token,
 )
+from parser.fb_http import fb_http_session
 from parser.marketplace import (
     enrich_listing,
     country_export_reject_reason,
@@ -32,6 +33,7 @@ from parser.marketplace import (
     normalize_listing_for_export,
     fetch_category_listings,
     is_connection_error,
+    listings_from_hub_html,
     listings_to_json,
     void_complete_from_feed,
     void_export_reject_reason,
@@ -511,329 +513,345 @@ async def _parse_impl(
         proxy_url_boot = await pick_random_proxy_url(session, user_id)
     region_doc_ids: list[str] = []
     region_hub_html = ""
-    try:
-        current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
-        await status_progress()
-        region_doc_ids, region_hub_html = await apply_marketplace_region(
-            token,
-            country,
-            user_agent=config.fb_user_agent,
-            proxy_url=proxy_url_boot,
-            timeout_sec=22.0,
-        )
-        if region_doc_ids:
-            stats["feed_doc_auto"] = region_doc_ids[0]
-            logger.info("region feed doc_ids: %s", len(region_doc_ids))
-    except AccountTokenDeadError:
-        token_dead_flag["value"] = True
-
+    hub_boot_done = False
     parse_error: str | None = None
-    try:
-        while (
-            not token_dead_flag["value"]
-            and len(collected) < json_limit
-            and active_cats
-            and not stop.is_set()
-        ):
-            cat = active_cats[0]
-            current_step["detail"] = cat.label
-            current_step["text"] = (
-                f"Категория: {cat.label} · активных {len(active_cats)}/{cat_count}"
-            )
+
+    async with fb_http_session(proxy_url_boot, token.cookies):
+        try:
+            current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
             await status_progress()
-
-            async with Session() as session:
-                proxy_url = await pick_random_proxy_url(session, user_id)
-
-            try:
-                await prime_category_feed_region(
-                    token,
-                    country,
-                    cat.url_path,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url,
+            region_doc_ids, region_hub_html = await apply_marketplace_region(
+                token,
+                country,
+                user_agent=config.fb_user_agent,
+                proxy_url=proxy_url_boot,
+                timeout_sec=22.0,
+            )
+            if region_doc_ids:
+                stats["feed_doc_auto"] = region_doc_ids[0]
+                logger.info("region feed doc_ids: %s", len(region_doc_ids))
+            elif region_hub_html:
+                logger.info(
+                    "region hub ok (%s bytes, item links=%s), doc_ids пока 0",
+                    len(region_hub_html),
+                    region_hub_html.count("/marketplace/item/"),
                 )
-            except AccountTokenDeadError:
-                raise
+        except AccountTokenDeadError:
+            token_dead_flag["value"] = True
 
-            async def on_url(i: int, n: int, short: str) -> None:
-                current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"
-                current_step["text"] = f"⏳ {current_step['detail']}"
-                await status_progress()
-
-            async def on_page_found(n: int) -> None:
-                stats["pages"] = stats.get("pages", 0) + 1
-                stats["found"] = stats.get("feed_cards", 0)
-                await status_progress()
-
-            cat_added = 0
-            page_raw = 0
-            stop_cat_pages = {"value": False}
-            accept_lock = asyncio.Lock()
-
-            async def _accept_item(item) -> bool:
-                normalize_seller_identity(item)
-                lid = (item.listing_id or "").strip()
-                if lid in accepted_listing_ids:
-                    return False
-                ck = canonical_seller_key(item)
-                if ck in accepted_seller_ids or is_seller_blocked(
-                    item, blocked_sellers | session_sellers
-                ):
-                    _record_reject(stats, "повторный_продавец")
-                    return False
-                reason = void_export_reject_reason(
-                    item, country, max_age_hours=max_age_hours
+        try:
+            while (
+                not token_dead_flag["value"]
+                and len(collected) < json_limit
+                and active_cats
+                and not stop.is_set()
+            ):
+                cat = active_cats[0]
+                current_step["detail"] = cat.label
+                current_step["text"] = (
+                    f"Категория: {cat.label} · активных {len(active_cats)}/{cat_count}"
                 )
-                if reason:
-                    _record_reject(stats, reason)
-                    return False
-                for sk in seller_keys_for_item(item):
-                    session_sellers.add(sk)
-                    blocked_sellers.add(sk)
-                if ck:
-                    accepted_seller_ids.add(ck)
-                async with Session() as session:
-                    await remember_seller(session, user_id, country, item)
-                normalize_listing_for_export(item, country)
-                if lid:
-                    accepted_listing_ids.add(lid)
-                collected.append(item)
-                return True
-
-            async def _process_listing(item) -> tuple[bool, bool]:
-                """Возвращает (accepted, dup_skip)."""
-                if stop.is_set() or len(collected) >= json_limit:
-                    return False, False
-                async with seen_lock:
+                await status_progress()
+    
+                proxy_url = proxy_url_boot
+    
+                try:
+                    await prime_category_feed_region(
+                        token,
+                        country,
+                        cat.url_path,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_url,
+                    )
+                except AccountTokenDeadError:
+                    raise
+    
+                async def on_url(i: int, n: int, short: str) -> None:
+                    current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"
+                    current_step["text"] = f"⏳ {current_step['detail']}"
+                    await status_progress()
+    
+                async def on_page_found(n: int) -> None:
+                    stats["pages"] = stats.get("pages", 0) + 1
+                    stats["found"] = stats.get("feed_cards", 0)
+                    await status_progress()
+    
+                cat_added = 0
+                page_raw = 0
+                stop_cat_pages = {"value": False}
+                accept_lock = asyncio.Lock()
+    
+                async def _accept_item(item) -> bool:
+                    normalize_seller_identity(item)
                     lid = (item.listing_id or "").strip()
-                    if not lid or lid in seen_listing_ids:
+                    if lid in accepted_listing_ids:
+                        return False
+                    ck = canonical_seller_key(item)
+                    if ck in accepted_seller_ids or is_seller_blocked(
+                        item, blocked_sellers | session_sellers
+                    ):
+                        _record_reject(stats, "повторный_продавец")
+                        return False
+                    reason = void_export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
+                    if reason:
+                        _record_reject(stats, reason)
+                        return False
+                    for sk in seller_keys_for_item(item):
+                        session_sellers.add(sk)
+                        blocked_sellers.add(sk)
+                    if ck:
+                        accepted_seller_ids.add(ck)
+                    async with Session() as session:
+                        await remember_seller(session, user_id, country, item)
+                    normalize_listing_for_export(item, country)
+                    if lid:
+                        accepted_listing_ids.add(lid)
+                    collected.append(item)
+                    return True
+    
+                async def _process_listing(item) -> tuple[bool, bool]:
+                    """Возвращает (accepted, dup_skip)."""
+                    if stop.is_set() or len(collected) >= json_limit:
                         return False, False
-                    seen_listing_ids.add(lid)
-                    stats["checked"] = stats.get("checked", 0) + 1
-                blocked = blocked_sellers | session_sellers
-                if is_seller_blocked(item, blocked):
-                    _record_reject(stats, "повторный_продавец")
-                    return False, True
-                wrong_country = country_export_reject_reason(item, country)
-                if wrong_country:
-                    _record_reject(stats, wrong_country)
-                    return False, False
-                reason = export_reject_reason(
-                    item, country, max_age_hours=max_age_hours
-                )
-                if reason in _HARD_FEED_REJECT:
-                    _record_reject(stats, reason)
-                    return False, False
-                if void_complete_from_feed(
-                    item, country, max_age_hours=max_age_hours
-                ):
+                    async with seen_lock:
+                        lid = (item.listing_id or "").strip()
+                        if not lid or lid in seen_listing_ids:
+                            return False, False
+                        seen_listing_ids.add(lid)
+                        stats["checked"] = stats.get("checked", 0) + 1
+                    blocked = blocked_sellers | session_sellers
+                    if is_seller_blocked(item, blocked):
+                        _record_reject(stats, "повторный_продавец")
+                        return False, True
+                    wrong_country = country_export_reject_reason(item, country)
+                    if wrong_country:
+                        _record_reject(stats, wrong_country)
+                        return False, False
+                    reason = export_reject_reason(
+                        item, country, max_age_hours=max_age_hours
+                    )
+                    if reason in _HARD_FEED_REJECT:
+                        _record_reject(stats, reason)
+                        return False, False
+                    if void_complete_from_feed(
+                        item, country, max_age_hours=max_age_hours
+                    ):
+                        async with accept_lock:
+                            ok = await _accept_item(item)
+                        if ok:
+                            await _sleep_human(config.parse_item_delay_sec)
+                        return ok, False
+                    if not stop.is_set():
+                        try:
+                            await enrich_listing(
+                                token,
+                                item,
+                                user_agent=config.fb_user_agent,
+                                proxy_url=proxy_used,
+                                timeout_sec=24.0,
+                                country=country,
+                            )
+                        except AccountTokenDeadError:
+                            token_dead_flag["value"] = True
+                            raise
                     async with accept_lock:
                         ok = await _accept_item(item)
                     if ok:
                         await _sleep_human(config.parse_item_delay_sec)
                     return ok, False
-                if not stop.is_set():
-                    try:
-                        await enrich_listing(
-                            token,
-                            item,
-                            user_agent=config.fb_user_agent,
-                            proxy_url=proxy_used,
-                            timeout_sec=24.0,
-                            country=country,
-                        )
-                    except AccountTokenDeadError:
-                        token_dead_flag["value"] = True
-                        raise
-                async with accept_lock:
-                    ok = await _accept_item(item)
-                if ok:
-                    await _sleep_human(config.parse_item_delay_sec)
-                return ok, False
-
-            async def on_page_items(page_items: list) -> None:
-                nonlocal cat_added, page_raw
-                page_raw = len(page_items)
-                stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
-                stats["feed_new"] = stats.get("feed_new", 0) + page_raw
-                page_acc = 0
-                page_skip = 0
-                page_skip_dup = 0
-                enrich_sem = asyncio.Semaphore(5)
-
-                async def _run_one(item) -> None:
-                    nonlocal cat_added, page_acc, page_skip, page_skip_dup
-                    if stop.is_set() or len(collected) >= json_limit:
-                        return
-                    async with enrich_sem:
-                        ok, dup = await _process_listing(item)
-                    if dup:
-                        page_skip += 1
-                        page_skip_dup += 1
-                    elif ok:
-                        cat_added += 1
-                        page_acc += 1
-                        current_step["detail"] = (
-                            f"+{cat_added} {cat.label} · "
-                            f"в JSON {len(collected)}/{json_limit}"
-                        )
-                        await status_progress()
-                    else:
-                        page_skip += 1
-                        last = stats.get("last_reject")
-                        if last == "повторный_продавец":
+    
+                if not hub_boot_done and region_hub_html:
+                    hub_boot_done = True
+                    hub_items = listings_from_hub_html(region_hub_html)
+                    logger.info("hub bootstrap: %s items", len(hub_items))
+                    for hub_it in hub_items:
+                        if stop.is_set() or len(collected) >= json_limit:
+                            break
+                        await _process_listing(hub_it)
+    
+                async def on_page_items(page_items: list) -> None:
+                    nonlocal cat_added, page_raw
+                    page_raw = len(page_items)
+                    stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
+                    stats["feed_new"] = stats.get("feed_new", 0) + page_raw
+                    page_acc = 0
+                    page_skip = 0
+                    page_skip_dup = 0
+                    enrich_sem = asyncio.Semaphore(5)
+    
+                    async def _run_one(item) -> None:
+                        nonlocal cat_added, page_acc, page_skip, page_skip_dup
+                        if stop.is_set() or len(collected) >= json_limit:
+                            return
+                        async with enrich_sem:
+                            ok, dup = await _process_listing(item)
+                        if dup:
+                            page_skip += 1
                             page_skip_dup += 1
-                        if last and last != "повторный_продавец":
+                        elif ok:
+                            cat_added += 1
+                            page_acc += 1
                             current_step["detail"] = (
-                                f"отсев: {_REJECT_LABELS.get(last, last)} · "
-                                f"JSON {len(collected)}/{json_limit}"
+                                f"+{cat_added} {cat.label} · "
+                                f"в JSON {len(collected)}/{json_limit}"
                             )
                             await status_progress()
-
-                await asyncio.gather(*[_run_one(it) for it in page_items])
-
-                logger.info(
-                    "page %s: feed=%s checked=%s accepted=%s skip=%s collected=%s",
-                    cat.label,
-                    page_raw,
-                    stats.get("checked"),
-                    page_acc,
-                    page_skip,
-                    len(collected),
-                )
-
-                min_before_dup_stop = min(json_limit, max(40, json_limit // 2))
-                if (
-                    len(collected) >= min_before_dup_stop
-                    and page_raw >= 8
-                    and page_acc == 0
-                    and page_skip_dup >= int(page_raw * config.feed_dup_stop_ratio)
-                ):
-                    stop_cat_pages["value"] = True
+                        else:
+                            page_skip += 1
+                            last = stats.get("last_reject")
+                            if last == "повторный_продавец":
+                                page_skip_dup += 1
+                            if last and last != "повторный_продавец":
+                                current_step["detail"] = (
+                                    f"отсев: {_REJECT_LABELS.get(last, last)} · "
+                                    f"JSON {len(collected)}/{json_limit}"
+                                )
+                                await status_progress()
+    
+                    await asyncio.gather(*[_run_one(it) for it in page_items])
+    
                     logger.info(
-                        "stop pages %s: %.0f%% repeat sellers (collected=%s)",
+                        "page %s: feed=%s checked=%s accepted=%s skip=%s collected=%s",
                         cat.label,
-                        100 * page_skip_dup / page_raw,
+                        page_raw,
+                        stats.get("checked"),
+                        page_acc,
+                        page_skip,
                         len(collected),
                     )
-
-            def should_stop() -> bool:
-                return stop.is_set() or len(collected) >= json_limit
-
-            def should_stop_pagination() -> bool:
-                return stop_cat_pages["value"]
-
-            fetch_meta: dict = {}
-            last_err: Exception | None = None
-            proxy_used: str | None = None
-            proxy_attempts: tuple[str | None, ...]
-            if proxy_url:
-                proxy_attempts = (proxy_url,)
-            else:
-                proxy_attempts = (None,)
-            for proxy_try in proxy_attempts:
-                try:
-                    proxy_used = proxy_try
-                    _, fetch_meta = await fetch_category_listings(
-                        token,
-                        url_path=cat.url_path,
-                        category_label=cat.label,
-                        user_agent=config.fb_user_agent,
-                        country=country,
-                        proxy_url=proxy_try,
-                        limit=max(json_limit * 12, 500),
-                        timeout_sec=35.0,
-                        on_url_progress=on_url,
-                        on_page_found=on_page_found,
-                        on_page_items=on_page_items,
-                        should_stop=should_stop,
-                        should_stop_pagination=should_stop_pagination,
-                        hub_round=hub_round_counter,
-                        graphql_doc_id=gql_doc,
-                        region_hint_html=region_hub_html,
-                        seed_doc_ids=region_doc_ids,
-                    )
-                    hub_round_counter += 1
-                    auto_doc = fetch_meta.get("feed_doc_auto")
-                    if auto_doc:
-                        stats["feed_doc_auto"] = str(auto_doc)
-                    connect_fails = 0
-                    break
-                except AccountTokenDeadError:
-                    raise
-                except Exception as e:
-                    last_err = e
-                    if is_account_token_dead(e):
-                        raise AccountTokenDeadError(str(e)) from e
-                    if proxy_try and is_connection_error(e):
-                        logger.warning("proxy failed for %s, retry direct: %s", cat.label, e)
-                        continue
-                    break
-
-            if last_err is not None and not fetch_meta.get("pages_fetched"):
-                err = last_err
-                if is_account_token_dead(err):
-                    raise AccountTokenDeadError(str(err)) from err
-                logger.warning("category %s failed: %s", cat.label, err)
-                category_fetch_fails += 1
-                if is_connection_error(err):
-                    connect_fails += 1
-                    current_step["text"] = (
-                        f"❌ Нет ответа Facebook ({category_fetch_fails}) · "
-                        f"проверь прокси CH/FI"
-                    )
-                    await status_progress()
-                    if connect_fails >= 3 and len(collected) == 0:
-                        hint = (
-                            "❌ <b>Facebook не отвечает</b> (ошибка 0 / обрыв связи).\n\n"
-                            "Проверь SOCKS5 прокси страны поиска в ⚙️ → 🌐 Прокси "
-                            "или смени прокси. Без рабочего прокси Railway часто режет FB."
+    
+                    min_before_dup_stop = min(json_limit, max(40, json_limit // 2))
+                    if (
+                        len(collected) >= min_before_dup_stop
+                        and page_raw >= 8
+                        and page_acc == 0
+                        and page_skip_dup >= int(page_raw * config.feed_dup_stop_ratio)
+                    ):
+                        stop_cat_pages["value"] = True
+                        logger.info(
+                            "stop pages %s: %.0f%% repeat sellers (collected=%s)",
+                            cat.label,
+                            100 * page_skip_dup / page_raw,
+                            len(collected),
                         )
-                        if on_status:
-                            await on_status(hint)
-                        raise RuntimeError("Нет связи с Facebook") from err
-                if category_fetch_fails >= 18 and len(collected) == 0:
-                    stop_reason = "нет_связи_fb"
-                    stop.set()
-                    break
-                active_cats = active_cats[1:] + [cat]
-                continue
-            category_fetch_fails = 0
-
-            if fetch_meta.get("stopped_dup_page"):
-                logger.info("category dup-page stop: %s", cat.label)
-                current_step["text"] = (
-                    f"↪ {cat.label}: в основном старые/повторы · "
-                    f"Показано {len(collected)}/{json_limit}"
-                )
-                active_cats = active_cats[1:] + [cat]
-            elif fetch_meta.get("exhausted"):
-                logger.info("category exhausted: %s", cat.label)
-                current_step["text"] = (
-                    f"❌ {cat.label}: лента закончилась · "
-                    f"Показано {len(collected)}/{json_limit}"
-                )
-                active_cats = [c for c in active_cats if c.key != cat.key]
-            else:
-                active_cats = active_cats[1:] + [cat]
-
-            await status_progress()
-            if config.parse_category_delay_sec > 0 and not stop.is_set():
-                await asyncio.sleep(config.parse_category_delay_sec)
-    except AccountTokenDeadError:
-        token_dead_flag["value"] = True
-    except Exception as e:
-        parse_error = str(e)
-        logger.exception("parse loop error tg=%s", telegram_id)
-    finally:
-        hb_task.cancel()
-        try:
-            await hb_task
-        except asyncio.CancelledError:
-            pass
-        if not active_cats and len(collected) < json_limit:
-            stop_reason = stop_reason or "категории_исчерпаны"
+    
+                def should_stop() -> bool:
+                    return stop.is_set() or len(collected) >= json_limit
+    
+                def should_stop_pagination() -> bool:
+                    return stop_cat_pages["value"]
+    
+                fetch_meta: dict = {}
+                last_err: Exception | None = None
+                proxy_used: str | None = None
+                proxy_attempts: tuple[str | None, ...]
+                if proxy_url:
+                    proxy_attempts = (proxy_url,)
+                else:
+                    proxy_attempts = (None,)
+                for proxy_try in proxy_attempts:
+                    try:
+                        proxy_used = proxy_try
+                        _, fetch_meta = await fetch_category_listings(
+                            token,
+                            url_path=cat.url_path,
+                            category_label=cat.label,
+                            user_agent=config.fb_user_agent,
+                            country=country,
+                            proxy_url=proxy_try,
+                            limit=max(json_limit * 12, 500),
+                            timeout_sec=35.0,
+                            on_url_progress=on_url,
+                            on_page_found=on_page_found,
+                            on_page_items=on_page_items,
+                            should_stop=should_stop,
+                            should_stop_pagination=should_stop_pagination,
+                            hub_round=hub_round_counter,
+                            graphql_doc_id=gql_doc,
+                            region_hint_html=region_hub_html,
+                            seed_doc_ids=region_doc_ids,
+                        )
+                        hub_round_counter += 1
+                        auto_doc = fetch_meta.get("feed_doc_auto")
+                        if auto_doc:
+                            stats["feed_doc_auto"] = str(auto_doc)
+                        connect_fails = 0
+                        break
+                    except AccountTokenDeadError:
+                        raise
+                    except Exception as e:
+                        last_err = e
+                        if is_account_token_dead(e):
+                            raise AccountTokenDeadError(str(e)) from e
+                        if proxy_try and is_connection_error(e):
+                            logger.warning("category fetch failed %s: %s", cat.label, e)
+                        break
+    
+                if last_err is not None and not fetch_meta.get("pages_fetched"):
+                    err = last_err
+                    if is_account_token_dead(err):
+                        raise AccountTokenDeadError(str(err)) from err
+                    logger.warning("category %s failed: %s", cat.label, err)
+                    category_fetch_fails += 1
+                    if is_connection_error(err):
+                        connect_fails += 1
+                        current_step["text"] = (
+                            f"❌ Нет ответа Facebook ({category_fetch_fails}) · "
+                            f"проверь прокси CH/FI"
+                        )
+                        await status_progress()
+                        if connect_fails >= 3 and len(collected) == 0:
+                            hint = (
+                                "❌ <b>Facebook не отвечает</b> (ошибка 0 / обрыв связи).\n\n"
+                                "Проверь SOCKS5 прокси страны поиска в ⚙️ → 🌐 Прокси "
+                                "или смени прокси. Без рабочего прокси Railway часто режет FB."
+                            )
+                            if on_status:
+                                await on_status(hint)
+                            raise RuntimeError("Нет связи с Facebook") from err
+                    if category_fetch_fails >= 18 and len(collected) == 0:
+                        stop_reason = "нет_связи_fb"
+                        stop.set()
+                        break
+                    active_cats = active_cats[1:] + [cat]
+                    continue
+                category_fetch_fails = 0
+    
+                if fetch_meta.get("stopped_dup_page"):
+                    logger.info("category dup-page stop: %s", cat.label)
+                    current_step["text"] = (
+                        f"↪ {cat.label}: в основном старые/повторы · "
+                        f"Показано {len(collected)}/{json_limit}"
+                    )
+                    active_cats = active_cats[1:] + [cat]
+                elif fetch_meta.get("exhausted"):
+                    logger.info("category exhausted: %s", cat.label)
+                    current_step["text"] = (
+                        f"❌ {cat.label}: лента закончилась · "
+                        f"Показано {len(collected)}/{json_limit}"
+                    )
+                    active_cats = [c for c in active_cats if c.key != cat.key]
+                else:
+                    active_cats = active_cats[1:] + [cat]
+    
+                await status_progress()
+                if config.parse_category_delay_sec > 0 and not stop.is_set():
+                    await asyncio.sleep(config.parse_category_delay_sec)
+        except AccountTokenDeadError:
+            token_dead_flag["value"] = True
+        except Exception as e:
+            parse_error = str(e)
+            logger.exception("parse loop error tg=%s", telegram_id)
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+            if not active_cats and len(collected) < json_limit:
+                stop_reason = stop_reason or "категории_исчерпаны"
 
     await _finalize_parse_run(
         bot,

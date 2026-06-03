@@ -13,6 +13,7 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from data.preset_categories import COUNTRY_LOCATIONS
+from parser.fb_http import reuse_http_session
 from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ async def _graphql_browse_prime(
     user_agent: str,
     proxy_url: str | None,
     timeout_sec: float,
+    http_session: aiohttp.ClientSession | None = None,
 ) -> bool:
     """Задать filter_location_id через marketplace_search (как VOID / wesbos gist)."""
     loc_id = _filter_location_id(country)
@@ -139,7 +141,7 @@ async def _graphql_browse_prime(
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     try:
-        async with _session_for_proxy(proxy_url) as session:
+        async with reuse_http_session(http_session, proxy_url) as session:
             async with session.post(
                 "https://www.facebook.com/api/graphql/",
                 headers=headers,
@@ -176,6 +178,7 @@ async def apply_marketplace_region(
     user_agent: str,
     proxy_url: str | None,
     timeout_sec: float = 25.0,
+    http_session: aiohttp.ClientSession | None = None,
 ) -> tuple[list[str], str]:
     """
     Перед парсингом: открыть CH/FI marketplace + координаты, чтобы FB не отдавал ленту UA аккаунта.
@@ -217,7 +220,7 @@ async def apply_marketplace_region(
         add(f"{hub}/")
 
     logger.info("region switch start country=%s urls=%s proxy=%s", country, len(urls), bool(proxy_url))
-    async with _session_for_proxy(proxy_url) as session:
+    async with reuse_http_session(http_session, proxy_url) as session:
         for url in urls:
             try:
                 logger.info("region GET %s", url.replace(_FB, "")[:56])
@@ -244,6 +247,7 @@ async def apply_marketplace_region(
         user_agent=user_agent,
         proxy_url=proxy_url,
         timeout_sec=min(timeout_sec, 12.0),
+        http_session=http_session,
     )
     logger.info(
         "marketplace region applied: %s (hub_html=%s, feed_doc_ids=%s)",
@@ -280,6 +284,7 @@ async def prime_category_feed_region(
     user_agent: str,
     proxy_url: str | None,
     timeout_sec: float = 18.0,
+    http_session: aiohttp.ClientSession | None = None,
 ) -> None:
     """Открыть ленту категории с geo до парсинга (loc_id + finland)."""
     if country not in COUNTRY_LOCATIONS:
@@ -292,7 +297,7 @@ async def prime_category_feed_region(
         connect=min(18.0, timeout_sec),
         sock_read=max(12.0, timeout_sec - 4.0),
     )
-    async with _session_for_proxy(proxy_url) as session:
+    async with reuse_http_session(http_session, proxy_url) as session:
         for path in _category_prime_paths(country, url_path)[:2]:
             url = _url_with_geo(urljoin(_FB, path), country)
             try:
