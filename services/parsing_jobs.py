@@ -29,8 +29,9 @@ from parser.fb_http import fb_http_session
 from parser.marketplace import (
     enrich_listing,
     country_export_reject_reason,
-    export_reject_reason,
+    feed_stage_reject_reason,
     normalize_listing_for_export,
+    prepare_listing_for_void_export,
     fetch_category_listings,
     is_connection_error,
     listings_from_hub_html,
@@ -73,7 +74,7 @@ async def _sleep_human(base_sec: float) -> None:
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
     "чужая_страна": "Отсечено: не FI/CH",
-    "мало_полей": "Мало полей",
+    "мало_полей": "Нет цены/фото (не блокирует VOID JSON)",
     "нет_заголовка": "Нет заголовка",
     "старше_24ч": "Старше 24 ч",
     "нет_данных": "Нет продавца/описания",
@@ -363,7 +364,8 @@ async def _finalize_parse_run(
                     label = _REJECT_LABELS.get(key, key)
                     lines.append(f"→ {label}: <b>{count}</b>")
             lines.append(
-                "\n<i>Как VOID: нужен person_link с карточки /marketplace/item/… "
+                "\n<i>Как VOID JSON: person_link продавца + item_link объявления "
+                "(как void-parser-result). Цена/фото добираются с карточки. "
                 "(цена+фото+profile). ЧС, старше 24 ч.</i>"
             )
             await on_status("\n".join(lines))
@@ -585,7 +587,7 @@ async def _parse_impl(
                 accepted_seller_ids.add(ck)
             async with Session() as session:
                 await remember_seller(session, user_id, country, item)
-            normalize_listing_for_export(item, country)
+            prepare_listing_for_void_export(item, country)
             if lid:
                 accepted_listing_ids.add(lid)
             collected.append(item)
@@ -608,7 +610,7 @@ async def _parse_impl(
             if wrong_country:
                 _record_reject(stats, wrong_country)
                 return False, False
-            reason = export_reject_reason(
+            reason = feed_stage_reject_reason(
                 item, country, max_age_hours=max_age_hours
             )
             if reason in _HARD_FEED_REJECT:

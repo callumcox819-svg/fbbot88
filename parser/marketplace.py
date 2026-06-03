@@ -360,6 +360,14 @@ _ITEM_DOC_PATTERNS = (
         re.I | re.DOTALL,
     ),
     re.compile(
+        r"MarketplaceProductDetails[^}]{0,3000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
+        r"MarketplaceItemDetails[^}]{0,3000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
+        re.I | re.DOTALL,
+    ),
+    re.compile(
         r"ListingDetails[^}]{0,2000}?\"doc_id\"\s*:\s*\"(\d{15,20})\"",
         re.I | re.DOTALL,
     ),
@@ -906,6 +914,23 @@ def export_reject_reason(
     return "мало_полей"
 
 
+def feed_stage_reject_reason(
+    item: MarketplaceListing,
+    country: str | None = None,
+    *,
+    max_age_hours: float | None = None,
+) -> str | None:
+    """До enrich: только возраст/заголовок/страна — не режем «мало полей»."""
+    if not listing_is_valid(item):
+        return "нет_заголовка"
+    if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
+        return "старше_24ч"
+    wrong = country_export_reject_reason(item, country)
+    if wrong:
+        return wrong
+    return None
+
+
 def void_export_reject_reason(
     item: MarketplaceListing,
     country: str | None = None,
@@ -913,15 +938,15 @@ def void_export_reject_reason(
     max_age_hours: float | None = None,
 ) -> str | None:
     """
-    Как VOID: title + price + photo + person_link (profile/1000…).
-    Имя и gender/ads_number — с карточки объявления после enrich.
+    Как VOID JSON: item_title + item_link + person_link (profile).
+    Цена/фото/описание добираются enrich; пустые поля — как в void-parser-result.
     """
     from services.seller_blacklist import _profile_id
 
-    base = export_reject_reason(item, country, max_age_hours=max_age_hours)
-    if base:
-        return base
-    # FI/CH: регион уже в URL и токене (finland/, loc_id). VOID не режет по UA в JSON.
+    if not listing_is_valid(item):
+        return "нет_заголовка"
+    if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
+        return "старше_24ч"
     from services.seller_blacklist import normalize_seller_identity
 
     normalize_seller_identity(item)
@@ -936,10 +961,27 @@ def void_export_reject_reason(
         item.person_link = ""
     if not _profile_id(item):
         return "нет_продавца"
+    if not (item.link or "").strip() and item.listing_id:
+        item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
     wrong = country_export_reject_reason(item, country)
     if wrong:
         return wrong
     return None
+
+
+def prepare_listing_for_void_export(
+    item: MarketplaceListing, country: str | None = None
+) -> None:
+    """Заполнить пустые поля как в void-parser-result перед записью в JSON."""
+    normalize_listing_for_export(item, country)
+    if not (item.link or "").strip() and item.listing_id:
+        item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
+    if not (item.item_desc or "").strip():
+        item.item_desc = "N/A"
+    if item.ads_number is None:
+        item.ads_number = None
+    if item.rating is None:
+        item.rating = 0
 
 
 def listing_enrich_complete(item: MarketplaceListing) -> bool:
@@ -1965,6 +2007,21 @@ async def _enrich_via_comet_cookies(
     return patch
 
 
+def _item_graphql_doc_ids(hint_html: str) -> list[str]:
+    ids: list[str] = []
+    env = (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip()
+    if env:
+        ids.append(env)
+    one = _extract_item_doc_id(hint_html)
+    if one and one not in ids:
+        ids.append(one)
+    if hint_html:
+        for d in _fallback_feed_doc_ids(hint_html)[:16]:
+            if d not in ids:
+                ids.append(d)
+    return ids
+
+
 async def _enrich_via_graphql_item(
     token: AccountToken,
     listing_id: str,
@@ -1975,8 +2032,8 @@ async def _enrich_via_graphql_item(
     country: str | None,
     hint_html: str = "",
 ) -> dict[str, Any]:
-    doc_id = _extract_item_doc_id(hint_html)
-    if not doc_id:
+    doc_ids = _item_graphql_doc_ids(hint_html)
+    if not doc_ids:
         return {}
     if not token.access_token and not token.cookies:
         return {}
@@ -2002,25 +2059,16 @@ async def _enrich_via_graphql_item(
     lsd, dtsg = _extract_fb_tokens(_html_for_discovery(hint_html))
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     async with reuse_http_session(None, proxy_url) as session:
-        for variables in variable_sets:
-            bodies: list[dict[str, str]] = []
-            if token.access_token:
-                bodies.append({
-                    "doc_id": doc_id,
-                    "variables": json.dumps(variables),
-                    "access_token": token.access_token,
-                })
-            if dtsg and token.c_user:
-                bodies.append({
-                    "__a": "1",
-                    "__user": token.c_user,
-                    "fb_dtsg": dtsg,
-                    "lsd": lsd or dtsg[:12],
-                    "doc_id": doc_id,
-                    "variables": json.dumps(variables),
-                    "server_timestamps": "1",
-                })
+        for doc_id in doc_ids[:10]:
+            for variables in variable_sets:
+                bodies: list[dict[str, str]] = []
                 if token.access_token:
+                    bodies.append({
+                        "doc_id": doc_id,
+                        "variables": json.dumps(variables),
+                        "access_token": token.access_token,
+                    })
+                if dtsg and token.c_user:
                     bodies.append({
                         "__a": "1",
                         "__user": token.c_user,
@@ -2028,40 +2076,72 @@ async def _enrich_via_graphql_item(
                         "lsd": lsd or dtsg[:12],
                         "doc_id": doc_id,
                         "variables": json.dumps(variables),
-                        "access_token": token.access_token,
                         "server_timestamps": "1",
                     })
-            if not bodies:
-                bodies.append({
-                    "doc_id": doc_id,
-                    "variables": json.dumps(variables),
-                })
-            for body in bodies:
-                hdrs = dict(headers)
-                if body.get("fb_dtsg") and lsd:
-                    hdrs["X-FB-LSD"] = lsd
-                try:
-                    async with session.post(
-                        "https://www.facebook.com/api/graphql/",
-                        headers=hdrs,
-                        data=body,
-                        timeout=timeout,
-                    ) as resp:
-                        raw = await resp.text(errors="ignore")
-                        if resp.status >= 400:
-                            continue
-                        data = json.loads(raw)
-                except Exception as e:
-                    logger.debug("item graphql %s: %s", listing_id, e)
-                    continue
-                patch = _seller_patch_from_graphql_payload(data, listing_id)
-                if patch.get("seller_id") or patch.get("person_link"):
-                    logger.info(
-                        "item graphql ok %s profile=%s",
-                        listing_id,
-                        str(patch.get("seller_id", ""))[:12],
-                    )
-                    return patch
+                    if token.access_token:
+                        bodies.append({
+                            "__a": "1",
+                            "__user": token.c_user,
+                            "fb_dtsg": dtsg,
+                            "lsd": lsd or dtsg[:12],
+                            "doc_id": doc_id,
+                            "variables": json.dumps(variables),
+                            "access_token": token.access_token,
+                            "server_timestamps": "1",
+                        })
+                if not bodies:
+                    bodies.append({
+                        "doc_id": doc_id,
+                        "variables": json.dumps(variables),
+                    })
+                for body in bodies:
+                    hdrs = dict(headers)
+                    if body.get("fb_dtsg") and lsd:
+                        hdrs["X-FB-LSD"] = lsd
+                    try:
+                        async with session.post(
+                            "https://www.facebook.com/api/graphql/",
+                            headers=hdrs,
+                            data=body,
+                            timeout=timeout,
+                        ) as resp:
+                            raw = await resp.text(errors="ignore")
+                            if resp.status >= 400:
+                                continue
+                            from parser.marketplace_region import loads_fb_api_response
+
+                            data = loads_fb_api_response(raw)
+                    except Exception as e:
+                        logger.debug("item graphql %s doc=%s: %s", listing_id, doc_id[:8], e)
+                        continue
+                    patch = _seller_patch_from_graphql_payload(data, listing_id)
+                    if not patch.get("price") or not patch.get("photo"):
+                        by_id: dict[str, MarketplaceListing] = {}
+                        for root in iter_fb_graphql_roots(raw):
+                            _walk_marketplace_json(root, by_id)
+                        hit = by_id.get(listing_id)
+                        if hit:
+                            patch = {
+                                **patch,
+                                "title": hit.title,
+                                "price": hit.price,
+                                "photo": hit.photo,
+                                "seller_id": hit.seller_id or patch.get("seller_id"),
+                                "seller_name": hit.seller_name or patch.get("seller_name"),
+                                "person_link": hit.person_link or patch.get("person_link"),
+                                "item_desc": hit.item_desc,
+                                "location": hit.location,
+                                "created_date": hit.created_date,
+                                "created_timestamp": hit.created_timestamp,
+                            }
+                    if patch.get("seller_id") or patch.get("person_link"):
+                        logger.info(
+                            "item graphql ok %s profile=%s doc=%s",
+                            listing_id,
+                            str(patch.get("seller_id", ""))[:12],
+                            doc_id[:10],
+                        )
+                        return patch
     return {}
 
 

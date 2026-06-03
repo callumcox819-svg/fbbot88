@@ -400,8 +400,14 @@ async def fetch_any_browse_feed(
     http_session: aiohttp.ClientSession | None = None,
     limit: int = 120,
 ) -> tuple[list, str]:
+    from parser.marketplace import merge_marketplace_feeds
+
+    comet_items: list = []
+    comet_raw = ""
+    token_items: list = []
+    token_raw = ""
     if hint_html:
-        items, raw = await fetch_browse_marketplace_comet(
+        comet_items, comet_raw = await fetch_browse_marketplace_comet(
             token,
             country,
             hint_html=hint_html,
@@ -410,16 +416,24 @@ async def fetch_any_browse_feed(
             http_session=http_session,
             limit=limit,
         )
-        if items:
-            return items, raw
-    items, raw = await fetch_browse_marketplace_listings(
-        token,
-        country,
-        user_agent=user_agent,
-        proxy_url=proxy_url,
-        http_session=http_session,
-        limit=limit,
-    )
+    if token.access_token:
+        token_items, token_raw = await fetch_browse_marketplace_listings(
+            token,
+            country,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            http_session=http_session,
+            limit=limit,
+        )
+    items = merge_marketplace_feeds(comet_items, token_items)
+    raw = token_raw if len(token_raw) > len(comet_raw) else comet_raw
+    if not items:
+        logger.info(
+            "browse all empty country=%s comet_raw=%s token_raw=%s",
+            country,
+            len(comet_raw),
+            len(token_raw),
+        )
     return items, raw
 
 
