@@ -208,6 +208,11 @@ def _progress_text(
             lines.append(
                 f"<i>doc_id ленты подобран из HTML: <code>{stats['feed_doc_auto'][:12]}…</code></i>"
             )
+        elif stop_reason == "нет_связи_fb":
+            lines.append(
+                "<i>Парсинг остановлен: Facebook не отдаёт ленту (прокси/блок). "
+                "Смени прокси и перезапусти.</i>"
+            )
         elif not (config.fb_marketplace_doc_id or "").strip() and in_json < total // 4:
             lines.append(
                 "<i>⚠️ doc_id ленты не найден — только 1-я порция HTML (~20 карточек). "
@@ -451,6 +456,7 @@ async def _parse_impl(
     connect_fails = 0
     stop_reason = ""
     hub_round_counter = 0
+    category_fetch_fails = 0
 
     t_start = time.monotonic()
     current_step = {"text": "Старт…"}
@@ -722,7 +728,7 @@ async def _parse_impl(
                         country=country,
                         proxy_url=proxy_try,
                         limit=max(json_limit * 12, 500),
-                        timeout_sec=22.0,
+                        timeout_sec=35.0,
                         on_url_progress=on_url,
                         on_page_found=on_page_found,
                         on_page_items=on_page_items,
@@ -753,18 +759,30 @@ async def _parse_impl(
                 if is_account_token_dead(err):
                     raise AccountTokenDeadError(str(err)) from err
                 logger.warning("category %s failed: %s", cat.label, err)
+                category_fetch_fails += 1
                 if is_connection_error(err):
                     connect_fails += 1
+                    current_step["text"] = (
+                        f"❌ Нет ответа Facebook ({category_fetch_fails}) · "
+                        f"проверь прокси CH/FI"
+                    )
+                    await status_progress()
                     if connect_fails >= 3 and len(collected) == 0:
                         hint = (
-                            "❌ <b>Нет связи с Facebook</b>\n\n"
-                            "Добавь SOCKS5 прокси страны поиска в ⚙️ Настройки → 🌐 Прокси."
+                            "❌ <b>Facebook не отвечает</b> (ошибка 0 / обрыв связи).\n\n"
+                            "Проверь SOCKS5 прокси страны поиска в ⚙️ → 🌐 Прокси "
+                            "или смени прокси. Без рабочего прокси Railway часто режет FB."
                         )
                         if on_status:
                             await on_status(hint)
                         raise RuntimeError("Нет связи с Facebook") from err
+                if category_fetch_fails >= 18 and len(collected) == 0:
+                    stop_reason = "нет_связи_fb"
+                    stop.set()
+                    break
                 active_cats = active_cats[1:] + [cat]
                 continue
+            category_fetch_fails = 0
 
             if fetch_meta.get("stopped_dup_page"):
                 logger.info("category dup-page stop: %s", cat.label)

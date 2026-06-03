@@ -1010,9 +1010,9 @@ def urls_for_country_category(
     if loc_id:
         country_slugs.add(loc_id)
     if embed_root and (embed_root in country_slugs or embed_root in country_hubs):
-        if cat_slug and loc_id:
-            add(build_category_url(f"{loc_id}/category/{cat_slug}"))
         add(build_category_url(norm))
+        if cat_slug and loc_id and embed_root != loc_id:
+            add(build_category_url(f"{loc_id}/category/{cat_slug}"))
         return urls
 
     slugs = cfg.get("marketplace_slugs") or []
@@ -1296,6 +1296,11 @@ def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
 
 
 def is_connection_error(exc: BaseException) -> bool:
+    if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, OSError)):
+        return True
+    status = getattr(exc, "status", None)
+    if status == 0:
+        return True
     s = str(exc).lower()
     return any(
         x in s
@@ -1303,11 +1308,14 @@ def is_connection_error(exc: BaseException) -> bool:
             "cannot connect",
             "connection refused",
             "connection reset",
+            "connection closed",
+            "server disconnected",
             "timed out",
             "timeout",
             "ssl",
             "proxy",
             "network is unreachable",
+            "message=''",
         )
     )
 
@@ -2650,14 +2658,30 @@ async def _fetch_page(
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    async with _session_for_proxy(proxy_url) as session:
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            html = await resp.text(errors="ignore")
-            if resp.status >= 400:
-                raise RuntimeError(f"Facebook HTTP {resp.status}")
-            if "login" in str(resp.url).lower():
-                raise AccountTokenDeadError("redirect to login")
+    timeout = aiohttp.ClientTimeout(total=timeout_sec, connect=min(25.0, timeout_sec))
+    last_exc: Exception | None = None
+    html = ""
+    for attempt in range(3):
+        try:
+            async with _session_for_proxy(proxy_url) as session:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    html = await resp.text(errors="ignore")
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Facebook HTTP {resp.status}")
+                    if "login" in str(resp.url).lower():
+                        raise AccountTokenDeadError("redirect to login")
+            last_exc = None
+            break
+        except (AccountTokenDeadError, RuntimeError):
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < 2 and is_connection_error(e):
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
 
     meta: dict[str, Any] = {
         "html_len": len(html),
