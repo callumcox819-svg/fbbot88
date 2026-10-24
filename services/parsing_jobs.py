@@ -422,6 +422,11 @@ async def _finalize_parse_run(
         lines.append("<i>Парсинг остановлен вручную — JSON уже в чате.</i>")
     elif full:
         lines.append("<i>Лимит набран.</i>")
+    elif stop_reason == "лента_недоступна":
+        lines.append(
+            "<i>Facebook закрыл дальнейшую Marketplace-ленту для текущего "
+            "прокси/IP. Токен не помечен умершим; отправлено всё уже собранное.</i>"
+        )
     elif stop_reason == "категории_исчерпаны":
         lines.append(
             f"<i>Все категории пройдены ({got}/{json_limit}). "
@@ -947,7 +952,7 @@ async def _parse_impl(
                 page_raw = 0
                 stop_cat_pages = {"value": False}
 
-                async def on_page_items(page_items: list) -> None:
+                async def process_category_items(page_items: list) -> None:
                     nonlocal cat_added, page_raw
                     page_raw = len(page_items)
                     stats["feed_cards"] = stats.get("feed_cards", 0) + page_raw
@@ -1030,7 +1035,7 @@ async def _parse_impl(
                 for proxy_try in proxy_attempts:
                     try:
                         proxy_used = proxy_try
-                        _, fetch_meta = await _interruptible(
+                        category_items, fetch_meta = await _interruptible(
                             fetch_category_listings(
                                 token,
                                 url_path=cat.url_path,
@@ -1042,7 +1047,7 @@ async def _parse_impl(
                                 timeout_sec=35.0,
                                 on_url_progress=on_url,
                                 on_page_found=on_page_found,
-                                on_page_items=on_page_items,
+                                on_page_items=None,
                                 should_stop=should_stop,
                                 should_stop_pagination=should_stop_pagination,
                                 hub_round=hub_round_counter,
@@ -1054,6 +1059,8 @@ async def _parse_impl(
                         )
                         if stop.is_set():
                             break
+                        if category_items:
+                            await process_category_items(category_items)
                         hub_round_counter += 1
                         auto_doc = fetch_meta.get("feed_doc_auto")
                         if auto_doc:
@@ -1101,6 +1108,16 @@ async def _parse_impl(
                     active_cats = active_cats[1:] + [cat]
                     continue
                 category_fetch_fails = 0
+
+                if fetch_meta.get("feed_blocked"):
+                    stop_reason = "лента_недоступна"
+                    logger.warning(
+                        "stop after partial category feed: %s items=%s json=%s",
+                        cat.label,
+                        len(category_items),
+                        len(collected),
+                    )
+                    break
     
                 if fetch_meta.get("stopped_dup_page"):
                     logger.info("category dup-page stop: %s", cat.label)

@@ -1385,6 +1385,7 @@ async def fetch_category_listings(
     has_next_at_end = False
     stopped_early = False
     stopped_dup_page = False
+    feed_blocked = False
     for i, url in enumerate(urls, start=1):
         if should_stop and should_stop():
             break
@@ -1549,8 +1550,18 @@ async def fetch_category_listings(
                     break
                 if config.parse_page_delay_sec > 0:
                     await asyncio.sleep(config.parse_page_delay_sec)
-            except (AccountTokenDeadError, MarketplaceFeedBlockedError):
+            except AccountTokenDeadError:
                 raise
+            except MarketplaceFeedBlockedError as e:
+                feed_blocked = True
+                has_next_at_end = False
+                logger.warning(
+                    "feed blocked after %s collected items for %s: %s",
+                    len(out),
+                    short,
+                    e,
+                )
+                break
             except RuntimeError as e:
                 if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                     logger.info("skip url %s: %s", url, e)
@@ -1560,6 +1571,8 @@ async def fetch_category_listings(
             except Exception as e:
                 logger.warning("feed %s p%s failed: %s", short, page_idx + 1, e)
                 break
+        if feed_blocked:
+            break
 
     exhausted = (
         pages_fetched > 0
@@ -1571,6 +1584,7 @@ async def fetch_category_listings(
         "listings_seen": len(seen_ids),
         "exhausted": exhausted,
         "stopped_dup_page": stopped_dup_page,
+        "feed_blocked": feed_blocked,
         "urls_tried": len(urls),
         "feed_doc_auto": auto_feed_doc if not env_feed_doc else None,
     }
