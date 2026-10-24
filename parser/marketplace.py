@@ -180,6 +180,10 @@ def _html_for_discovery(html: str) -> str:
     return (
         html.replace("\\u0022", '"')
         .replace("\\u0027", "'")
+        .replace("\\u002f", "/")
+        .replace("\\u002F", "/")
+        .replace("\\u003d", "=")
+        .replace("\\u003D", "=")
         .replace("\\/", "/")
     )
 
@@ -369,8 +373,13 @@ def listings_from_hub_html(
     norm = _html_for_discovery(html)
     if not html or not _hub_has_listings(html):
         return []
-    by_id = _parse_embedded_scripts(norm)
-    items = list(by_id.values()) if by_id else _parse_html(norm, category_label)
+    # Relay содержит множество внутренних сущностей с похожими полями `id`.
+    # Реальным объявлением считаем только сущность, для которой на странице
+    # присутствует ссылка /marketplace/item/{id}.
+    real_ids = set(_collect_listing_ids(norm))
+    items = _parse_html(norm, category_label)
+    if real_ids:
+        items = [item for item in items if item.listing_id in real_ids]
     out: list[MarketplaceListing] = []
     seen: set[str] = set()
     for it in items:
@@ -1020,9 +1029,27 @@ def void_missing_fields(item: MarketplaceListing) -> list[str]:
     return miss
 
 
+def export_core_missing_fields(item: MarketplaceListing) -> list[str]:
+    """Поля, без которых объявление не считается пригодным для результата."""
+    from services.seller_blacklist import _profile_id
+
+    miss: list[str] = []
+    if not (item.title or "").strip():
+        miss.append("title")
+    if not (item.price or "").strip():
+        miss.append("price")
+    if not (item.photo or "").strip():
+        miss.append("photo")
+    if not (item.seller_name or "").strip():
+        miss.append("seller_name")
+    if not _profile_id(item):
+        miss.append("person_link")
+    return miss
+
+
 def listing_void_ready(item: MarketplaceListing) -> bool:
-    """Полная карточка как void-parser-result (после enrich с токеном)."""
-    return not void_missing_fields(item)
+    """Карточка содержит все обязательные поля; остальное экспортируется при наличии."""
+    return not export_core_missing_fields(item)
 
 
 def void_export_reject_reason(
@@ -1031,7 +1058,7 @@ def void_export_reject_reason(
     *,
     max_age_hours: float | None = None,
 ) -> str | None:
-    """В JSON только полная карточка VOID: seller, price, photo, desc, person_link."""
+    """В JSON карточка с основными полями; дополнительные поля могут быть пустыми."""
     if not listing_is_valid(item):
         return "нет_заголовка"
     if max_age_hours is not None and listing_is_too_old(item, max_age_hours):
@@ -1055,15 +1082,11 @@ def void_export_reject_reason(
         return wrong
     if listing_void_ready(item):
         return None
-    miss = void_missing_fields(item)
+    miss = export_core_missing_fields(item)
     if "person_link" in miss:
         return "нет_продавца"
     if "seller_name" in miss:
         return "нет_имени"
-    if "item_desc" in miss:
-        return "нет_описания"
-    if "location" in miss or "created_date" in miss:
-        return "нет_даты_локации"
     if "price" in miss or "photo" in miss:
         return "мало_полей"
     return "мало_полей"
@@ -2819,12 +2842,20 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
     if not title:
         title = _dig_str(node, "marketplace_listing_title", "title", "name")
 
-    price = _dig_str(fs, "formatted_price", "formatted_amount", "listing_price")
+    price = _dig_str(fs, "formatted_price", "formatted_amount")
     if not price:
-        for key in ("formatted_price", "listing_price", "price"):
+        for key in ("listing_price", "price", "current_price"):
             price_obj = fs.get(key)
             if isinstance(price_obj, dict):
-                price = _dig_str(price_obj, "text", "amount")
+                price = _dig_str(
+                    price_obj,
+                    "formatted_amount",
+                    "formatted_price",
+                    "text",
+                    "amount",
+                )
+            elif isinstance(price_obj, (str, int, float)):
+                price = str(price_obj)
             if price:
                 break
 
@@ -2841,6 +2872,19 @@ def _listing_from_graph_node(node: dict[str, Any]) -> dict[str, Any] | None:
         title = f"Item {lid}"
 
     location = _dig_str(fs, "marketplace_listing_location", "location")
+    location_obj = fs.get("location")
+    if not location and isinstance(location_obj, dict):
+        reverse = location_obj.get("reverse_geocode")
+        if isinstance(reverse, dict):
+            city_page = reverse.get("city_page")
+            if isinstance(city_page, dict):
+                location = _dig_str(city_page, "display_name", "name")
+            location = location or _dig_str(
+                reverse,
+                "city",
+                "display_name",
+                "single_line_address",
+            )
     seller_name = ""
     seller_id = ""
     sid_direct = str(
@@ -3745,6 +3789,7 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
     seller_index = build_feed_seller_index(html)
 
     ids_in_order = _collect_listing_ids(html)
+    real_ids = set(ids_in_order)
     titles = _first_group(list(_TITLE_RE.finditer(html)))
     prices = _first_group(list(_PRICE_RE.finditer(html)))
     sellers = _first_group(list(_SELLER_RE.finditer(html)))
@@ -3796,6 +3841,8 @@ def _parse_html(html: str, category_label: str) -> list[MarketplaceListing]:
 
     out: list[MarketplaceListing] = []
     for item in by_id.values():
+        if real_ids and item.listing_id not in real_ids:
+            continue
         if not item.link:
             item.link = f"https://www.facebook.com/marketplace/item/{item.listing_id}/"
         if listing_is_valid(item):

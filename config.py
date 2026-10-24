@@ -51,9 +51,9 @@ def load_config() -> Config:
             (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip() or None
         ),
         listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "24"),
-        parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "6"),
-        parse_category_delay_sec=float(os.getenv("PARSE_CATEGORY_DELAY_SEC") or "10"),
-        parse_page_delay_sec=float(os.getenv("PARSE_PAGE_DELAY_SEC") or "3"),
+        parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "2.5"),
+        parse_category_delay_sec=float(os.getenv("PARSE_CATEGORY_DELAY_SEC") or "3"),
+        parse_page_delay_sec=float(os.getenv("PARSE_PAGE_DELAY_SEC") or "1.5"),
         marketplace_pages_per_category=int(os.getenv("MARKETPLACE_PAGES_PER_CATEGORY") or "12"),
         feed_dup_stop_ratio=float(os.getenv("FEED_DUP_STOP_RATIO") or "0.85"),
     )
