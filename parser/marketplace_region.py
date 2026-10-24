@@ -41,9 +41,17 @@ def _session_for_proxy(proxy_url: str | None) -> aiohttp.ClientSession:
 
 def _looks_like_login_wall(html: str) -> bool:
     h = html.lower()
-    if "id=\"loginform\"" in h or 'id="loginform"' in h:
+    if (
+        'id="loginform"' in h
+        or 'id="login_form"' in h
+        or 'name="login"' in h
+    ):
         return True
-    if "marketplace/item/" not in h and ("login" in h[:8000] or "log in" in h[:8000]):
+    start = h[:120_000]
+    if (
+        ('name="email"' in start or 'autocomplete="username"' in start)
+        and ('name="pass"' in start or 'autocomplete="current-password"' in start)
+    ):
         return True
     return False
 

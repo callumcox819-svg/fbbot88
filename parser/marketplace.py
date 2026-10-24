@@ -1430,6 +1430,8 @@ async def fetch_category_listings(
                         )
                         if batch or meta.get("parsed") or meta.get("source", "").startswith("graphql"):
                             break
+                    except AccountTokenDeadError:
+                        raise
                     except Exception as e:
                         page_err = e
                         logger.info("fetch try %s: %s", fetch_url[:72], e)
@@ -1542,6 +1544,8 @@ async def fetch_category_listings(
                     break
                 if config.parse_page_delay_sec > 0:
                     await asyncio.sleep(config.parse_page_delay_sec)
+            except AccountTokenDeadError:
+                raise
             except RuntimeError as e:
                 if "HTTP 400" in str(e) or "HTTP 404" in str(e):
                     logger.info("skip url %s: %s", url, e)
@@ -1650,11 +1654,22 @@ def _merge_listing(base: MarketplaceListing, patch: dict[str, Any]) -> Marketpla
 
 def _looks_like_login_wall(html: str) -> bool:
     h = html.lower()
-    if "id=\"loginform\"" in h or 'id="loginform"' in h:
+    if (
+        'id="loginform"' in h
+        or 'id="login_form"' in h
+        or 'name="login"' in h
+    ):
         return True
     if "checkpoint" in h and len(html) < 800_000:
         return True
-    if "marketplace/item/" not in h and ("login" in h[:8000] or "log in" in h[:8000]):
+    # `login` встречается в JS даже на живой пустой странице Marketplace.
+    # Считаем HTML стеной входа только при наличии самой формы авторизации.
+    start = h[:120_000]
+    has_credentials_form = (
+        ('name="email"' in start or 'autocomplete="username"' in start)
+        and ('name="pass"' in start or 'autocomplete="current-password"' in start)
+    )
+    if has_credentials_form:
         return True
     return False
 

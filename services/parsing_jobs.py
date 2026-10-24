@@ -513,6 +513,18 @@ async def _parse_impl(
             stop_wait.cancel()
             await asyncio.gather(stop_wait, return_exceptions=True)
 
+    async def _gather_cancel_on_error(coroutines) -> None:
+        """Не оставлять запросы старой задачи работать после первой ошибки."""
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def status_progress(force: bool = False) -> None:
         nonlocal last_status_at
         stats["accepted"] = len(collected)
@@ -862,7 +874,7 @@ async def _parse_impl(
                             json_limit,
                         )
 
-            await asyncio.gather(*[_boot_one(it) for it in boot_items])
+            await _gather_cancel_on_error(_boot_one(it) for it in boot_items)
 
         try:
             while (
@@ -966,7 +978,7 @@ async def _parse_impl(
                                 )
                                 await status_progress()
     
-                    await asyncio.gather(*[_run_one(it) for it in page_items])
+                    await _gather_cancel_on_error(_run_one(it) for it in page_items)
     
                     logger.info(
                         "page %s: feed=%s checked=%s accepted=%s skip=%s collected=%s",
