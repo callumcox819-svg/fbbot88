@@ -3282,7 +3282,11 @@ async def enrich_listing(
             logger.debug("enrich %s %s failed: %s", lid, url[:40], e)
             continue
         if _looks_like_login_wall(html):
-            raise AccountTokenDeadError("login wall on item page")
+            # Отдельные m/basic item URL могут отдать login-wall даже при
+            # живой основной Marketplace-сессии. Это отказ карточки, а не
+            # доказательство смерти всего токена.
+            logger.info("enrich %s login wall via %s — skip endpoint", lid, url[:40])
+            continue
         _extract_item_doc_id(html)
         _merge_item_from_html(item, html)
         sp = _patch_seller_from_item_page(html, lid)
