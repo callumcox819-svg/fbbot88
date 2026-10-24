@@ -491,6 +491,24 @@ async def _parse_impl(
     stats = job.stats if job else {}
     token_dead_flag = {"value": False}
 
+    async def _interruptible(awaitable, default):
+        """Выполнить сетевую операцию либо отменить её сразу после команды ⏹."""
+        operation = asyncio.create_task(awaitable)
+        stop_wait = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait(
+                {operation, stop_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop.is_set():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+                return default
+            return await operation
+        finally:
+            stop_wait.cancel()
+            await asyncio.gather(stop_wait, return_exceptions=True)
+
     async def status_progress() -> None:
         stats["accepted"] = len(collected)
         if on_status:
@@ -546,12 +564,15 @@ async def _parse_impl(
         try:
             current_step["text"] = f"Переключаю Marketplace на {country_label or country}…"
             await status_progress()
-            region_doc_ids, region_hub_html = await apply_marketplace_region(
-                token,
-                country,
-                user_agent=config.fb_user_agent,
-                proxy_url=proxy_url_boot,
-                timeout_sec=22.0,
+            region_doc_ids, region_hub_html = await _interruptible(
+                apply_marketplace_region(
+                    token,
+                    country,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_url_boot,
+                    timeout_sec=22.0,
+                ),
+                ([], ""),
             )
             if region_doc_ids:
                 from parser.marketplace import _browse_doc_id
@@ -576,13 +597,16 @@ async def _parse_impl(
                     len(region_doc_ids),
                 )
             if active_cats and not stop.is_set() and not token_dead_flag["value"]:
-                snap_html, snap_docs = await fetch_category_hub_snapshot(
-                    token,
-                    country,
-                    active_cats[0].url_path,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url_boot,
-                    timeout_sec=22.0,
+                snap_html, snap_docs = await _interruptible(
+                    fetch_category_hub_snapshot(
+                        token,
+                        country,
+                        active_cats[0].url_path,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_url_boot,
+                        timeout_sec=22.0,
+                    ),
+                    ("", []),
                 )
                 if snap_html and len(snap_html) > len(region_hub_html or ""):
                     region_hub_html = snap_html
@@ -740,19 +764,22 @@ async def _parse_impl(
                 await _item_delay_until_stopped()
             return ok, False
 
-        if not token_dead_flag["value"] and region_hub_html:
+        if not token_dead_flag["value"] and region_hub_html and not stop.is_set():
             _category_feed_html.set(region_hub_html)
             _extract_item_doc_id(region_hub_html)
             browse_raw = ""
             comet_items: list = []
             try:
-                comet_items, browse_raw = await fetch_any_browse_feed(
-                    token,
-                    country,
-                    hint_html=region_hub_html,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url_boot,
-                    limit=max(json_limit * 3, 150),
+                comet_items, browse_raw = await _interruptible(
+                    fetch_any_browse_feed(
+                        token,
+                        country,
+                        hint_html=region_hub_html,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_url_boot,
+                        limit=max(json_limit * 3, 150),
+                    ),
+                    ([], ""),
                 )
             except (ValueError, TypeError) as e:
                 logger.warning("browse feed unpack error: %s", e)
@@ -775,13 +802,16 @@ async def _parse_impl(
                 "",
             )
             if first_lid:
-                await prime_item_doc_id_cache(
-                    token,
-                    first_lid,
-                    user_agent=config.fb_user_agent,
-                    proxy_url=proxy_url_boot,
-                    timeout_sec=24.0,
-                    country=country,
+                await _interruptible(
+                    prime_item_doc_id_cache(
+                        token,
+                        first_lid,
+                        user_agent=config.fb_user_agent,
+                        proxy_url=proxy_url_boot,
+                        timeout_sec=24.0,
+                        country=country,
+                    ),
+                    None,
                 )
             boot_sem = asyncio.Semaphore(4)
 
@@ -826,13 +856,18 @@ async def _parse_impl(
                 proxy_used = proxy_url
 
                 try:
-                    cat_html, cat_docs = await prime_category_feed_region(
-                        token,
-                        country,
-                        cat.url_path,
-                        user_agent=config.fb_user_agent,
-                        proxy_url=proxy_url,
+                    cat_html, cat_docs = await _interruptible(
+                        prime_category_feed_region(
+                            token,
+                            country,
+                            cat.url_path,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_url,
+                        ),
+                        ("", []),
                     )
+                    if stop.is_set():
+                        break
                     if cat_html:
                         if len(cat_html) > len(region_hub_html or ""):
                             region_hub_html = cat_html
@@ -949,25 +984,30 @@ async def _parse_impl(
                 for proxy_try in proxy_attempts:
                     try:
                         proxy_used = proxy_try
-                        _, fetch_meta = await fetch_category_listings(
-                            token,
-                            url_path=cat.url_path,
-                            category_label=cat.label,
-                            user_agent=config.fb_user_agent,
-                            country=country,
-                            proxy_url=proxy_try,
-                            limit=max(json_limit * 12, 500),
-                            timeout_sec=35.0,
-                            on_url_progress=on_url,
-                            on_page_found=on_page_found,
-                            on_page_items=on_page_items,
-                            should_stop=should_stop,
-                            should_stop_pagination=should_stop_pagination,
-                            hub_round=hub_round_counter,
-                            graphql_doc_id=gql_doc,
-                            region_hint_html=region_hub_html,
-                            seed_doc_ids=region_doc_ids,
+                        _, fetch_meta = await _interruptible(
+                            fetch_category_listings(
+                                token,
+                                url_path=cat.url_path,
+                                category_label=cat.label,
+                                user_agent=config.fb_user_agent,
+                                country=country,
+                                proxy_url=proxy_try,
+                                limit=max(json_limit * 12, 500),
+                                timeout_sec=35.0,
+                                on_url_progress=on_url,
+                                on_page_found=on_page_found,
+                                on_page_items=on_page_items,
+                                should_stop=should_stop,
+                                should_stop_pagination=should_stop_pagination,
+                                hub_round=hub_round_counter,
+                                graphql_doc_id=gql_doc,
+                                region_hint_html=region_hub_html,
+                                seed_doc_ids=region_doc_ids,
+                            ),
+                            ([], {"stopped": True}),
                         )
+                        if stop.is_set():
+                            break
                         hub_round_counter += 1
                         auto_doc = fetch_meta.get("feed_doc_auto")
                         if auto_doc:
@@ -1035,7 +1075,10 @@ async def _parse_impl(
     
                 await status_progress()
                 if config.parse_category_delay_sec > 0 and not stop.is_set():
-                    await asyncio.sleep(config.parse_category_delay_sec)
+                    await _interruptible(
+                        asyncio.sleep(config.parse_category_delay_sec),
+                        None,
+                    )
         except AccountTokenDeadError:
             token_dead_flag["value"] = True
         except Exception as e:
