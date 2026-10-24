@@ -1921,6 +1921,30 @@ def _extract_fb_tokens(html: str) -> tuple[str | None, str | None]:
     return lsd, dtsg
 
 
+def _extract_fb_request_context(html: str) -> dict[str, str]:
+    """Modern Comet request fields required by persisted GraphQL queries."""
+    norm = _html_for_discovery(html)
+    lsd, dtsg = _extract_fb_tokens(norm)
+    out: dict[str, str] = {}
+    if lsd:
+        out["lsd"] = lsd
+    if dtsg:
+        out["fb_dtsg"] = dtsg
+    for key, patterns in {
+        "jazoest": (r"jazoest=(\d+)", r'"jazoest"\s*:\s*"(\d+)"'),
+        "__rev": (
+            r'"client_revision"\s*:\s*(\d+)',
+            r"__spin_r\s*:\s*(\d+)",
+        ),
+    }.items():
+        for pattern in patterns:
+            match = re.search(pattern, norm)
+            if match:
+                out[key] = match.group(1)
+                break
+    return out
+
+
 def _seller_from_listing_chunk(html: str, listing_id: str) -> dict[str, str]:
     """Seller id из JSON-куска ленты вокруг listing_id (без /marketplace/profile/ в HTML)."""
     h = _normalize_fb_html(html)
@@ -2131,7 +2155,9 @@ async def _enrich_via_comet_cookies(
 ) -> dict[str, Any]:
     """GraphQL карточки через cookies + fb_dtsg (как браузер), без access_token."""
     doc_ids = _discover_item_doc_ids_from_html(hint_html)
-    lsd, dtsg = _extract_fb_tokens(hint_html)
+    request_context = _extract_fb_request_context(hint_html)
+    lsd = request_context.get("lsd")
+    dtsg = request_context.get("fb_dtsg")
     if not doc_ids or not dtsg or not token.c_user:
         return {}
     referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
@@ -2146,16 +2172,19 @@ async def _enrich_via_comet_cookies(
         "Origin": "https://www.facebook.com",
         "Referer": referer,
         "X-FB-LSD": lsd or "",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
     var_sets = [
+        {"targetId": listing_id},
         {"listingID": listing_id, "scale": 2},
         {"listing_id": listing_id, "scale": 2},
-        {"id": listing_id},
     ]
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     try:
         async with reuse_http_session(None, proxy_url) as session:
-            for doc_id in doc_ids[:6]:
+            for doc_id in doc_ids[:3]:
                 for variables in var_sets:
                     body = urlencode(
                         {
@@ -2163,6 +2192,9 @@ async def _enrich_via_comet_cookies(
                             "__user": token.c_user,
                             "fb_dtsg": dtsg,
                             "lsd": lsd or dtsg[:12],
+                            "jazoest": request_context.get("jazoest", ""),
+                            "__req": "1",
+                            "__rev": request_context.get("__rev", "1"),
                             "doc_id": doc_id,
                             "variables": json.dumps(variables),
                             "server_timestamps": "1",
@@ -2313,12 +2345,7 @@ async def prime_item_doc_id_cache(
         if _cached_item_doc_id or _item_doc_prime_done:
             return
         _item_doc_prime_done = True
-        locale_q = ""
-        if country == "fi":
-            locale_q = "?locale=fi_FI"
-        elif country == "ch":
-            locale_q = "?locale=de_CH"
-        url = f"https://www.facebook.com/marketplace/item/{listing_id}/{locale_q}"
+        url = f"https://www.facebook.com/marketplace/item/{listing_id}/"
         referer = "https://www.facebook.com/marketplace/"
         if country and country in COUNTRY_LOCATIONS:
             slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
@@ -2382,10 +2409,9 @@ async def _enrich_via_graphql_item(
         return {}
 
     variable_sets = [
+        {"targetId": listing_id},
         {"listingID": listing_id, "scale": 2},
         {"listing_id": listing_id, "scale": 2},
-        {"id": listing_id},
-        {"forSaleItemID": listing_id},
     ]
     referer = f"https://www.facebook.com/marketplace/item/{listing_id}/"
     if country:
@@ -2398,62 +2424,43 @@ async def _enrich_via_graphql_item(
         "Accept-Language": _accept_language(country),
         "Origin": "https://www.facebook.com",
         "Referer": referer,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
-    lsd, dtsg = _extract_fb_tokens(_html_for_discovery(hint_html))
+    request_context = _extract_fb_request_context(hint_html)
+    lsd = request_context.get("lsd")
+    dtsg = request_context.get("fb_dtsg")
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     async with reuse_http_session(None, proxy_url) as session:
-        for doc_id in doc_ids[:10]:
+        for doc_id in doc_ids[:3]:
             for variables in variable_sets:
                 bodies: list[dict[str, str]] = []
-                if token.access_token:
-                    bodies.append({
-                        "doc_id": doc_id,
-                        "variables": json.dumps(variables),
-                        "access_token": token.access_token,
-                    })
                 if dtsg and token.c_user:
                     bodies.append({
                         "__a": "1",
                         "__user": token.c_user,
                         "fb_dtsg": dtsg,
                         "lsd": lsd or dtsg[:12],
+                        "jazoest": request_context.get("jazoest", ""),
+                        "__req": "1",
+                        "__rev": request_context.get("__rev", "1"),
                         "doc_id": doc_id,
                         "variables": json.dumps(variables),
                         "server_timestamps": "1",
                     })
-                    if token.access_token:
-                        bodies.append({
-                            "__a": "1",
-                            "__user": token.c_user,
-                            "fb_dtsg": dtsg,
-                            "lsd": lsd or dtsg[:12],
-                            "doc_id": doc_id,
-                            "variables": json.dumps(variables),
-                            "access_token": token.access_token,
-                            "server_timestamps": "1",
-                        })
-                if not bodies:
+                elif token.access_token:
                     bodies.append({
                         "doc_id": doc_id,
                         "variables": json.dumps(variables),
+                        "access_token": token.access_token,
                     })
-                endpoints: list[tuple[str, dict[str, str] | None]] = [
-                    ("https://www.facebook.com/api/graphql/", None),
-                ]
-                if token.access_token:
-                    endpoints.append(("https://graph.facebook.com/graphql", None))
                 for body in bodies:
                     hdrs = dict(headers)
                     if body.get("fb_dtsg") and lsd:
                         hdrs["X-FB-LSD"] = lsd
-                    for gql_url, extra_params in endpoints:
+                    for gql_url in ("https://www.facebook.com/api/graphql/",):
                         post_data = dict(body)
-                        if extra_params:
-                            post_data.update(extra_params)
-                        if gql_url.startswith("https://graph.facebook.com"):
-                            if not token.access_token:
-                                continue
-                            post_data["access_token"] = token.access_token
                         try:
                             async with session.post(
                                 gql_url,
@@ -3191,22 +3198,6 @@ async def enrich_listing(
         logger.info("enrich %s void-ready via graphql", lid)
         return item
 
-    if feed_hint:
-        comet = await _enrich_via_comet_cookies(
-            token,
-            lid,
-            user_agent=user_agent,
-            proxy_url=proxy_url,
-            timeout_sec=timeout_sec,
-            country=country,
-            hint_html=feed_hint,
-        )
-        if comet:
-            _merge_listing(item, comet)
-        if listing_void_ready(item):
-            logger.info("enrich %s void-ready via comet", lid)
-            return item
-
     locale_q = ""
     if country == "fi":
         locale_q = "?locale=fi_FI"
@@ -3264,19 +3255,6 @@ async def enrich_listing(
                 url[:40],
                 len(html),
             )
-            return item
-        comet = await _enrich_via_comet_cookies(
-            token,
-            lid,
-            user_agent=user_agent,
-            proxy_url=proxy_url,
-            timeout_sec=timeout_sec,
-            country=country,
-            hint_html=html,
-        )
-        if comet:
-            _merge_listing(item, comet)
-        if listing_void_ready(item):
             return item
         gql_patch = await _enrich_via_graphql_item(
             token,

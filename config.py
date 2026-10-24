@@ -44,7 +44,7 @@ def load_config() -> Config:
         fb_user_agent=(
             os.getenv("FB_USER_AGENT")
             or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
         ).strip(),
         fb_marketplace_doc_id=(os.getenv("FB_MARKETPLACE_DOC_ID") or "").strip() or None,
         fb_marketplace_browse_doc_id=(
