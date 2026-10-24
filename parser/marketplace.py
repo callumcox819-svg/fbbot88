@@ -24,7 +24,12 @@ from data.preset_categories import (
 )
 from parser.fb_http import reuse_http_session
 from parser.marketplace_region import append_geo_to_marketplace_url
-from parser.account_token import AccountToken, AccountTokenDeadError, cookies_header
+from parser.account_token import (
+    AccountToken,
+    AccountTokenDeadError,
+    MarketplaceFeedBlockedError,
+    cookies_header,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1430,7 +1435,7 @@ async def fetch_category_listings(
                         )
                         if batch or meta.get("parsed") or meta.get("source", "").startswith("graphql"):
                             break
-                    except AccountTokenDeadError:
+                    except (AccountTokenDeadError, MarketplaceFeedBlockedError):
                         raise
                     except Exception as e:
                         page_err = e
@@ -1544,7 +1549,7 @@ async def fetch_category_listings(
                     break
                 if config.parse_page_delay_sec > 0:
                     await asyncio.sleep(config.parse_page_delay_sec)
-            except AccountTokenDeadError:
+            except (AccountTokenDeadError, MarketplaceFeedBlockedError):
                 raise
             except RuntimeError as e:
                 if "HTTP 400" in str(e) or "HTTP 404" in str(e):
@@ -3747,7 +3752,9 @@ async def _fetch_page(
     if len(html) < 3_000_000:
         meta["raw_html"] = html
     if _looks_like_login_wall(html):
-        raise AccountTokenDeadError("login wall in HTML")
+        raise MarketplaceFeedBlockedError(
+            "Marketplace category requires login from current proxy/region"
+        )
 
     items = _parse_html(html, category_label)
     meta["parsed"] = len(items)

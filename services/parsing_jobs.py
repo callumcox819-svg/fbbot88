@@ -21,6 +21,7 @@ from database import Session
 from models import ParseRun, User
 from parser.account_token import (
     AccountTokenDeadError,
+    MarketplaceFeedBlockedError,
     TOKEN_DEAD_USER_MESSAGE,
     is_account_token_dead,
     parse_account_token,
@@ -360,6 +361,13 @@ async def _finalize_parse_run(
     if got <= 0:
         if token_dead:
             await _notify_token_dead(bot, telegram_id, on_status)
+        elif stop_reason == "лента_недоступна" and on_status:
+            await on_status(
+                "⚠️ <b>Аккаунт жив, но Marketplace-лента не открылась</b>\n\n"
+                "Facebook запросил повторный вход только для ленты через текущий "
+                "прокси/IP. Это не означает, что токен умер.\n"
+                "<i>Смени прокси выбранной страны либо повтори позже.</i>"
+            )
         elif on_status:
             reasons = stats.get("reject_reasons") or {}
             lines = [
@@ -1119,6 +1127,9 @@ async def _parse_impl(
                     )
         except AccountTokenDeadError:
             token_dead_flag["value"] = True
+        except MarketplaceFeedBlockedError as e:
+            stop_reason = "лента_недоступна"
+            logger.warning("marketplace feed blocked tg=%s: %s", telegram_id, e)
         except Exception as e:
             parse_error = str(e)
             logger.exception("parse loop error tg=%s", telegram_id)

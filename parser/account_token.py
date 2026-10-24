@@ -92,6 +92,10 @@ class AccountTokenDeadError(RuntimeError):
     """Cookies/access_token Facebook больше не принимаются."""
 
 
+class MarketplaceFeedBlockedError(RuntimeError):
+    """Аккаунт может быть жив, но Marketplace feed не открыт с текущего IP/региона."""
+
+
 TOKEN_DEAD_USER_MESSAGE = (
     "❌ Все токены не валидны или истекли, попробуйте получить их заново"
 )
