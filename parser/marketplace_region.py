@@ -125,7 +125,9 @@ async def _graphql_browse_prime(
     if not loc_id or not token.access_token:
         return False
 
-    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip()
+    if not doc_id:
+        return False
     variables: dict[str, Any] = {
         "params": {
             "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": ""},
@@ -190,7 +192,9 @@ async def fetch_browse_marketplace_listings(
     if not loc_id or not token.access_token or country not in COUNTRY_LOCATIONS:
         return [], ""
 
-    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip()
+    if not doc_id:
+        return [], ""
     variables: dict[str, Any] = {
         "params": {
             "bqf": {"callsite": "COMMERCE_MKTPLACE_WWW", "query": ""},
@@ -331,7 +335,9 @@ async def fetch_browse_marketplace_comet(
         logger.info("browse comet skip: dtsg=%s c_user=%s", bool(dtsg), bool(token.c_user))
         return [], ""
 
-    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    doc_id = (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip()
+    if not doc_id:
+        return [], ""
     referer = urljoin(_FB, COUNTRY_LOCATIONS[country]["marketplace_slugs"][0] + "/")
     payload: dict[str, str] = {
         "__a": "1",

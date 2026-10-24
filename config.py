@@ -48,7 +48,7 @@ def load_config() -> Config:
         ).strip(),
         fb_marketplace_doc_id=(os.getenv("FB_MARKETPLACE_DOC_ID") or "").strip() or None,
         fb_marketplace_browse_doc_id=(
-            (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip() or None
+            (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip() or None
         ),
         listing_max_age_hours=float(os.getenv("LISTING_MAX_AGE_HOURS") or "24"),
         parse_item_delay_sec=float(os.getenv("PARSE_ITEM_DELAY_SEC") or "6"),

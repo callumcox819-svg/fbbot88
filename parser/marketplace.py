@@ -185,7 +185,9 @@ def _html_for_discovery(html: str) -> str:
 
 
 def _browse_doc_id() -> str:
-    return (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "2022753507811174").strip()
+    # Persisted GraphQL ids are short-lived. An old hard-coded browse id makes
+    # Facebook return error 1357054; use one only when explicitly configured.
+    return (os.getenv("FB_MARKETPLACE_BROWSE_DOC_ID") or "").strip()
 
 
 def _fallback_category_feed_doc_ids(hint_html: str) -> list[str]:
@@ -410,6 +412,7 @@ _category_feed_html: contextvars.ContextVar[str | None] = contextvars.ContextVar
 _cached_item_doc_id: str | None = None
 _item_doc_prime_lock: asyncio.Lock | None = None
 _item_doc_prime_done: bool = False
+_item_doc_prime_uid: str = ""
 
 _ITEM_DOC_PATTERNS = (
     re.compile(
@@ -2051,6 +2054,29 @@ def _discover_item_doc_ids_from_html(html: str) -> list[str]:
             d = m.group(1)
             if d not in ids and d != browse:
                 ids.append(d)
+    # Meta frequently changes operation names and may place doc_id before the
+    # friendly query name. Search around each id in both directions.
+    item_markers = (
+        "listingdetails",
+        "productdetails",
+        "marketplacepdp",
+        "marketplaceproduct",
+        "marketplacelisting",
+    )
+    feed_markers = ("categoryfeed", "homefeed", "searchcontentpagination")
+    for m in re.finditer(
+        r'"(?:doc_id|queryID)"\s*:\s*"(\d{15,22})"',
+        norm,
+        re.I,
+    ):
+        window = norm[max(0, m.start() - 5000) : m.end() + 5000].lower()
+        if not any(marker in window for marker in item_markers):
+            continue
+        if any(marker in window for marker in feed_markers):
+            continue
+        d = m.group(1)
+        if d not in ids and d != browse:
+            ids.append(d)
     return ids[:12]
 
 
@@ -2258,11 +2284,9 @@ def _item_graphql_doc_ids(hint_html: str) -> list[str]:
     ids = _discover_item_doc_ids_from_html(hint_html)
     if _cached_item_doc_id and _cached_item_doc_id not in ids:
         ids.insert(0, _cached_item_doc_id)
-    if hint_html:
-        for d in _discover_feed_doc_ids_from_html(hint_html)[:10]:
-            if d not in ids and d != browse:
-                ids.append(d)
-    return ids[:18]
+    # Feed queries use another variables schema. Trying their doc_ids for an
+    # item creates hundreds of invalid requests and error 1357054.
+    return ids[:6]
 
 
 async def prime_item_doc_id_cache(
@@ -2276,6 +2300,11 @@ async def prime_item_doc_id_cache(
 ) -> None:
     """Один раз загрузить /marketplace/item/ и закэшировать doc_id карточки для GraphQL."""
     global _cached_item_doc_id, _item_doc_prime_done, _item_doc_prime_lock
+    global _item_doc_prime_uid
+    if _item_doc_prime_uid != token.c_user:
+        _cached_item_doc_id = None
+        _item_doc_prime_done = False
+        _item_doc_prime_uid = token.c_user
     if _cached_item_doc_id or (os.getenv("FB_MARKETPLACE_ITEM_DOC_ID") or "").strip():
         return
     if _item_doc_prime_lock is None:
@@ -2307,6 +2336,11 @@ async def prime_item_doc_id_cache(
             async with reuse_http_session(None, proxy_url) as session:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status >= 400:
+                        logger.warning(
+                            "prime item page HTTP %s listing=%s",
+                            resp.status,
+                            listing_id[:12],
+                        )
                         return
                     html = await resp.text(errors="ignore")
         except Exception as e:
@@ -2317,6 +2351,15 @@ async def prime_item_doc_id_cache(
         did = _extract_item_doc_id(html)
         if did:
             logger.info("primed item doc_id %s from listing %s", did[:12], listing_id[:12])
+        else:
+            norm = _html_for_discovery(html)
+            logger.warning(
+                "item doc_id not found listing=%s html=%s listing_details=%s product_details=%s",
+                listing_id[:12],
+                len(html),
+                norm.lower().count("listingdetails"),
+                norm.lower().count("productdetails"),
+            )
         sp = _patch_seller_from_item_page(html, listing_id)
         if sp.get("person_link"):
             logger.info("primed seller hint from item page %s", listing_id[:12])
