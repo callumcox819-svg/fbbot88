@@ -69,11 +69,6 @@ logger = logging.getLogger(__name__)
 _HARD_FEED_REJECT = frozenset({"старше_24ч", "нет_заголовка", "чужая_страна"})
 
 
-async def _sleep_human(base_sec: float) -> None:
-    if base_sec > 0:
-        await asyncio.sleep(base_sec * random.uniform(0.9, 1.12))
-
-
 _REJECT_LABELS: dict[str, str] = {
     "повторный_продавец": "Повторные продавцы",
     "чужая_страна": "Отсечено: не FI/CH",
@@ -643,6 +638,44 @@ async def _parse_impl(
             collected.append(item)
             return True
 
+        async def _enrich_until_stopped(item) -> bool:
+            """Отменить активные HTTP-запросы карточки сразу после команды ⏹."""
+            enrich_task = asyncio.create_task(
+                enrich_listing(
+                    token,
+                    item,
+                    user_agent=config.fb_user_agent,
+                    proxy_url=proxy_used,
+                    timeout_sec=32.0,
+                    country=country,
+                    hub_html=region_hub_html,
+                )
+            )
+            stop_task = asyncio.create_task(stop.wait())
+            try:
+                await asyncio.wait(
+                    {enrich_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop.is_set():
+                    enrich_task.cancel()
+                    await asyncio.gather(enrich_task, return_exceptions=True)
+                    return False
+                await enrich_task
+                return True
+            finally:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+
+        async def _item_delay_until_stopped() -> None:
+            delay = config.parse_item_delay_sec * random.uniform(0.9, 1.12)
+            if delay <= 0 or stop.is_set():
+                return
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
         async def _process_listing(item) -> tuple[bool, bool]:
             if stop.is_set() or len(collected) >= json_limit:
                 return False, False
@@ -672,7 +705,7 @@ async def _parse_impl(
                 async with accept_lock:
                     ok = await _accept_item(item)
                 if ok:
-                    await _sleep_human(config.parse_item_delay_sec)
+                    await _item_delay_until_stopped()
                 return ok, False
             if not stop.is_set() and region_hub_html:
                 from services.seller_blacklist import _profile_id
@@ -691,26 +724,20 @@ async def _parse_impl(
                     async with accept_lock:
                         ok = await _accept_item(item)
                     if ok:
-                        await _sleep_human(config.parse_item_delay_sec)
+                        await _item_delay_until_stopped()
                     return ok, False
             if not stop.is_set():
                 try:
-                    await enrich_listing(
-                        token,
-                        item,
-                        user_agent=config.fb_user_agent,
-                        proxy_url=proxy_used,
-                        timeout_sec=32.0,
-                        country=country,
-                        hub_html=region_hub_html,
-                    )
+                    completed = await _enrich_until_stopped(item)
+                    if not completed:
+                        return False, False
                 except AccountTokenDeadError:
                     token_dead_flag["value"] = True
                     raise
             async with accept_lock:
                 ok = await _accept_item(item)
             if ok:
-                await _sleep_human(config.parse_item_delay_sec)
+                await _item_delay_until_stopped()
             return ok, False
 
         if not token_dead_flag["value"] and region_hub_html:
