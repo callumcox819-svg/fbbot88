@@ -3679,20 +3679,11 @@ async def _fetch_page(
     )
     last_exc: Exception | None = None
     html = ""
-    # Ask Facebook itself for newest listings from the last day. This keeps
-    # undated feed cards inside the requested 24-hour window.
-    parsed_url = urlparse(url)
-    fresh_query = parse_qs(parsed_url.query)
-    fresh_query["daysSinceListed"] = ["1"]
-    fresh_query["sortBy"] = ["creation_time_descend"]
-    fresh_url = parsed_url._replace(
-        query=urlencode(fresh_query, doseq=True)
-    ).geturl()
     for attempt in range(3):
         try:
             async with reuse_http_session(http_session, proxy_url) as session:
                 async with session.get(
-                    fresh_url,
+                    url,
                     headers=headers,
                     timeout=timeout,
                     max_redirects=8,
