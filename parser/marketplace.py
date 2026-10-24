@@ -3547,7 +3547,9 @@ async def _fetch_graphql_category(
                 raw = await resp.text(errors="ignore")
                 if resp.status >= 400:
                     return None
-                data = json.loads(raw)
+                from parser.marketplace_region import loads_fb_api_response
+
+                data = loads_fb_api_response(raw)
     except Exception as e:
         logger.info("graphql token miss %s doc=%s: %s", seo_path[:32], doc_id[:8], e)
         return None
