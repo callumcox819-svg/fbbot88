@@ -492,6 +492,8 @@ async def _parse_impl(
     token_dead_flag = {"value": False}
     status_lock = asyncio.Lock()
     last_status_at = 0.0
+    auth_wall_lock = asyncio.Lock()
+    auth_wall_listings: set[str] = set()
 
     async def _interruptible(awaitable, default):
         """Выполнить сетевую операцию либо отменить её сразу после команды ⏹."""
@@ -767,6 +769,21 @@ async def _parse_impl(
                 except AccountTokenDeadError:
                     token_dead_flag["value"] = True
                     raise
+                if item.auth_login_wall:
+                    async with auth_wall_lock:
+                        if item.listing_id:
+                            auth_wall_listings.add(item.listing_id)
+                        wall_count = len(auth_wall_listings)
+                    logger.warning(
+                        "account login wall on %s distinct listings", wall_count
+                    )
+                    if wall_count >= 4:
+                        raise AccountTokenDeadError(
+                            "Facebook requires login on multiple distinct listings"
+                        )
+                else:
+                    async with auth_wall_lock:
+                        auth_wall_listings.clear()
             async with accept_lock:
                 ok = await _accept_item(item)
             if ok:

@@ -481,6 +481,7 @@ class MarketplaceListing:
     views: int | None = None
     parser_views: int = 0
     rating: float | int = 0
+    auth_login_wall: bool = False
 
 
 def _unescape(s: str) -> str:
@@ -3219,6 +3220,7 @@ async def enrich_listing(
     if item.link:
         clean = item.link.split("?")[0].rstrip("/")
         urls.insert(1, f"{clean}{locale_q}")
+    urls = list(dict.fromkeys(urls))
     referer = "https://www.facebook.com/marketplace/"
     if country and country in COUNTRY_LOCATIONS:
         slugs = COUNTRY_LOCATIONS[country].get("marketplace_slugs") or []
@@ -3235,6 +3237,8 @@ async def enrich_listing(
         "Sec-Fetch-Site": "same-origin",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    login_wall_count = 0
+    readable_page_count = 0
     for url in urls:
         try:
             async with reuse_http_session(None, proxy_url) as session:
@@ -3250,7 +3254,9 @@ async def enrich_listing(
             # живой основной Marketplace-сессии. Это отказ карточки, а не
             # доказательство смерти всего токена.
             logger.info("enrich %s login wall via %s — skip endpoint", lid, url[:40])
+            login_wall_count += 1
             continue
+        readable_page_count += 1
         _extract_item_doc_id(html)
         _merge_item_from_html(item, html)
         sp = _patch_seller_from_item_page(html, lid)
@@ -3282,6 +3288,10 @@ async def enrich_listing(
         if listing_void_ready(item):
             return item
 
+    # Один закрытый item URL ещё не доказывает смерть аккаунта. Но если все
+    # независимые mobile/www/basic endpoints требуют вход, передаём сигнал
+    # оркестратору: он остановит задачу только после нескольких таких карточек.
+    item.auth_login_wall = login_wall_count >= 2 and readable_page_count == 0
     miss = void_missing_fields(item)
     if miss:
         logger.info(
