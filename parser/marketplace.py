@@ -1292,7 +1292,7 @@ def urls_for_country_category(
     *,
     hub_round: int | None = None,
 ) -> list[str]:
-    """Регионы выбранной страны. hub_round — один хаб за проход (не все 10 сразу)."""
+    """Общая лента и городские хабы выбранной страны."""
     cfg = COUNTRY_LOCATIONS.get(country) or {}
     urls: list[str] = []
     seen: set[str] = set()
@@ -1314,28 +1314,20 @@ def urls_for_country_category(
     if loc_id:
         country_slugs.add(loc_id)
     if embed_root and (embed_root in country_slugs or embed_root in country_hubs):
-        add(build_category_url(norm))
-        if cat_slug and loc_id and embed_root != loc_id:
-            add(build_category_url(f"{loc_id}/category/{cat_slug}"))
-        return urls
+        norm = f"category/{cat_slug}"
 
     slugs = cfg.get("marketplace_slugs") or []
     hubs = cfg.get("region_hubs") or []
 
-    if hub_round is not None:
-        if slugs:
-            add(build_category_url(url_path, marketplace_root=slugs[0]))
-        if hubs:
-            add(build_category_url(url_path, marketplace_root=hubs[hub_round % len(hubs)]))
-        if urls:
-            return urls
-
-    for slug in slugs:
-        add(build_category_url(url_path, marketplace_root=slug))
+    # Country slug and location id often return the same first 20 cards.
+    # One country page plus city feeds gives substantially more unique cards
+    # without relying on Facebook's frequently rotated GraphQL doc_id.
+    if slugs:
+        add(build_category_url(norm, marketplace_root=slugs[-1]))
     for hub in hubs:
-        add(build_category_url(url_path, marketplace_root=hub))
+        add(build_category_url(norm, marketplace_root=hub))
     if not urls:
-        add(build_category_url(url_path))
+        add(build_category_url(norm))
     return urls
 
 
@@ -1445,41 +1437,13 @@ async def fetch_category_listings(
                     logger.warning("category page failed %s: %s", short, page_err)
                     break
                 if page_idx == 0 and not discovered_doc:
-                    candidates = meta.get("discovered_doc_ids") or []
-                    if not candidates and meta.get("discovered_doc_id"):
-                        candidates = [str(meta["discovered_doc_id"])]
-                    if cursor and candidates:
-                        seo = _seo_path_from_url(fetch_urls[0])
-                        for cand in candidates[:8]:
-                            gql_try = await _fetch_graphql_category(
-                                token,
-                                seo_path=seo,
-                                user_agent=user_agent,
-                                proxy_url=proxy_url,
-                                timeout_sec=timeout_sec,
-                                category_label=category_label,
-                                doc_id=cand,
-                                limit=_FEED_PAGE_SIZE,
-                                cursor=cursor,
-                                country=country,
-                            )
-                            if gql_try and gql_try[0]:
-                                discovered_doc = cand
-                                auto_feed_doc = cand
-                                logger.info(
-                                    "auto feed doc_id %s ok for %s (%s items)",
-                                    cand,
-                                    short,
-                                    len(gql_try[0]),
-                                )
-                                break
-                    if not discovered_doc and candidates:
-                        discovered_doc = str(candidates[0])
-                        logger.info(
-                            "feed doc_id candidate %s for %s (graphql not verified)",
-                            discovered_doc,
-                            short,
-                        )
+                    # IDs embedded in Facebook HTML mostly belong to unrelated
+                    # queries. Trying each one costs dozens of failed requests.
+                    # Pagination is used only with an explicitly configured,
+                    # verified FB_MARKETPLACE_DOC_ID; otherwise city HTML feeds
+                    # provide the next independent batches.
+                    if env_feed_doc and meta.get("discovered_doc_id"):
+                        discovered_doc = env_feed_doc
                 elif meta.get("discovered_doc_id") and not discovered_doc:
                     discovered_doc = str(meta["discovered_doc_id"])
                     logger.info("discovered feed doc_id %s for %s", discovered_doc, short)
@@ -3594,20 +3558,10 @@ async def _fetch_page(
 ) -> tuple[list[MarketplaceListing], dict[str, Any], str | None, bool]:
     seo = _seo_path_from_url(url)
     feed_doc = _graphql_doc_for_feed(graphql_doc_id)
-    doc_ids = _feed_doc_candidates(feed_doc, seed_doc_ids)
-    if not doc_ids and region_hint_html:
-        doc_ids = _discover_feed_doc_ids_from_html(region_hint_html)[:24]
-    if not doc_ids and region_hint_html:
-        doc_ids = _fallback_category_feed_doc_ids(region_hint_html)
-        if doc_ids:
-            logger.info("feed fallback doc_ids: %s", len(doc_ids))
-    if not doc_ids and region_hint_html:
-        _, dtsg = _extract_fb_tokens(_html_for_discovery(region_hint_html))
-        logger.warning(
-            "feed doc_ids=0 hub=%s bytes dtsg=%s — GraphQL/ HTML",
-            len(region_hint_html),
-            bool(dtsg),
-        )
+    # Persisted query IDs rotate frequently. Only a user-configured and
+    # previously verified ID is worth requesting; guessed IDs from HTML were
+    # responsible for most of the parser's runtime and never yielded a page.
+    doc_ids = [feed_doc] if feed_doc else []
     gql_miss = False
 
     if doc_ids:
@@ -3715,11 +3669,20 @@ async def _fetch_page(
     )
     last_exc: Exception | None = None
     html = ""
+    # Ask Facebook itself for newest listings from the last day. This keeps
+    # undated feed cards inside the requested 24-hour window.
+    parsed_url = urlparse(url)
+    fresh_query = parse_qs(parsed_url.query)
+    fresh_query["daysSinceListed"] = ["1"]
+    fresh_query["sortBy"] = ["creation_time_descend"]
+    fresh_url = parsed_url._replace(
+        query=urlencode(fresh_query, doseq=True)
+    ).geturl()
     for attempt in range(3):
         try:
             async with reuse_http_session(http_session, proxy_url) as session:
                 async with session.get(
-                    url,
+                    fresh_url,
                     headers=headers,
                     timeout=timeout,
                     max_redirects=8,
@@ -3780,7 +3743,7 @@ async def _fetch_page(
     next_cursor, has_next = _extract_cursor_from_html(html)
     if not next_cursor:
         has_next = False
-    elif not feed_doc and not doc_candidates:
+    elif not feed_doc:
         has_next = False
     if items and not has_next and not next_cursor and not doc_candidates:
         logger.warning(

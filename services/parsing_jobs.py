@@ -490,6 +490,8 @@ async def _parse_impl(
     job = _jobs.get(telegram_id)
     stats = job.stats if job else {}
     token_dead_flag = {"value": False}
+    status_lock = asyncio.Lock()
+    last_status_at = 0.0
 
     async def _interruptible(awaitable, default):
         """Выполнить сетевую операцию либо отменить её сразу после команды ⏹."""
@@ -509,9 +511,15 @@ async def _parse_impl(
             stop_wait.cancel()
             await asyncio.gather(stop_wait, return_exceptions=True)
 
-    async def status_progress() -> None:
+    async def status_progress(force: bool = False) -> None:
+        nonlocal last_status_at
         stats["accepted"] = len(collected)
-        if on_status:
+        if not on_status:
+            return
+        async with status_lock:
+            now = time.monotonic()
+            if not force and now - last_status_at < 3.0:
+                return
             await on_status(
                 _progress_text(
                     len(collected),
@@ -522,9 +530,10 @@ async def _parse_impl(
                     stop_reason=stop_reason,
                 )
             )
+            last_status_at = time.monotonic()
 
     if job:
-        job.push_status = status_progress
+        job.push_status = lambda: status_progress(True)
 
     async def heartbeat() -> None:
         while not stop.is_set():
@@ -543,7 +552,7 @@ async def _parse_impl(
     elif country == "fi":
         country_label = " 🇫🇮"
     current_step["text"] = f"Категорий VOID: {cat_count}{country_label}"
-    await status_progress()
+    await status_progress(True)
     logger.info(
         "parse start tg=%s limit=%s cats=%s country=%s token_uid=%s access_token=%s",
         telegram_id,

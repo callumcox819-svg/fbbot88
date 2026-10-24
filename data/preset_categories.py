@@ -11,10 +11,12 @@ FI_MARKETPLACE_LOCATION_ID = "104042359631581"
 _VOID_CATEGORY_SLUGS: tuple[tuple[str, str], ...] = (
     ("electronics", "📱 Электроника"),
     ("apparel", "👕 Одежда"),
-    ("home", "🛋 Дом"),
-    ("sports", "⚽ Спорт"),
+    ("sportinggoods", "⚽ Товары для спорта"),
     ("hobbies", "🎨 Хобби"),
-    ("family", "👶 Семья"),
+    ("garden", "🌿 Сад и улица"),
+    ("family", "👨‍👩‍👧 Семья и развлечения"),
+    ("musicalinstruments", "🎸 Музыкальные инструменты"),
+    ("toysgames", "🧸 Игрушки и игры"),
 )
 
 
@@ -27,7 +29,9 @@ class PresetCategory:
 
 
 def _country_category(country_slug: str, fb_slug: str) -> str:
-    return f"{country_slug}/category/{fb_slug}"
+    # Корень региона подставляется при запросе. Путь без страны позволяет
+    # пройти не только общую ленту, но и городские хабы выбранной страны.
+    return f"category/{fb_slug}"
 
 
 def _build_presets(country: str, country_slug: str) -> tuple[PresetCategory, ...]:
