@@ -2,10 +2,11 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from models import Base
+from models import Base, Proxy, User
+from security import protect_secret
 
 # Railway: примонтируй Volume в /data и задай DATABASE_PATH=/data/fb_bot.db
 _raw_path = (os.getenv("DATABASE_PATH") or "./fb_bot.db").strip()
@@ -80,3 +81,23 @@ async def init_db() -> None:
             ver = int(res.scalar() or 0)
             if ver < 2:
                 await conn.execute(text("PRAGMA user_version = 2"))
+
+    # Одноразово шифрует старые записи, оставшиеся от версий без encryption-at-rest.
+    async with Session() as session:
+        changed = False
+        users = (await session.execute(select(User))).scalars().all()
+        for user in users:
+            protected = protect_secret(user.last_account_token)
+            if protected != user.last_account_token:
+                user.last_account_token = protected
+                changed = True
+        proxies = (await session.execute(select(Proxy))).scalars().all()
+        for proxy in proxies:
+            username = protect_secret(proxy.username)
+            password = protect_secret(proxy.password)
+            if username != proxy.username or password != proxy.password:
+                proxy.username = username
+                proxy.password = password
+                changed = True
+        if changed:
+            await session.commit()

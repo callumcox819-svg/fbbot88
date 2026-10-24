@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Proxy
+from security import protect_secret, reveal_secret
 
 
 def parse_proxy_line(raw: str) -> Optional[dict]:
@@ -38,8 +39,10 @@ def parse_proxy_line(raw: str) -> Optional[dict]:
 
 def proxy_to_url(proxy: Proxy) -> str:
     auth = ""
-    if proxy.username:
-        auth = f"{proxy.username}:{proxy.password or ''}@"
+    username = reveal_secret(proxy.username)
+    password = reveal_secret(proxy.password)
+    if username:
+        auth = f"{username}:{password or ''}@"
     scheme = "socks5" if proxy.proxy_type.startswith("socks") else "http"
     return f"{scheme}://{auth}{proxy.host}:{proxy.port}"
 
@@ -63,8 +66,8 @@ async def add_proxies(session: AsyncSession, user_id: int, lines: list[str]) -> 
                 user_id=user_id,
                 host=parsed["host"],
                 port=parsed["port"],
-                username=parsed.get("username"),
-                password=parsed.get("password"),
+                username=protect_secret(parsed.get("username")),
+                password=protect_secret(parsed.get("password")),
             )
         )
         added += 1

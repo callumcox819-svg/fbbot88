@@ -10,6 +10,7 @@ from config import config
 from database import init_db
 from handlers import admin, menu, parse_flow, settings_handler
 from middlewares.access import AccessMiddleware
+from security import validate_encryption_key
 from services.bot_setup import configure_bot_ui
 
 logging.basicConfig(
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
+    validate_encryption_key()
     await init_db()
     logger.info("БД готова")
 

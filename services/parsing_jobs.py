@@ -62,6 +62,7 @@ from services.seller_blacklist import (
     remember_seller,
     seller_keys_for_item,
 )
+from security import protect_secret
 
 logger = logging.getLogger(__name__)
 
@@ -459,7 +460,7 @@ async def _parse_impl(
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
         json_limit = max(1, min(int(user.json_limit or 50), 500))
         country = user.country
-        user.last_account_token = token_raw
+        user.last_account_token = protect_secret(token_raw)
         await session.commit()
 
         if not country or country not in ("ch", "fi"):

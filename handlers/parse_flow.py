@@ -13,6 +13,7 @@ from models import User
 from parser.account_token import is_account_token_line, parse_account_token
 from services.parsing_jobs import is_parsing, refresh_parse_status, start_parsing
 from services.users import get_or_create_user
+from security import reveal_secret
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -97,7 +98,12 @@ async def parse_last_token(callback: CallbackQuery, state: FSMContext, db_user: 
         await callback.message.answer("Нет сохранённого токена аккаунта.")
         return
     await state.clear()
-    await _launch_parse(callback.message, callback.from_user.id, db_user, saved)
+    await _launch_parse(
+        callback.message,
+        callback.from_user.id,
+        db_user,
+        reveal_secret(saved) or "",
+    )
 
 
 @router.message(ParseStates.waiting_account_token)

@@ -42,7 +42,17 @@ Telegram-бот для сбора объявлений Facebook Marketplace.
 ```env
 BOT_TOKEN=123456789:AAH...твой_токен_от_BotFather...
 ADMIN_IDS=твой_telegram_id
+DATA_ENCRYPTION_KEY=ключ_Fernet
 ```
+
+Ключ шифрования генерируется один раз:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Не меняй `DATA_ENCRYPTION_KEY` после запуска: им шифруются сохранённые
+Facebook-токены и логины/пароли прокси.
 
 ```powershell
 copy .env.example .env
@@ -58,6 +68,7 @@ notepad .env
 3. **Variables** → добавь:
    - `BOT_TOKEN` = токен @BotFather
    - `ADMIN_IDS` = твой Telegram ID
+ - `DATA_ENCRYPTION_KEY` = сгенерированный ключ Fernet
 4. Deploy. Start command уже в `railway.toml`: `python bot.py`.
 
 ### Деплой на Render / VPS
