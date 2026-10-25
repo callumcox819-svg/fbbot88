@@ -1380,6 +1380,110 @@ async def fetch_category_listings(
             country or "?",
             urls[0].replace(_FB_BASE, "")[:64],
         )
+    # Без рабочего persisted doc_id каждая городская лента — независимая
+    # HTML-страница. Загружаем их ограниченно-параллельно, затем спокойно
+    # обогащаем карточки. Последовательный обход тратил 1–2 минуты на категорию.
+    if not env_feed_doc and on_page_items is None:
+        fetch_sem = asyncio.Semaphore(4)
+
+        async def _fetch_html_url(url: str):
+            if should_stop and should_stop():
+                return None
+            async with fetch_sem:
+                return await _fetch_page(
+                    token,
+                    url=url.split("?")[0].rstrip("/") + "/",
+                    user_agent=user_agent,
+                    proxy_url=proxy_url,
+                    timeout_sec=timeout_sec,
+                    category_label=category_label,
+                    graphql_doc_id=None,
+                    cursor=None,
+                    country=country,
+                    region_hint_html=region_hint_html,
+                    seed_doc_ids=None,
+                    http_session=http_session,
+                )
+
+        results = await asyncio.gather(
+            *[_fetch_html_url(url) for url in urls],
+            return_exceptions=True,
+        )
+        pages_fetched = 0
+        blocked_pages = 0
+        for i, (url, result) in enumerate(zip(urls, results), start=1):
+            short = url.replace(_FB_BASE, "")[:48]
+            if on_url_progress:
+                await on_url_progress(i, total_urls, short)
+            if isinstance(result, AccountTokenDeadError):
+                raise result
+            if isinstance(result, MarketplaceFeedBlockedError):
+                blocked_pages += 1
+                logger.info("feed blocked %s", short)
+                continue
+            if isinstance(result, BaseException):
+                logger.warning("feed %s failed: %s", short, result)
+                continue
+            if result is None:
+                continue
+            batch, meta, _, _ = result
+            pages_fetched += 1
+            page_new: list[MarketplaceListing] = []
+            for item in batch:
+                if not listing_is_valid(item):
+                    continue
+                lid = item.listing_id
+                if not lid or lid in seen_ids:
+                    continue
+                seen_ids.add(lid)
+                page_new.append(item)
+                out.append(item)
+                if len(out) >= limit:
+                    break
+
+            page_html = meta.get("raw_html")
+            if page_html:
+                html_s = str(page_html)
+                seller_index = build_feed_seller_index(html_s)
+                for it in page_new:
+                    apply_feed_seller_index(it, seller_index)
+                    extra = _seller_from_listing_chunk(html_s, it.listing_id)
+                    if extra:
+                        _merge_listing(it, extra)
+                    sp = _patch_seller_from_html(html_s, it.listing_id)
+                    if sp:
+                        _merge_listing(it, sp)
+                    if not (it.seller_name or "").strip():
+                        nm = _seller_name_near_listing_in_html(
+                            html_s, it.listing_id
+                        )
+                        if nm:
+                            it.seller_name = nm
+            if on_page_found and page_new:
+                await on_page_found(len(page_new))
+            if len(out) >= limit:
+                break
+
+        feed_blocked = blocked_pages == len(urls) and not out
+        logger.info(
+            "category fast %s country=%s urls=%s pages=%s seen=%s blocked=%s",
+            category_label,
+            country or "all",
+            len(urls),
+            pages_fetched,
+            len(seen_ids),
+            blocked_pages,
+        )
+        return out[:limit], {
+            "pages_fetched": pages_fetched,
+            "listings_seen": len(seen_ids),
+            "exhausted": True,
+            "stopped_dup_page": False,
+            "feed_blocked": feed_blocked,
+            "urls_tried": len(urls),
+            "feed_doc_auto": None,
+        }
+
     max_pages = _pages_per_category()
     pages_fetched = 0
     has_next_at_end = False
