@@ -2432,6 +2432,78 @@ async def _enrich_via_ajax_item(
     return patch
 
 
+async def _enrich_seller_name_from_profile(
+    token: AccountToken,
+    item: MarketplaceListing,
+    *,
+    user_agent: str,
+    proxy_url: str | None,
+    timeout_sec: float,
+    country: str | None,
+) -> str:
+    """Facebook иногда оставляет в ленте ID продавца, а имя грузит только в профиле."""
+    if (item.seller_name or "").strip():
+        return item.seller_name
+    profile_id = (item.seller_id or "").strip()
+    if not profile_id:
+        match = _PROFILE_LINK_RE.search(item.person_link or "")
+        profile_id = match.group(1) if match else ""
+    if not profile_id or profile_id == (item.listing_id or "").strip():
+        return ""
+
+    url = f"https://www.facebook.com/marketplace/profile/{profile_id}/"
+    headers = {
+        "User-Agent": user_agent,
+        "Cookie": cookies_header(token.cookies),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": _accept_language(country),
+        "Referer": item.link or "https://www.facebook.com/marketplace/",
+    }
+    timeout = aiohttp.ClientTimeout(total=min(timeout_sec, 16.0))
+    try:
+        async with reuse_http_session(None, proxy_url) as session:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    return ""
+                html = await resp.text(errors="ignore")
+    except Exception as exc:
+        logger.debug("seller profile %s: %s", profile_id, exc)
+        return ""
+    if _looks_like_login_wall(html):
+        return ""
+
+    name = _seller_name_for_profile_in_html(
+        _normalize_fb_html(html), profile_id
+    )
+    if not name:
+        for pattern in (
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{2,100})',
+            r'<meta[^>]+content=["\']([^"\']{2,100})["\'][^>]+property=["\']og:title["\']',
+            r"<title>([^<]{2,120})</title>",
+            r'"name"\s*:\s*"((?:\\.|[^"\\]){2,100})"',
+        ):
+            match = re.search(pattern, html, re.I)
+            if not match:
+                continue
+            candidate = _unescape(match.group(1)).strip()
+            candidate = re.sub(
+                r"\s*[|·\-]\s*(?:Facebook|Marketplace).*$", "", candidate, flags=re.I
+            ).strip()
+            candidate = re.sub(
+                r"(?:'s|’s)\s+Marketplace listings.*$", "", candidate, flags=re.I
+            ).strip()
+            if candidate and candidate.lower() not in {
+                "facebook",
+                "marketplace",
+                "log in or sign up to view",
+            }:
+                name = candidate
+                break
+    if name:
+        logger.info("seller profile name ok %s", profile_id[:12])
+    return name
+
+
 def _listing_dict_from_graphql_raw(raw: str, listing_id: str) -> dict[str, Any]:
     """Все поля объявления из ответа GraphQL карточки."""
     by_id: dict[str, MarketplaceListing] = {}
@@ -3369,6 +3441,21 @@ async def enrich_listing(
         _merge_listing(item, gql_patch)
     if listing_void_ready(item):
         logger.info("enrich %s void-ready via graphql", lid)
+        return item
+
+    if _profile_id(item) and not (item.seller_name or "").strip():
+        seller_name = await _enrich_seller_name_from_profile(
+            token,
+            item,
+            user_agent=user_agent,
+            proxy_url=proxy_url,
+            timeout_sec=timeout_sec,
+            country=country,
+        )
+        if seller_name:
+            item.seller_name = seller_name
+    if listing_void_ready(item):
+        logger.info("enrich %s void-ready via seller profile", lid)
         return item
 
     locale_q = ""
