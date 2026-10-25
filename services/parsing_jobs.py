@@ -906,32 +906,37 @@ async def _parse_impl(
                 proxy_url = proxy_url_boot
                 proxy_used = proxy_url
 
-                # Category priming only helps GraphQL pagination. In the
-                # reliable HTML mode it duplicates two large GET requests for
-                # every category and adds more than a minute per run.
-                if gql_doc:
-                    try:
-                        cat_html, cat_docs = await _interruptible(
-                            prime_category_feed_region(
-                                token,
-                                country,
-                                cat.url_path,
-                                user_agent=config.fb_user_agent,
-                                proxy_url=proxy_url,
-                            ),
-                            ("", []),
-                        )
-                        if stop.is_set():
-                            break
-                        if cat_html:
-                            if len(cat_html) > len(region_hub_html or ""):
-                                region_hub_html = cat_html
-                            _category_feed_html.set(cat_html)
-                            for d in cat_docs:
-                                if d not in region_doc_ids:
-                                    region_doc_ids.insert(0, d)
-                    except AccountTokenDeadError:
-                        raise
+                try:
+                    cat_html, cat_docs = await _interruptible(
+                        prime_category_feed_region(
+                            token,
+                            country,
+                            cat.url_path,
+                            user_agent=config.fb_user_agent,
+                            proxy_url=proxy_url,
+                        ),
+                        ("", []),
+                    )
+                    if stop.is_set():
+                        break
+                    if cat_html:
+                        if len(cat_html) > len(region_hub_html or ""):
+                            region_hub_html = cat_html
+                        _category_feed_html.set(cat_html)
+                        for d in cat_docs:
+                            if d not in region_doc_ids:
+                                region_doc_ids.insert(0, d)
+                        if cat_docs:
+                            from parser.marketplace import _browse_doc_id
+
+                            browse_d = _browse_doc_id()
+                            cids = [x for x in region_doc_ids if x != browse_d]
+                            stats["feed_doc_auto"] = (cids or region_doc_ids)[0]
+                            stats["feed_doc_is_browse"] = (
+                                stats["feed_doc_auto"] == browse_d
+                            )
+                except AccountTokenDeadError:
+                    raise
     
                 async def on_url(i: int, n: int, short: str) -> None:
                     current_step["detail"] = f"{cat.label} ({i}/{n}) {short}"
@@ -955,7 +960,7 @@ async def _parse_impl(
                     page_acc = 0
                     page_skip = 0
                     page_skip_dup = 0
-                    enrich_sem = asyncio.Semaphore(8)
+                    enrich_sem = asyncio.Semaphore(5)
     
                     async def _run_one(item) -> None:
                         nonlocal cat_added, page_acc, page_skip, page_skip_dup
