@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import re
 from typing import Optional
 
@@ -96,8 +95,24 @@ async def delete_all_proxies(session: AsyncSession, user_id: int) -> int:
     return len(rows)
 
 
-async def pick_random_proxy_url(session: AsyncSession, user_id: int) -> str | None:
+def _proxy_matches_country(proxy: Proxy, country: str | None) -> bool:
+    if not country:
+        return True
+    username = (reveal_secret(proxy.username) or "").lower()
+    compact = username.replace("_", "-")
+    return f"cr-{country.lower()}" in compact
+
+
+async def pick_random_proxy_url(
+    session: AsyncSession,
+    user_id: int,
+    country: str | None = None,
+) -> str | None:
     rows = await list_proxies(session, user_id)
     if not rows:
         return None
-    return proxy_to_url(random.choice(rows))
+    matching = [row for row in rows if _proxy_matches_country(row, country)]
+    if matching:
+        # Последний добавленный прокси — актуальная настройка пользователя.
+        return proxy_to_url(matching[-1])
+    return proxy_to_url(rows[-1])

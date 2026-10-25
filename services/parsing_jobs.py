@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import unquote, urlparse
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -591,7 +593,17 @@ async def _parse_impl(
     )
 
     async with Session() as session:
-        proxy_url_boot = await pick_random_proxy_url(session, user_id)
+        proxy_url_boot = await pick_random_proxy_url(session, user_id, country)
+    if proxy_url_boot:
+        parsed_proxy = urlparse(proxy_url_boot)
+        proxy_user = unquote(parsed_proxy.username or "").lower().replace("_", "-")
+        match = re.search(r"cr-([a-z]{2})", proxy_user)
+        logger.info(
+            "selected proxy host=%s country_tag=%s requested=%s",
+            parsed_proxy.hostname or "?",
+            match.group(1) if match else "unknown",
+            country,
+        )
     region_doc_ids: list[str] = []
     region_hub_html = ""
     parse_error: str | None = None
