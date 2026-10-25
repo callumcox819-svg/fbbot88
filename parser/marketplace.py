@@ -1961,6 +1961,39 @@ _ITEM_NEAR_PROFILE_RE = (
 
 
 def _seller_name_for_profile_in_html(html: str, profile_id: str) -> str:
+    profile_href = (
+        rf'href=["\']/marketplace/profile/{re.escape(profile_id)}/?'
+        rf'(?:\?[^"\']*)?["\']'
+    )
+    # Current Marketplace markup puts ?product_id=... after the profile id.
+    # The avatar carries the seller name in aria-label; the adjacent link has
+    # it inside a nested span. CSS classes are generated and cannot be relied on.
+    for pat in (
+        re.compile(
+            rf'<a\b(?=[^>]{{0,7000}}{profile_href})'
+            rf'[^>]{{0,7000}}\baria-label=["\']([^"\']{{2,100}})["\']',
+            re.I,
+        ),
+        re.compile(
+            rf'<a\b(?=[^>]{{0,7000}}{profile_href})[^>]*>'
+            rf'[\s\S]{{0,5000}}?<span[^>]*>([^<]{{2,100}})</span>',
+            re.I,
+        ),
+    ):
+        for match in pat.finditer(html):
+            name = _unescape(match.group(1)).strip()
+            low = name.casefold()
+            if (
+                len(name) >= 2
+                and not name.startswith("Listing ")
+                and "seller info" not in low
+                and "information about seller" not in low
+                and "информация о продавц" not in low
+                and "інформація про продавц" not in low
+                and "informationen zum verkäufer" not in low
+                and "informations sur le vendeur" not in low
+            ):
+                return name
     for pat in (
         re.compile(
             rf'"/marketplace/profile/{re.escape(profile_id)}"'
