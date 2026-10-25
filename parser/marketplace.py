@@ -1390,20 +1390,46 @@ async def fetch_category_listings(
             if should_stop and should_stop():
                 return None
             async with fetch_sem:
-                return await _fetch_page(
-                    token,
-                    url=url.split("?")[0].rstrip("/") + "/",
-                    user_agent=user_agent,
-                    proxy_url=proxy_url,
-                    timeout_sec=timeout_sec,
-                    category_label=category_label,
-                    graphql_doc_id=None,
-                    cursor=None,
-                    country=country,
-                    region_hint_html=region_hint_html,
-                    seed_doc_ids=None,
-                    http_session=http_session,
-                )
+                clean_url = url.split("?")[0].rstrip("/") + "/"
+                try:
+                    return await _fetch_page(
+                        token,
+                        url=clean_url,
+                        user_agent=user_agent,
+                        proxy_url=proxy_url,
+                        timeout_sec=timeout_sec,
+                        category_label=category_label,
+                        graphql_doc_id=None,
+                        cursor=None,
+                        country=country,
+                        region_hint_html=region_hint_html,
+                        seed_doc_ids=None,
+                        http_session=http_session,
+                    )
+                except MarketplaceFeedBlockedError:
+                    mobile_url = clean_url.replace(
+                        "https://www.facebook.com/",
+                        "https://m.facebook.com/",
+                        1,
+                    )
+                    logger.info(
+                        "desktop feed blocked, try mobile %s",
+                        mobile_url.replace("https://m.facebook.com/marketplace/", "")[:48],
+                    )
+                    return await _fetch_page(
+                        token,
+                        url=mobile_url,
+                        user_agent=user_agent,
+                        proxy_url=proxy_url,
+                        timeout_sec=timeout_sec,
+                        category_label=category_label,
+                        graphql_doc_id=None,
+                        cursor=None,
+                        country=country,
+                        region_hint_html=region_hint_html,
+                        seed_doc_ids=None,
+                        http_session=http_session,
+                    )
 
         results = await asyncio.gather(
             *[_fetch_html_url(url) for url in urls],
